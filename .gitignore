@@ -1,0 +1,11 @@
+# Local GTDB metadata
+ar53_metadata_r214.tsv
+bac120_metadata_r214.tsv
+
+# Temporary exploratory analysis
+explore_metadata.py
+
+# Python and macOS-generated files
+__pycache__/
+*.py[cod]
+.DS_Store
