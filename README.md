@@ -1,6 +1,6 @@
-# Next Concept Prediction for Biology
+# NSM-DNA
 
-This project explores applying Next Concept Prediction to biological data.
+This project explores applying Next-Scale Modeling to genomic sequence data.
 
-The project is in an early exploratory stage. Its scope, methods, and documentation
-will be developed as the research direction becomes clearer.
+The first milestone is a hierarchical model for sequences of up to 8,192 base
+pairs, trained on representative genomes from GTDB R232.

@@ -2,10 +2,21 @@
 ar53_metadata_r214.tsv
 bac120_metadata_r214.tsv
 
-# Temporary exploratory analysis
-explore_metadata.py
+# Generated record identifier lists
+*_record_ids.txt
+
+# Generated comparison results
+comparison_results/
+
+# Local AI project context
+AGENTS.md
+PROJECT_STATUS.md
+
+# Local research documents and proposals
+/documents/
 
 # Python and macOS-generated files
+.venv/
 __pycache__/
 *.py[cod]
 .DS_Store
