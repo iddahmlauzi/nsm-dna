@@ -1,6 +1,8 @@
 .git/
 .venv/
+.ruff_cache/
 documents/
+data/
 __pycache__/
 *.py[cod]
 .DS_Store

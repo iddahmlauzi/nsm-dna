@@ -8,6 +8,11 @@ bac120_metadata_r214.tsv
 # Generated comparison results
 comparison_results/
 
+# Local source files for the nine-study Evo DMS panel
+/data/evo_panel/raw/*
+!/data/evo_panel/raw/*/
+!/data/evo_panel/raw/*/README.md
+
 # Local AI project context
 AGENTS.md
 PROJECT_STATUS.md
@@ -17,6 +22,7 @@ PROJECT_STATUS.md
 
 # Python and macOS-generated files
 .venv/
+.ruff_cache/
 __pycache__/
 *.py[cod]
 .DS_Store
