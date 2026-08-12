@@ -31,14 +31,13 @@ STANDARDIZERS = {
 def standardize_studies(
     source_dir: Path,
     output_dir: Path,
-    study_names: list[str] | None,
 ) -> dict[str, int]:
-    """Run the selected Evo study converters and return assay row counts."""
+    """Run all Evo study converters and return assay row counts."""
     row_counts = {}
 
-    for study_name in study_names or STANDARDIZERS:
+    for study_name, standardize in STANDARDIZERS.items():
         row_counts.update(
-            STANDARDIZERS[study_name](
+            standardize(
                 source_dir / study_name,
                 output_dir,
             )

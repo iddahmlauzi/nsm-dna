@@ -4,7 +4,6 @@ from pathlib import Path
 from dms.evo import (
     OUTPUT_DIR as EVO_OUTPUT_DIR,
     SOURCE_DIR as EVO_SOURCE_DIR,
-    STANDARDIZERS,
     standardize_studies,
 )
 from dms.mavedb import (
@@ -24,7 +23,6 @@ def parse_args() -> argparse.Namespace:
     evo_parser = benchmarks.add_parser("evo1")
     evo_parser.add_argument("--source-dir", type=Path, default=EVO_SOURCE_DIR)
     evo_parser.add_argument("--output-dir", type=Path, default=EVO_OUTPUT_DIR)
-    evo_parser.add_argument("--study", action="append", choices=STANDARDIZERS)
 
     mavedb_parser = benchmarks.add_parser("mavedb")
     mavedb_parser.add_argument("--archive", type=Path, default=MAVEDB_ARCHIVE_PATH)
@@ -41,7 +39,6 @@ def main() -> None:
         row_counts = standardize_studies(
             args.source_dir,
             args.output_dir,
-            args.study,
         )
 
         for assay_id, row_count in row_counts.items():
