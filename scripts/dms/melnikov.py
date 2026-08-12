@@ -4,19 +4,24 @@ import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 
-from openpyxl import load_workbook
-
 from dms.shared import (
     CODON_TABLE,
     VariantRecord,
     describe_coding_edit,
+    read_worksheet,
     replace_codon,
     translate_dna,
     write_variants,
 )
 
 ASSAY_ID = "KKA2_KLEPN_Melnikov_2014"
-OLIGO_PATTERN = re.compile(r"^(KKA2_KLEPN_[AB]\d+)_(\d+)_(wt|[ACDEFGHIKLMNPQRSTVWY])$")
+
+# Each oligo is a short synthesized piece of the gene. An ID such as
+# KKA2_KLEPN_A1_2_F means tile KKA2_KLEPN_A1 was designed to change protein
+# position 2 to F. The matching unmutated tile ends in `_wt`.
+OLIGO_PATTERN = re.compile(
+    r"^(KKA2_KLEPN_[AB]\d+)_(\d+)_(wt|[ACDEFGHIKLMNPQRSTVWY])$"
+)
 SCORE_FILES = (
     "Supplementary Data 2 - Unpacked/KKA2_S1_Kan18_L1.aadiff.txt",
     "Supplementary Data 2 - Unpacked/KKA2_S3_Kan18_L1.aadiff.txt",
@@ -25,46 +30,33 @@ SCORE_FILES = (
 
 def read_wt_sequence(source_dir: Path) -> str:
     """Read the exact synthetic APH(3')II construct."""
-    workbook = load_workbook(
+    rows = read_worksheet(
         source_dir / "supp_gku511_nar-01049-met-h-2014-File006.xlsx",
-        read_only=True,
-        data_only=True,
+        "Primers_etc",
     )
 
-    try:
-        worksheet = workbook["Primers_etc"]
-
-        for row in worksheet.iter_rows(values_only=True):
-            if row[0] == "KKA2_KLEPN_opt":
-                return str(row[2]).upper()
-    finally:
-        workbook.close()
+    # Primers_etc contains many named sequences. KKA2_KLEPN_opt is the complete
+    # WT coding sequence used to design this study's KKA2 mutant library.
+    for row in rows:
+        if row[0] == "KKA2_KLEPN_opt":
+            return str(row[2]).upper()
 
     raise ValueError("KKA2_KLEPN_opt was not found in Primers_etc")
 
 
 def read_oligos(source_dir: Path) -> dict[str, str]:
     """Read the six KKA2 WT tiles and 4,997 designed mutant tiles."""
-    workbook = load_workbook(
-        source_dir / "supp_gku511_nar-01049-met-h-2014-File006.xlsx",
-        read_only=True,
-        data_only=True,
-    )
+    workbook_path = source_dir / "supp_gku511_nar-01049-met-h-2014-File006.xlsx"
     oligos = {}
 
-    try:
-        for sheet_name in ("OLS_A", "OLS_B"):
-            worksheet = workbook[sheet_name]
+    # OLS_A and OLS_B list all DNA oligos synthesized on two microarrays. Keep
+    # only IDs belonging to the KKA2 experiment.
+    for sheet_name in ("OLS_A", "OLS_B"):
+        rows = read_worksheet(workbook_path, sheet_name, min_row=6, max_col=2)
 
-            for oligo_id, sequence in worksheet.iter_rows(
-                min_row=6,
-                max_col=2,
-                values_only=True,
-            ):
-                if isinstance(oligo_id, str) and OLIGO_PATTERN.fullmatch(oligo_id):
-                    oligos[oligo_id] = str(sequence).upper()
-    finally:
-        workbook.close()
+        for oligo_id, sequence in rows:
+            if isinstance(oligo_id, str) and OLIGO_PATTERN.fullmatch(oligo_id):
+                oligos[oligo_id] = str(sequence).upper()
 
     return oligos
 
@@ -72,7 +64,7 @@ def read_oligos(source_dir: Path) -> dict[str, str]:
 def read_score_matrix(
     source_dir: Path,
 ) -> dict[tuple[int, str], float]:
-    """Average the two valid Kan18 amino-acid enrichment matrices."""
+    """Average S1 and S3 scores for each amino-acid substitution."""
     archive_path = source_dir / "supp_gku511_nar-01049-met-h-2014-File007.zip"
     replicate_scores: list[dict[tuple[int, str], float]] = []
 
@@ -80,8 +72,15 @@ def read_score_matrix(
         for score_filename in SCORE_FILES:
             with archive.open(score_filename) as binary_file:
                 lines = io.TextIOWrapper(binary_file, encoding="utf-8")
+
+                # Each file is one selection round under Kan18: kanamycin at
+                # 1/8 of the WT minimum inhibitory concentration. The first
+                # line names the experiment, and the second lists protein
+                # positions across the matrix columns.
                 next(lines)
                 positions = [int(value) for value in next(lines).split("\t")[1:]]
+
+                # The third line lists the WT amino acid at every position.
                 next(lines)
                 scores = {}
 
@@ -91,6 +90,8 @@ def read_score_matrix(
                     if not values[0].startswith("Delta-"):
                         continue
 
+                    # A Delta-F row gives the change in frequency after
+                    # selection for variants producing F at every position.
                     mutant_residue = values[0].removeprefix("Delta-")
 
                     for position, value in zip(positions, values[1:]):
@@ -98,6 +99,9 @@ def read_score_matrix(
 
                 replicate_scores.append(scores)
 
+    # S1 and S3 are independent selection rounds under the same condition.
+    # The authors marked S2 as a failed sequencing library, so it is excluded.
+    # Average the two measurements for each (position, mutant amino acid).
     return {
         key: (replicate_scores[0][key] + replicate_scores[1][key]) / 2
         for key in replicate_scores[0]
@@ -113,6 +117,10 @@ def find_mutant_codon(
     """Locate the designed mutant codon within a matched oligo tile."""
     candidates: set[str] = set()
 
+    # A mutant oligo and its WT tile differ only at the designed codon. Some
+    # tiles are written in the coding direction and others in the opposite
+    # direction, so compare both the supplied sequences and their reverse
+    # complements.
     for oriented_wt, oriented_mutant in (
         (wt_tile, mutant_tile),
         (reverse_complement(wt_tile), reverse_complement(mutant_tile)),
@@ -125,6 +133,9 @@ def find_mutant_codon(
             if wt_base != mutant_base
         ]
 
+        # Find the three-base window containing all differences. Accept it only
+        # if the WT window matches the full WT gene and the mutant window
+        # translates to the amino acid named in the oligo ID.
         for codon_start in range(
             max(0, min(changed_indices) - 2),
             min(changed_indices) + 1,
@@ -161,12 +172,16 @@ def iter_variants(source_dir: Path) -> Iterator[VariantRecord]:
     wt_aa = translate_dna(wt_nt)
     oligos = read_oligos(source_dir)
     scores = read_score_matrix(source_dir)
-    wt_tiles = {
-        match.group(1): sequence
-        for oligo_id, sequence in oligos.items()
-        if (match := OLIGO_PATTERN.fullmatch(oligo_id)) is not None
-        and match.group(3) == "wt"
-    }
+    wt_tiles = {}
+
+    # Build one WT sequence for each of the six tiles. For example,
+    # KKA2_KLEPN_A1_2_F is compared with the KKA2_KLEPN_A1 WT tile to recover
+    # the exact mutant codon synthesized by the authors.
+    for oligo_id, sequence in oligos.items():
+        match = OLIGO_PATTERN.fullmatch(oligo_id)
+
+        if match is not None and match.group(3) == "wt":
+            wt_tiles[match.group(1)] = sequence
 
     for oligo_id, mutant_tile in oligos.items():
         match = OLIGO_PATTERN.fullmatch(oligo_id)
@@ -178,6 +193,9 @@ def iter_variants(source_dir: Path) -> Iterator[VariantRecord]:
         position = int(position_text)
         wt_tile = wt_tiles[tile_id]
         wt_residue = wt_aa[position - 1]
+
+        # The oligo ID provides the protein position and resulting amino acid,
+        # while comparison with the WT oligo provides the exact mutant codon.
         codon_start = (position - 1) * 3
         wt_codon = wt_nt[codon_start : codon_start + 3]
         mutant_codon = find_mutant_codon(
@@ -193,7 +211,6 @@ def iter_variants(source_dir: Path) -> Iterator[VariantRecord]:
             "panel": "evo1",
             "study_id": "melnikov_2014",
             "assay_id": ASSAY_ID,
-            "variant_id": oligo_id,
             "organism": "Klebsiella pneumoniae",
             "target": "APH(3')II aminoglycoside phosphotransferase",
             "wt_nt": wt_nt,
@@ -207,9 +224,9 @@ def iter_variants(source_dir: Path) -> Iterator[VariantRecord]:
         }
 
 
-def standardize(source_dir: Path, output_dir: Path) -> int:
+def standardize(source_dir: Path, output_dir: Path) -> dict[str, int]:
     """Write the standardized Melnikov assay."""
-    return write_variants(
-        iter_variants(source_dir),
-        output_dir / f"{ASSAY_ID}.csv",
+    row_count = write_variants(
+        iter_variants(source_dir), output_dir / f"{ASSAY_ID}.csv"
     )
+    return {ASSAY_ID: row_count}

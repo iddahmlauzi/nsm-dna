@@ -9,9 +9,19 @@ bac120_metadata_r214.tsv
 comparison_results/
 
 # Local source files for the nine-study Evo DMS panel
-/data/evo_panel/raw/*
-!/data/evo_panel/raw/*/
-!/data/evo_panel/raw/*/README.md
+/data/benchmark_sources/evo1/*
+!/data/benchmark_sources/evo1/*/
+/data/benchmark_sources/evo1/*/*
+!/data/benchmark_sources/evo1/*/README.md
+
+# Locally inspected Evo evaluation artifact
+/arvind_dms.tar.gz
+/arvind_adkar_sample.tsv
+/NIHMS836960-supplement-*.csv
+/NIHMS836960-supplement-*.xlsx
+/pcbi.1004421.s001.docx
+/supp_gku511_nar-01049-met-h-2014-File006.xlsx
+/supp_gku511_nar-01049-met-h-2014-File007.zip
 
 # Local AI project context
 AGENTS.md

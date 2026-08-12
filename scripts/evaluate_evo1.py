@@ -11,7 +11,7 @@ from typing import Any
 from scipy.stats import spearmanr
 from tqdm import tqdm
 
-INPUT_DIR = Path("/workspace/datasets/evo_panel/standardized")
+INPUT_DIR = Path("/workspace/datasets/benchmarks/evo1_prokaryotic")
 OUTPUT_DIR = Path("/workspace/evo1_reproduction")
 
 MODEL_NAME = "evo-1-8k-base"
@@ -44,7 +44,6 @@ REPORTED_CORRELATIONS = {
 PREDICTION_COLUMNS = (
     "study_id",
     "assay_id",
-    "variant_id",
     "experimental_score",
     "directionality",
     "evo_log_likelihood",
@@ -90,11 +89,6 @@ def select_assay_files(input_dir: Path, studies: tuple[str, ...]) -> list[Path]:
     return selected_files
 
 
-def source_identifiers(rows: list[dict[str, str]]) -> list[tuple[str, str]]:
-    """Return ordered assay and variant identifiers from source rows."""
-    return [(row["assay_id"], row["variant_id"]) for row in rows]
-
-
 def prediction_is_complete(
     source_rows: list[dict[str, str]],
     output_path: Path,
@@ -104,7 +98,7 @@ def prediction_is_complete(
         return False
 
     prediction_rows = read_csv_rows(output_path)
-    return source_identifiers(prediction_rows) == source_identifiers(source_rows)
+    return len(prediction_rows) == len(source_rows)
 
 
 def load_evo_model(device: str) -> tuple[Any, Any]:
@@ -162,7 +156,6 @@ def write_predictions(
                 {
                     "study_id": source_row["study_id"],
                     "assay_id": source_row["assay_id"],
-                    "variant_id": source_row["variant_id"],
                     "experimental_score": source_row["experimental_score"],
                     "directionality": source_row["directionality"],
                     "evo_log_likelihood": score,

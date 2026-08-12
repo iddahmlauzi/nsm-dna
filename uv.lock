@@ -1008,6 +1008,7 @@ dependencies = [
     { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "torch" },
     { name = "tqdm" },
+    { name = "typing-extensions" },
 ]
 
 [package.metadata]
@@ -1019,6 +1020,7 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.14.0" },
     { name = "torch", specifier = ">=2.13.0" },
     { name = "tqdm", specifier = ">=4.67.3" },
+    { name = "typing-extensions", specifier = ">=4.16.0" },
 ]
 
 [[package]]

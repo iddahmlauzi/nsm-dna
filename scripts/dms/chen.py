@@ -1,11 +1,10 @@
 from collections.abc import Iterator
 from pathlib import Path
 
-from openpyxl import load_workbook
-
 from dms.shared import (
     VariantRecord,
     describe_coding_edit,
+    read_worksheet,
     replace_codon,
     translate_dna,
     write_variants,
@@ -16,62 +15,68 @@ WORKBOOK_NAME = "elife-56707-supp2-v2.xlsx"
 POSITION_COLUMN = "codon position (G2 stands for Glycine 2 from the inhouse sequence)"
 
 
-def read_source_rows(source_dir: Path) -> tuple[str, list[tuple[object, ...]]]:
-    """Read codon fitness rows and reconstruct the VIM-2 WT sequence."""
-    workbook = load_workbook(
+def read_source_rows(source_dir: Path) -> list[dict[str, object]]:
+    """Read codon fitness rows from the author supplement."""
+    rows = read_worksheet(
         source_dir / WORKBOOK_NAME,
-        read_only=True,
-        data_only=True,
+        "SF2D Codon Fitness scores",
+        min_row=2,
     )
+    headers = [str(value) for value in rows[0]]
+    return [dict(zip(headers, row)) for row in rows[1:]]
 
-    try:
-        worksheet = workbook["SF2D Codon Fitness scores"]
-        headers = [cell.value for cell in worksheet[2]]
-        rows = list(worksheet.iter_rows(min_row=3, values_only=True))
-    finally:
-        workbook.close()
 
-    columns = {name: index for index, name in enumerate(headers)}
-    wt_codons: dict[int, str] = {}
+def reconstruct_wt(rows: list[dict[str, object]]) -> str:
+    """Reconstruct the VIM-2 WT coding sequence."""
+    # A position has many rows for different variant codons, but every row at
+    # that position repeats the same WT codon. G2 is an extra glycine in the
+    # experimental construct between standard VIM-2 positions 1 and 2.
+    wt_codons: dict[object, str] = {}
 
     for row in rows:
-        position_value = row[columns[POSITION_COLUMN]]
+        position = row[POSITION_COLUMN]
 
-        if not isinstance(position_value, int):
+        if position is None:
             continue
 
-        wt_codon = str(row[columns["wt codon"]]).upper()
+        if position not in wt_codons:
+            wt_codons[position] = str(row["wt codon"]).upper()
 
-        if position_value in wt_codons and wt_codons[position_value] != wt_codon:
-            raise ValueError(f"Inconsistent WT codon at {position_value}")
-
-        wt_codons[position_value] = wt_codon
-
-    wt_nt = "".join(wt_codons[position] for position in sorted(wt_codons))
-    return wt_nt, rows
+    return "".join(wt_codons.values())
 
 
 def iter_variants(source_dir: Path) -> Iterator[VariantRecord]:
     """Convert VIM-2 codons scored under 128 micrograms/mL ampicillin."""
-    wt_nt, rows = read_source_rows(source_dir)
+    rows = read_source_rows(source_dir)
+    wt_nt = reconstruct_wt(rows)
     wt_aa = translate_dna(wt_nt)
 
-    for row in rows:
-        position_value = row[2]
-        score = row[6]
+    # The source order is 1, G2, 2, 3, ...; map these labels to positions
+    # 1, 2, 3, 4, ... in the experimental WT sequence.
+    sequence_positions: dict[object, int] = {}
 
-        if not isinstance(position_value, int) or score is None:
+    for row in rows:
+        position_label = row[POSITION_COLUMN]
+
+        if position_label is not None and position_label not in sequence_positions:
+            sequence_positions[position_label] = len(sequence_positions) + 1
+
+    for row in rows:
+        position_label = row[POSITION_COLUMN]
+        score = row["fitness score"]
+
+        if position_label is None or score is None:
             continue
 
-        mutant_codon = str(row[1]).upper()
-        mutant_nt = replace_codon(wt_nt, position_value, mutant_codon)
+        position = sequence_positions[position_label]
+        mutant_codon = str(row["variant codon"]).upper()
+        mutant_nt = replace_codon(wt_nt, position, mutant_codon)
         mutant_aa = translate_dna(mutant_nt)
 
         yield {
             "panel": "evo1",
             "study_id": "chen_2020",
             "assay_id": ASSAY_ID,
-            "variant_id": str(row[0]),
             "organism": "Pseudomonas aeruginosa",
             "target": "VIM-2 beta-lactamase",
             "wt_nt": wt_nt,
@@ -80,17 +85,17 @@ def iter_variants(source_dir: Path) -> Iterator[VariantRecord]:
             "wt_aa": wt_aa,
             "mutant_aa": mutant_aa,
             "aa_change": (
-                f"{wt_aa[position_value - 1]}{position_value}"
-                f"{mutant_aa[position_value - 1]}"
+                f"{wt_aa[position - 1]}{position}"
+                f"{mutant_aa[position - 1]}"
             ),
             "experimental_score": str(score),
             "directionality": 1,
         }
 
 
-def standardize(source_dir: Path, output_dir: Path) -> int:
+def standardize(source_dir: Path, output_dir: Path) -> dict[str, int]:
     """Write the standardized Chen assay."""
-    return write_variants(
-        iter_variants(source_dir),
-        output_dir / f"{ASSAY_ID}.csv",
+    row_count = write_variants(
+        iter_variants(source_dir), output_dir / f"{ASSAY_ID}.csv"
     )
+    return {ASSAY_ID: row_count}

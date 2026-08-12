@@ -10,12 +10,12 @@ from dms.mavedb import apply_nucleotide_edit  # noqa: E402
 from dms.jacquier import apply_substitutions  # noqa: E402
 from dms.melnikov import find_mutant_codon, reverse_complement  # noqa: E402
 from dms.shared import (  # noqa: E402
+    describe_amino_acid_changes,
     describe_coding_edit,
     read_fasta,
     replace_codon,
     translate_dna,
 )
-from dms.tsuboyama import iter_assay_variants, target_coding_sequence  # noqa: E402
 
 
 class MaveDBSequenceTest(unittest.TestCase):
@@ -52,7 +52,7 @@ class SharedSequenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             fasta_path = Path(temp_dir) / "target.fasta"
             fasta_path.write_text(">target\nATG\nGCT\n", encoding="utf-8")
-            self.assertEqual(read_fasta(fasta_path), "ATGGCT")
+            self.assertEqual(read_fasta(fasta_path), {"target": "ATGGCT"})
 
     def test_replace_codon(self) -> None:
         self.assertEqual(replace_codon("ATGGCT", 2, "TAA"), "ATGTAA")
@@ -92,57 +92,19 @@ class EvoSourceTest(unittest.TestCase):
             "TTC",
         )
 
-    def test_tsuboyama_target_slice(self) -> None:
-        source_row = {
-            "name": "example",
-            "aa_seq": "MA",
-            "aa_seq_full": "QMAK",
-            "dna_seq": "CAAATGGCTAAA",
-        }
-        self.assertEqual(target_coding_sequence(source_row), "ATGGCT")
+    def test_amino_acid_changes(self) -> None:
+        self.assertEqual(describe_amino_acid_changes("MA", "IV"), "M1I:A2V")
+        self.assertEqual(describe_amino_acid_changes("MA", "MA"), "p.=")
+        self.assertEqual(describe_amino_acid_changes("MA", "QIVK"), "insertion")
 
-    def test_tsuboyama_multiple_substitutions(self) -> None:
-        source_rows = [
-            {
-                "name": "example",
-                "aa_change": "M1I:A2V",
-                "experimental_score": "-0.5",
-                "mutant_nt": "ATAGTT",
-            }
-        ]
-        variants = list(
-            iter_assay_variants(
-                "1AOY.pdb",
-                "ATGGCT",
-                source_rows,
-            )
+    def test_nucleotide_insertion(self) -> None:
+        self.assertEqual(
+            describe_coding_edit("ATGGCT", "CAAATAGTTAAA"),
+            "insertion",
         )
-        self.assertEqual(variants[0]["mutant_aa"], "IV")
 
-    def test_tsuboyama_disambiguates_reused_source_names(self) -> None:
-        source_rows = [
-            {
-                "name": "reused",
-                "aa_change": "M1I:A2V",
-                "experimental_score": "-0.5",
-                "mutant_nt": "ATAGTT",
-            },
-            {
-                "name": "reused",
-                "aa_change": "M1I:A2V",
-                "experimental_score": "-0.4",
-                "mutant_nt": "ATCGTA",
-            },
-        ]
-        variants = list(
-            iter_assay_variants(
-                "1AOY.pdb",
-                "ATGGCT",
-                source_rows,
-            )
-        )
-        variant_ids = {variant["variant_id"] for variant in variants}
-        self.assertEqual(len(variant_ids), 2)
+    def test_nucleotide_deletion(self) -> None:
+        self.assertEqual(describe_coding_edit("ATGGCT", "ATG"), "deletion")
 
 
 if __name__ == "__main__":

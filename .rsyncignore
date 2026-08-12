@@ -1,8 +1,16 @@
 .git/
 .venv/
 .ruff_cache/
+.pytest_cache/
 documents/
 data/
 __pycache__/
 *.py[cod]
 .DS_Store
+arvind_dms.tar.gz
+arvind_adkar_sample.tsv
+NIHMS836960-supplement-*.csv
+NIHMS836960-supplement-*.xlsx
+pcbi.1004421.s001.docx
+supp_gku511_nar-01049-met-h-2014-File006.xlsx
+supp_gku511_nar-01049-met-h-2014-File007.zip

@@ -11,15 +11,18 @@ from typing import Any, TextIO
 from dms.shared import VariantRecord, translate_dna, write_variants
 
 MAVEDB_ARCHIVE_PATH = Path(
-    "/home/iddah/datasets/mavedb/raw/2026-06-24/mavedb-dump.2026062418131.tar.gz"
+    "/home/iddah/datasets/benchmark_sources/mavedb/2026-06-24/"
+    "mavedb-dump.2026062418131.tar.gz"
 )
-OUTPUT_DIR = Path("/home/iddah/datasets/mavedb/standardized")
+OUTPUT_DIR = Path("/home/iddah/datasets/benchmarks/mavedb_ecoli_k12")
 
 PANEL = "dnahnet"
 STUDY_ID = "tsuboyama_2023"
 TARGET_ORGANISM = "Escherichia coli K-12"
 DIRECTIONALITY = 1
 
+# Parse edits such as c.4G>T, c.4_6del, c.3_4insAAA, and
+# c.4_6delinsTAA after the leading "c." has been removed.
 SUBSTITUTION_PATTERN = re.compile(r"(\d+)([ACGT])>([ACGT])")
 DELETION_PATTERN = re.compile(r"(\d+)(?:_(\d+))?del")
 INSERTION_PATTERN = re.compile(r"(\d+)_(\d+)ins([ACGT]+)")
@@ -46,6 +49,8 @@ def find_score_sets(public_dump: dict[str, Any]) -> list[dict[str, Any]]:
     """Find combined E. coli K-12 score sets."""
     selected_score_sets = []
 
+    # main.json groups score sets under experiment sets and experiments. A
+    # combined score set names its component assays in metaAnalyzesScoreSetUrns.
     for experiment_set in public_dump["experimentSets"]:
         for experiment in experiment_set["experiments"]:
             for score_set in experiment["scoreSets"]:
@@ -158,7 +163,6 @@ def iter_standardized_variants(
     reader = csv.DictReader(score_file)
 
     for source_variant in reader:
-        variant_id = source_variant["accession"]
         mutant_nt = apply_nucleotide_edit(wt_nt, source_variant["hgvs_nt"])
         mutant_aa = translate_dna(mutant_nt)
 
@@ -166,7 +170,7 @@ def iter_standardized_variants(
             "panel": PANEL,
             "study_id": STUDY_ID,
             "assay_id": score_set["urn"],
-            "variant_id": variant_id,
+            "variant_id": source_variant["accession"],
             "organism": organism,
             "target": target,
             "wt_nt": wt_nt,
@@ -197,7 +201,10 @@ def standardize_mavedb(
             score_set_urn = score_set["urn"]
             file_stem = score_set_urn.replace(":", "-")
             score_member = f"{archive_dir}/csv/{file_stem}.scores.csv"
-            score_file = TextIOWrapper(archive.extractfile(score_member))
+            score_file = TextIOWrapper(
+                archive.extractfile(score_member),
+                encoding="utf-8",
+            )
             output_path = output_dir / f"{file_stem}.csv"
 
             with score_file:

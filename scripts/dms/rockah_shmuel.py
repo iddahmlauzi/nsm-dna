@@ -2,77 +2,83 @@ import re
 from collections.abc import Iterator
 from pathlib import Path
 
-from openpyxl import load_workbook
-
 from dms.shared import (
-    CODON_TABLE,
     VariantRecord,
     describe_coding_edit,
+    read_worksheet,
     replace_codon,
     translate_dna,
     write_variants,
 )
 
 ASSAY_ID = "MTH3_HAEAE_RockahShmuel_2015"
+
+# Parse missense mutations such as N2D, synonymous entries such as N2, and
+# nonsense mutations such as L3*. Positions use the authors' zero-based system.
 MUTATION_PATTERN = re.compile(r"([A-Z])(\d+)([A-Z*])?")
-
-
-def codon_distance(first: str, second: str) -> int:
-    """Count nucleotide differences between two codons."""
-    return sum(
-        first_base != second_base for first_base, second_base in zip(first, second)
-    )
 
 
 def read_wt_sequence(source_dir: Path) -> str:
     """Read positions 0 through 331 of the author HaeIII construct."""
-    workbook = load_workbook(
+    rows = read_worksheet(
         source_dir / "pcbi.1004421.s002.xlsx",
-        read_only=True,
-        data_only=True,
+        "raw G0",
+        min_row=3,
     )
-
-    try:
-        worksheet = workbook["raw G0"]
-        wt_codons = {
-            int(row[0]): str(row[2]).upper()
-            for row in worksheet.iter_rows(min_row=3, values_only=True)
-            if isinstance(row[0], int) and 0 <= row[0] <= 331
-        }
-    finally:
-        workbook.close()
+    # raw G0 begins with an upstream tag at positions -20 through -1. The
+    # experimental HaeIII construct starts with ATG at position 0 and ends with
+    # TAG at position 331, so retain only positions 0 through 331.
+    wt_codons = {
+        int(row[0]): str(row[2]).upper()
+        for row in rows
+        if isinstance(row[0], int) and 0 <= row[0] <= 331
+    }
 
     return "".join(wt_codons[position] for position in range(332))
 
 
-def iter_source_scores(source_dir: Path) -> Iterator[tuple[str, float]]:
-    """Read the G17 scores for missense, synonymous, and nonsense variants."""
-    workbook = load_workbook(
+def read_single_nt_codons(source_dir: Path) -> dict[int, list[str]]:
+    """Read the exact single-nucleotide codons listed by the authors."""
+    rows = read_worksheet(
         source_dir / "pcbi.1004421.s003.xlsx",
-        read_only=True,
-        data_only=True,
+        "# of nt exchanges",
     )
-    sheet_columns = {
-        "Single nt nonSyn": 8,
-        "Syn": 7,
-        "nonSense": 7,
+    codons = [str(codon) for codon in rows[0][3:]]
+
+    # Each row gives the number of nucleotide changes from the WT codon to
+    # every possible codon. Keep columns marked 1 because the authors defined
+    # the analyzed dataset as single-nucleotide mutations.
+    return {
+        int(values[0]): [
+            codon
+            for codon, num_changes in zip(codons, values[3:])
+            if num_changes == 1
+        ]
+        for values in rows[2:]
+        if values[0] is not None
     }
 
-    try:
-        for sheet_name, score_column in sheet_columns.items():
-            worksheet = workbook[sheet_name]
 
-            for row in worksheet.iter_rows(min_row=2, values_only=True):
-                if row[0] is not None and row[score_column] is not None:
-                    yield str(row[0]), row[score_column]
-    finally:
-        workbook.close()
+def iter_source_scores(source_dir: Path) -> Iterator[tuple[str, float]]:
+    """Read the G17 scores for missense, synonymous, and nonsense variants."""
+    workbook_path = source_dir / "pcbi.1004421.s003.xlsx"
+
+    for sheet_name in ("Single nt nonSyn", "Syn", "nonSense"):
+        rows = read_worksheet(workbook_path, sheet_name)
+        headers = [str(value) for value in rows[0]]
+
+        for values in rows[1:]:
+            row = dict(zip(headers, values))
+
+            if row["Mutation"] is not None and row["Wrel G17"] is not None:
+                yield str(row["Mutation"]), row["Wrel G17"]
 
 
 def iter_variants(source_dir: Path) -> Iterator[VariantRecord]:
-    """Expand each reported amino-acid effect to its one-nt source codons."""
+    """Pair each reported amino-acid effect with its measured source codons."""
     wt_nt = read_wt_sequence(source_dir)
     wt_aa = translate_dna(wt_nt)
+    single_nt_codons = read_single_nt_codons(source_dir)
 
     for mutation, score in iter_source_scores(source_dir):
         match = MUTATION_PATTERN.fullmatch(mutation)
@@ -82,19 +88,23 @@ def iter_variants(source_dir: Path) -> Iterator[VariantRecord]:
 
         source_residue, source_position_text, reported_mutant = match.groups()
         source_position = int(source_position_text)
+
+        # The source calls its first codon position 0. Our sequence functions
+        # use one-based positions, so source position 2 becomes position 3.
         sequence_position = source_position + 1
-        wt_codon = wt_nt[(sequence_position - 1) * 3 : sequence_position * 3]
 
         if wt_aa[sequence_position - 1] != source_residue:
             raise ValueError(f"WT residue mismatch for {mutation}")
 
+        # Synonymous rows omit the mutant residue, for example N2. In that case
+        # the target amino acid remains the WT residue N.
         target_residue = reported_mutant or source_residue
 
-        for mutant_codon, mutant_residue in CODON_TABLE.items():
-            if mutant_residue != target_residue:
-                continue
-
-            if codon_distance(wt_codon, mutant_codon) != 1:
+        # S3 reports one Wrel score after combining codons that produce the
+        # same amino-acid mutation. Pair that score with each corresponding
+        # single-nucleotide codon in the authors' analyzed dataset.
+        for mutant_codon in single_nt_codons[source_position]:
+            if translate_dna(mutant_codon) != target_residue:
                 continue
 
             mutant_nt = replace_codon(wt_nt, sequence_position, mutant_codon)
@@ -104,7 +114,6 @@ def iter_variants(source_dir: Path) -> Iterator[VariantRecord]:
                 "panel": "evo1",
                 "study_id": "rockah_shmuel_2015",
                 "assay_id": ASSAY_ID,
-                "variant_id": f"position_{source_position}_{mutant_codon}",
                 "organism": "Haemophilus aegyptius",
                 "target": "HaeIII DNA methyltransferase",
                 "wt_nt": wt_nt,
@@ -118,9 +127,9 @@ def iter_variants(source_dir: Path) -> Iterator[VariantRecord]:
             }
 
 
-def standardize(source_dir: Path, output_dir: Path) -> int:
+def standardize(source_dir: Path, output_dir: Path) -> dict[str, int]:
     """Write the standardized Rockah-Shmuel assay."""
-    return write_variants(
-        iter_variants(source_dir),
-        output_dir / f"{ASSAY_ID}.csv",
+    row_count = write_variants(
+        iter_variants(source_dir), output_dir / f"{ASSAY_ID}.csv"
     )
+    return {ASSAY_ID: row_count}
