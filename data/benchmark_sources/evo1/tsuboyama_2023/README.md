@@ -8,5 +8,5 @@ Measured folding stability for natural and designed protein domains using cDNA-d
 
 | File | Source and use |
 |---|---|
-| `Processed_K50_dG_datasets.zip` | Original processed author dataset from [Zenodo record 7844779](https://zenodo.org/records/7844779). Dataset 1 provides the exact nucleotide sequences and `deltaG` measurements for the five targets. |
+| `Processed_K50_dG_datasets.zip` | Original processed author dataset from [Zenodo record 7844779](https://zenodo.org/records/7844779). Dataset 1 provides the exact nucleotide sequences and `deltaG` measurements for the five targets. Rows without `deltaG` and rows identical to the corresponding WT DNA are excluded; distinct nucleotide sequences that encode the same protein are retained. |
 | `evo1_tsuboyama_wt.fasta` | Five WT nucleotide references from the Evo 1 evaluation artifacts. |

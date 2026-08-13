@@ -11,6 +11,11 @@ from dms.mavedb import (
     OUTPUT_DIR as MAVEDB_OUTPUT_DIR,
     standardize_mavedb,
 )
+from dms.ncrna import (
+    ARCHIVE_PATH as NCRNA_ARCHIVE_PATH,
+    OUTPUT_DIR as NCRNA_OUTPUT_DIR,
+    standardize_ncrna,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,6 +28,10 @@ def parse_args() -> argparse.Namespace:
     evo_parser = benchmarks.add_parser("evo1")
     evo_parser.add_argument("--source-dir", type=Path, default=EVO_SOURCE_DIR)
     evo_parser.add_argument("--output-dir", type=Path, default=EVO_OUTPUT_DIR)
+
+    ncrna_parser = benchmarks.add_parser("evo1-ncrna")
+    ncrna_parser.add_argument("--archive", type=Path, default=NCRNA_ARCHIVE_PATH)
+    ncrna_parser.add_argument("--output-dir", type=Path, default=NCRNA_OUTPUT_DIR)
 
     mavedb_parser = benchmarks.add_parser("mavedb")
     mavedb_parser.add_argument("--archive", type=Path, default=MAVEDB_ARCHIVE_PATH)
@@ -43,6 +52,16 @@ def main() -> None:
 
         for assay_id, row_count in row_counts.items():
             print(f"{assay_id}: {row_count:,}")
+
+        print(f"Total: {sum(row_counts.values()):,}")
+    elif args.benchmark == "evo1-ncrna":
+        row_counts = standardize_ncrna(
+            args.archive,
+            args.output_dir,
+        )
+
+        for study_id, row_count in row_counts.items():
+            print(f"{study_id}: {row_count:,}")
 
         print(f"Total: {sum(row_counts.values()):,}")
     else:

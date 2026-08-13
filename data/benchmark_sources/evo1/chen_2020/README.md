@@ -8,4 +8,4 @@ Measured the effects of amino-acid substitutions on the antibiotic resistance, s
 
 | File | Source and use |
 |---|---|
-| `elife-56707-supp2-v2.xlsx` | Original author [Supplementary file 2](https://cdn.elifesciences.org/articles/56707/elife-56707-supp2-v2.xlsx). Sheet `SF2D Codon Fitness scores` provides the WT codons, mutant codons, and fitness under 128 µg/mL ampicillin used by the converter. The WT sequence is reconstructed from this table; `G2` insertion records are excluded. |
+| `elife-56707-supp2-v2.xlsx` | Original author [Supplementary file 2](https://cdn.elifesciences.org/articles/56707/elife-56707-supp2-v2.xlsx). Sheet `SF2D Codon Fitness scores` provides the WT codons, mutant codons, and fitness under 128 µg/mL ampicillin used by the converter. The WT sequence is reconstructed from this table and includes the extra `GGA` codon called `G2` in the authors' experimental construct. All scored rows, including the 62 `G2` variants, are retained. |
