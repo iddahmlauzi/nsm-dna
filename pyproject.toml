@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "datasets>=4.5.0",
+    "einx>=0.4.3",
     "numpy>=2.2.6",
     "openpyxl>=3.1",
     "pyarrow>=25.0.0",
