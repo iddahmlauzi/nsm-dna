@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from jaxtyping import Float, Int
+from torch import Tensor
 
 from .common import LayerNorm, TransformerBlock
 
@@ -9,18 +11,21 @@ class Encoder(nn.Module):
 
     def __init__(
         self,
-        in_vocab_size,
-        context_length,
-        embed_dim,
-        dropout=0.1,
-    ):
+        vocab_size: int,
+        context_length: int,
+        embed_dim: int,
+        dropout: float = 0.1,
+    ) -> None:
         super().__init__()
 
-        self.token_embedding = nn.Embedding(in_vocab_size, embed_dim)
+        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         self.position_embedding = nn.Embedding(context_length, embed_dim)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, token_ids):
+    def forward(
+        self,
+        token_ids: Int[Tensor, "batch length"],
+    ) -> Float[Tensor, "batch length embed_dim"]:
         positions = torch.arange(token_ids.size(1), device=token_ids.device)
 
         token_embeddings = self.token_embedding(token_ids)
@@ -34,12 +39,12 @@ class Decoder(nn.Module):
 
     def __init__(
         self,
-        vocab_size,
-        embed_dim,
-        num_heads,
-        dropout=0.1,
-        bias=False,
-    ):
+        vocab_size: int,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.1,
+        bias: bool = False,
+    ) -> None:
         super().__init__()
 
         self.block = TransformerBlock(
@@ -49,9 +54,12 @@ class Decoder(nn.Module):
             bias=bias,
         )
         self.final_norm = LayerNorm(embed_dim, bias=bias)
-        self.out_proj = nn.Linear(embed_dim, vocab_size, bias=False)
+        self.out_proj = nn.Linear(embed_dim, vocab_size, bias=bias)
 
-    def forward(self, latent, valid_mask=None):
-        x = self.block(latent, valid_mask=valid_mask, is_causal=False)
+    def forward(
+        self,
+        latent: Float[Tensor, "batch length embed_dim"],
+    ) -> Float[Tensor, "batch length vocab_size"]:
+        x = self.block(latent, is_causal=False)
         x = self.final_norm(x)
         return self.out_proj(x)
