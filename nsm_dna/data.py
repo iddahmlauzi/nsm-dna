@@ -11,23 +11,58 @@ BASE_TO_TOKEN_ID = {
     "T": 3,
 }
 
-PAD_TOKEN_ID = 4
-MAX_SEQUENCE_LENGTH = 8_192
-
 _ASCII_TO_TOKEN_ID = np.full(256, -1, dtype=np.int64)
 for base, token_id in BASE_TO_TOKEN_ID.items():
     _ASCII_TO_TOKEN_ID[ord(base)] = token_id
 
 
-def load_gtdb_dataset(data_directory: Path) -> IterableDataset:
-    """Load GTDB sequences as a streaming dataset."""
+def load_gtdb_dataset(
+    subset_directory: Path,
+    split: str,
+    context_length: int,
+    *,
+    shuffle_buffer_size: int = 10_000,
+    seed: int = 0,
+) -> IterableDataset:
+    """Stream one GTDB split as fixed-length training sequences."""
     dataset = load_dataset(
         "parquet",
-        data_files=str(data_directory / "chunks-*.parquet"),
+        data_files={
+            split: str(subset_directory / split / "chunks-*.parquet"),
+        },
+        split=split,
         streaming=True,
         columns=["sequence"],
     )
-    return dataset["train"]
+    dataset = dataset.map(
+        split_sequences,
+        batched=True,
+        fn_kwargs={"context_length": context_length},
+    )
+
+    if split == "train":
+        dataset = dataset.shuffle(
+            seed=seed,
+            buffer_size=shuffle_buffer_size,
+        )
+
+    return dataset
+
+
+def split_sequences(
+    examples: dict[str, list[str]],
+    context_length: int,
+) -> dict[str, list[str]]:
+    """Divide longer stored sequences into training-length examples."""
+    sequences = []
+
+    for sequence in examples["sequence"]:
+        sequences.extend(
+            sequence[start : start + context_length]
+            for start in range(0, len(sequence), context_length)
+        )
+
+    return {"sequence": sequences}
 
 
 def encode_sequence(sequence: str) -> torch.Tensor:
@@ -42,19 +77,8 @@ def encode_sequence(sequence: str) -> torch.Tensor:
 
 
 def collate_dna_sequences(examples: list[dict[str, str]]) -> dict[str, torch.Tensor]:
-    """Encode and right-pad DNA sequences for training."""
-    input_ids = torch.full(
-        (len(examples), MAX_SEQUENCE_LENGTH),
-        PAD_TOKEN_ID,
-        dtype=torch.long,
+    """Encode a batch of equal-length DNA sequences."""
+    input_ids = torch.stack(
+        [encode_sequence(example["sequence"]) for example in examples]
     )
-
-    for i, example in enumerate(examples):
-        token_ids = encode_sequence(example["sequence"])
-        input_ids[i, :len(token_ids)] = token_ids
-
-    valid_mask = input_ids != PAD_TOKEN_ID
-    return {
-        "input_ids": input_ids,
-        "valid_mask": valid_mask,
-    }
+    return {"input_ids": input_ids}

@@ -333,11 +333,10 @@ def selected_chunk_ordinals(allocation: GenomeAllocation, seed: int) -> set[int]
         byteorder="big",
     )
     generator = np.random.default_rng(genome_seed)
-    ordinals = generator.choice(
-        allocation.available_full_chunks,
-        size=allocation.selected_chunks,
-        replace=False,
-    )
+    # Taking a prefix of one permutation makes smaller data budgets exact
+    # subsets of larger budgets created with the same seed.
+    ordinals = generator.permutation(allocation.available_full_chunks)
+    ordinals = ordinals[: allocation.selected_chunks]
     return {int(ordinal) for ordinal in ordinals}
 
 

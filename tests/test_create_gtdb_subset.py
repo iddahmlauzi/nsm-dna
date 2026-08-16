@@ -19,6 +19,7 @@ from create_gtdb_subset import (  # noqa: E402
     Taxonomy,
     allocate_balanced_chunks,
     create_gtdb_subset,
+    selected_chunk_ordinals,
 )
 
 
@@ -267,6 +268,25 @@ class GTDBSubsetTest(unittest.TestCase):
         self.assertEqual(selected["limited"], 1)
         self.assertEqual(sum(selected.values()), 7)
         self.assertLessEqual(abs(selected["large-a"] - selected["large-b"]), 1)
+
+    def test_smaller_chunk_selections_are_nested(self) -> None:
+        small = GenomeAllocation(
+            "genome",
+            taxonomy("Genus", "species"),
+            available_full_chunks=20,
+            selected_chunks=3,
+        )
+        large = GenomeAllocation(
+            "genome",
+            taxonomy("Genus", "species"),
+            available_full_chunks=20,
+            selected_chunks=8,
+        )
+
+        small_ordinals = selected_chunk_ordinals(small, seed=17)
+        large_ordinals = selected_chunk_ordinals(large, seed=17)
+
+        self.assertTrue(small_ordinals < large_ordinals)
 
     def test_missing_taxonomy_fails_before_writing(self) -> None:
         with gzip.open(
