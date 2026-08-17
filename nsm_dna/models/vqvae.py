@@ -21,19 +21,17 @@ class VQVAE(nn.Module):
         codebook_sizes: list[int],
         *,
         # Encoder and decoder
-        dropout: float = 0.1,
+        encoder_dropout: float = 0.0,
+        decoder_dropout: float = 0.1,
         bias: bool = False,
         pre_quant_num_groups: int | None = None,
-
         # Codebook updates and quantization loss
         commitment_cost: float = 0.25,
         decay: float = 0.99,
         eps: float = 1e-5,
-
         # Per-scale post-quantization refinement
         refinement_ratio: float = 0.5,
         refinement_kernel_size: int = 3,
-
         # Fine-scale dropout
         fine_dropout_prob: float = 0.5,
         min_scales_to_keep: int = 1,
@@ -58,7 +56,7 @@ class VQVAE(nn.Module):
             self.vocab_size,
             self.context_length,
             self.embed_dim,
-            dropout=dropout,
+            dropout=encoder_dropout,
         )
 
         # Normalize the encoder output before comparing it with codebook vectors.
@@ -98,7 +96,7 @@ class VQVAE(nn.Module):
             self.vocab_size,
             self.embed_dim,
             self.num_heads,
-            dropout=dropout,
+            dropout=decoder_dropout,
             bias=bias,
         )
 
@@ -147,6 +145,20 @@ class VQVAE(nn.Module):
         latent = self._encode_pre_quant(token_ids)
         _, _, indices_by_scale = self.quantizer(latent)
         return indices_by_scale
+
+    @torch.no_grad()
+    def decode_cumulative(
+        self,
+        indices_by_scale: list[Int[Tensor, "batch scale_length"]],
+    ) -> list[Float[Tensor, "batch length vocab_size"]]:
+        """Decode the reconstruction after each additional quantization scale."""
+        if self.training:
+            raise RuntimeError("Call model.eval() before decoding sequences.")
+
+        cumulative_latents = self.quantizer.indices_to_cumulative_latents(
+            indices_by_scale
+        )
+        return [self.decoder(latent) for latent in cumulative_latents]
 
     @property
     def utilization_by_scale(self) -> list[Float[Tensor, ""]]:

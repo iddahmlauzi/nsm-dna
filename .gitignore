@@ -9,10 +9,10 @@ bac120_metadata_r214.tsv
 comparison_results/
 
 # Local source files for the nine-study Evo DMS panel
-/data/benchmark_sources/evo1/*
-!/data/benchmark_sources/evo1/*/
-/data/benchmark_sources/evo1/*/*
-!/data/benchmark_sources/evo1/*/README.md
+/datasets/benchmark_sources/evo1/*
+!/datasets/benchmark_sources/evo1/*/
+/datasets/benchmark_sources/evo1/*/*
+!/datasets/benchmark_sources/evo1/*/README.md
 
 # Locally inspected Evo evaluation artifact
 /arvind_dms.tar.gz
@@ -29,6 +29,9 @@ PROJECT_STATUS.md
 
 # Local research documents and proposals
 /documents/
+
+# Local generated datasets
+/datasets/gtdb/
 
 # Python and macOS-generated files
 .venv/

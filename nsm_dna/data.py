@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from datasets import IterableDataset, load_dataset
+from datasets.distributed import split_dataset_by_node
 
 BASE_TO_TOKEN_ID = {
     "A": 0,
@@ -23,6 +24,8 @@ def load_gtdb_dataset(
     *,
     shuffle_buffer_size: int = 10_000,
     seed: int = 0,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> IterableDataset:
     """Stream one GTDB split as fixed-length training sequences."""
     dataset = load_dataset(
@@ -44,6 +47,13 @@ def load_gtdb_dataset(
         dataset = dataset.shuffle(
             seed=seed,
             buffer_size=shuffle_buffer_size,
+        )
+
+    if world_size > 1:
+        dataset = split_dataset_by_node(
+            dataset,
+            rank=rank,
+            world_size=world_size,
         )
 
     return dataset

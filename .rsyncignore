@@ -3,7 +3,7 @@
 .ruff_cache/
 .pytest_cache/
 documents/
-data/
+datasets/
 __pycache__/
 *.py[cod]
 .DS_Store

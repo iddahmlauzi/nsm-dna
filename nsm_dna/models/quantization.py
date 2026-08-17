@@ -28,7 +28,9 @@ class EMACodebook(nn.Module):
         self.register_buffer("codebook", codebook)
         self.register_buffer("ema_counts", torch.ones(codebook_size))
         self.register_buffer("ema_vector_sums", codebook.clone())
-        self.register_buffer("codebook_hits", torch.zeros(codebook_size, dtype=torch.bool))
+        self.register_buffer(
+            "codebook_hits", torch.zeros(codebook_size, dtype=torch.bool)
+        )
 
     def _get_ema_decay(self) -> float:
         """Adjust EMA update strength for DDP's summed batch statistics."""
@@ -210,11 +212,9 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         commitment_cost: float = 0.25,
         decay: float = 0.99,
         eps: float = 1e-5,
-
         # Per-scale post-quantization refinement
         refinement_ratio: float = 0.5,
         refinement_kernel_size: int = 3,
-
         # Fine-scale dropout
         fine_dropout_prob: float = 0.5,
         min_scales_to_keep: int = 1,
@@ -241,21 +241,22 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         self.fine_dropout_prob = fine_dropout_prob
         self.min_scales_to_keep = min_scales_to_keep
 
-        # Sampling at the first scale is learned.
-        # A cascade can be added later for large strides.
         full_scale_length = scale_lengths[-1]
         first_scale_length = scale_lengths[0]
         if full_scale_length % first_scale_length != 0:
-            raise ValueError("The full scale length must be divisible by the first scale length.")
+            raise ValueError(
+                "The full scale length must be divisible by the first scale length."
+            )
 
-        self.first_scale_stride = full_scale_length // first_scale_length
+        first_scale_stride = full_scale_length // first_scale_length
         self.first_scale_downsampler = _make_learned_downsampler(
             embed_dim,
-            stride=self.first_scale_stride,
+            stride=first_scale_stride,
         )
+        self.first_scale_norm = nn.LayerNorm(embed_dim, elementwise_affine=False)
         self.first_scale_upsampler = _make_learned_upsampler(
             embed_dim,
-            stride=self.first_scale_stride,
+            stride=first_scale_stride,
         )
 
         self.codebooks = nn.ModuleList(
@@ -278,8 +279,8 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
     ) -> Float[Tensor, "batch scale_length embed_dim"]:
         """Downsample the residual to the selected scale's sequence length.
 
-        The first scale uses the learned strided convolution, intermediate scales
-        use area interpolation, and the final scale is already full length.
+        The first scale uses a learned strided convolution. Intermediate scales use
+        area interpolation, and the final scale is already full length.
         """
         scale_length = self.scale_lengths[scale_index]
         if scale_index == len(self.scale_lengths) - 1:
@@ -289,6 +290,14 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         residual = einx.id("b l d -> b d l", residual)
         if scale_index == 0:
             scaled_residual = self.first_scale_downsampler(residual)
+            scaled_residual = einx.id("b d l -> b l d", scaled_residual)
+
+            # The encoder was normalized before quantization, but the learned
+            # convolution can increase its magnitude again. Normalize each coarse
+            # vector before codebook lookup so the codebook and refiner do not chase
+            # and then cancel increasingly large values. Disabling LayerNorm's
+            # affine transform prevents it from learning that scale back.
+            return self.first_scale_norm(scaled_residual)
         else:
             scaled_residual = F.interpolate(
                 residual,
@@ -305,8 +314,8 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
     ) -> Float[Tensor, "batch embed_dim length"]:
         """Upsample a quantized contribution to the full latent length.
 
-        The first scale uses the learned transposed convolution, intermediate
-        scales use linear interpolation, and the final scale is already full length.
+        The first scale uses a learned transposed convolution. Intermediate scales
+        use linear interpolation, and the final scale is already full length.
         The channels-first layout can pass directly into BlendedConv1d afterward.
         """
         if scale_index == len(self.scale_lengths) - 1:
@@ -321,6 +330,20 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             mode="linear",
             align_corners=False,
         )
+
+    def _prepare_scale_contribution(
+        self,
+        quantized_at_scale: Float[Tensor, "batch scale_length embed_dim"],
+        scale_index: int,
+    ) -> Float[Tensor, "batch length embed_dim"]:
+        """Upsample and refine one scale's quantized vectors."""
+        quantized_at_scale = einx.id("b l d -> b d l", quantized_at_scale)
+        scale_contribution = self._upsample_to_full_length(
+            quantized_at_scale,
+            scale_index,
+        )
+        scale_contribution = self.refiners[scale_index](scale_contribution)
+        return einx.id("b d l -> b l d", scale_contribution)
 
     def forward(
         self,
@@ -364,22 +387,17 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             indices_by_scale.append(scale_indices)
 
             # Nearest-code selection blocks gradients to the learned downsampler.
-            # At the first scale, use an STE whose forward value is the selected
-            # code but whose backward path treats the lookup as an identity. The
-            # codebook's EMA update is unaffected because it uses detached inputs.
+            # This preserves the selected code in the forward pass while treating
+            # the lookup as an identity when calculating downsampler gradients.
             if scale_index == 0 and len(self.scale_lengths) > 1:
-                quantized_at_scale = scaled_residual + (
-                    quantized_at_scale - scaled_residual
-                ).detach()
+                quantized_at_scale = (
+                    scaled_residual + (quantized_at_scale - scaled_residual).detach()
+                )
 
-            # Upsample and refine this scale's quantized contribution.
-            quantized_at_scale = einx.id("b l d -> b d l", quantized_at_scale)
-            scale_contribution = self._upsample_to_full_length(
+            scale_contribution = self._prepare_scale_contribution(
                 quantized_at_scale,
                 scale_index,
             )
-            scale_contribution = self.refiners[scale_index](scale_contribution)
-            scale_contribution = einx.id("b d l -> b l d", scale_contribution)
 
             reconstruction = reconstruction + scale_contribution
             residual = residual - scale_contribution
@@ -409,6 +427,34 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         quantized_latent = x + (decoder_reconstruction - x).detach()
         return quantized_latent, vq_loss, indices_by_scale
 
+    @torch.no_grad()
+    def indices_to_cumulative_latents(
+        self,
+        indices_by_scale: list[Int[Tensor, "batch scale_length"]],
+    ) -> list[Float[Tensor, "batch length embed_dim"]]:
+        """Reconstruct the latent after successively adding each scale."""
+        batch_size = indices_by_scale[0].shape[0]
+        full_length = self.scale_lengths[-1]
+        reconstruction = self.codebooks[0].codebook.new_zeros(
+            batch_size,
+            full_length,
+            self.embed_dim,
+        )
+        cumulative_latents = []
+
+        for scale_index, (codebook, scale_indices) in enumerate(
+            zip(self.codebooks, indices_by_scale)
+        ):
+            quantized_at_scale = codebook.codebook[scale_indices]
+            scale_contribution = self._prepare_scale_contribution(
+                quantized_at_scale,
+                scale_index,
+            )
+            reconstruction = reconstruction + scale_contribution
+            cumulative_latents.append(reconstruction)
+
+        return cumulative_latents
+
     @property
     def utilization_by_scale(self) -> list[Float[Tensor, ""]]:
         """Fraction of each scale's codes that have been used."""
@@ -421,3 +467,8 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             [codebook.codebook_hits.sum() for codebook in self.codebooks]
         ).sum()
         return used_codes / sum(self.codebook_sizes)
+
+    @property
+    def num_codebook_parameters(self) -> int:
+        """Number of learned codebook values included in model-size reporting."""
+        return sum(codebook.codebook.numel() for codebook in self.codebooks)

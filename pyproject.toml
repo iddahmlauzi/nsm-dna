@@ -7,6 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     "datasets>=4.5.0",
     "einx>=0.4.3",
+    "hydra-core>=1.3.5",
     "jaxtyping>=0.3.7",
     "numpy>=2.2.6",
     "openpyxl>=3.1",
@@ -15,4 +16,8 @@ dependencies = [
     "torch>=2.13.0",
     "tqdm>=4.67.3",
     "typing-extensions>=4.16.0",
+    "wandb>=0.21.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["nsm_dna*"]

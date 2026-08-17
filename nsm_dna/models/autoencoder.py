@@ -14,7 +14,7 @@ class Encoder(nn.Module):
         vocab_size: int,
         context_length: int,
         embed_dim: int,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
 

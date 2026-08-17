@@ -1,0 +1,21 @@
+# Planned configuration for second-stage NSM training.
+#
+# run:
+#   Experiment identity, output directory, seed, and optional resume checkpoint.
+#
+# data:
+#   GTDB location, batching, workers, streaming shuffle, and eventual split.
+#
+# tokenizer_checkpoint:
+#   The exact trained VQ-VAE checkpoint. Its stored configuration is the source
+#   of truth for levels, codebook sizes, and tokenizer architecture; those
+#   settings must not be duplicated here.
+#
+# model:
+#   Only NSM-transformer settings, such as width, depth, attention heads,
+#   dropout, and positional representation.
+#
+# optimizer, training, and wandb:
+#   The same categories used by the VQ-VAE configuration, with stage-specific
+#   optimization values and optional W&B reporting.
+

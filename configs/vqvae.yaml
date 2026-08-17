@@ -1,0 +1,99 @@
+# First full VQ-VAE training run on the 20B-base GTDB subset.
+
+run:
+  seed: 0
+  resume_from: null
+
+wandb:
+  enabled: true
+  entity: nsm-dna
+  project: vqvae
+  name: dna-256-20b-d384-first-scale-4-norm-ema95-lr1e-4-encoder-lr1e-5-no-encoder-dropout-seed0
+
+data:
+  subset_directory: ../datasets/gtdb/20B_subset
+  train_split: train
+  validation_split: validation
+  train_batch_size: 512
+  validation_batch_size: 128
+  num_workers: 3
+  shuffle_buffer_size: 10_000
+
+model:
+  vocab_size: 4
+  context_length: 256
+  embed_dim: 384
+  num_heads: 6
+  scale_lengths:
+    - 4
+    - 9
+    - 16
+    - 25
+    - 36
+    - 49
+    - 64
+    - 81
+    - 100
+    - 121
+    - 144
+    - 169
+    - 196
+    - 225
+    - 256
+  codebook_sizes:
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+
+  encoder_dropout: 0.0
+  decoder_dropout: 0.1
+  bias: false
+  pre_quant_num_groups: 4
+
+  commitment_cost: 0.25
+  decay: 0.95
+  eps: 1e-5
+
+  refinement_ratio: 0.5
+  refinement_kernel_size: 3
+
+  fine_dropout_prob: 0.5
+  min_scales_to_keep: 1
+
+optimizer:
+  learning_rate: 1e-4
+  encoder_learning_rate: 1e-5
+  min_learning_rate: 3e-5
+  warmup_steps: 300
+  beta_1: 0.9
+  beta_2: 0.99
+  weight_decay: 0.01
+  max_gradient_norm: 1.0
+  gradient_accumulation_steps: 1
+
+mixed_precision:
+  enabled: true
+
+training:
+  # One pass over the 78,124,992 non-overlapping 256-base training windows.
+  max_steps: 152_588
+  log_interval: 10
+
+evaluation:
+  interval: 1_000
+  max_batches: 10
+
+checkpoint:
+  interval: 10_000
