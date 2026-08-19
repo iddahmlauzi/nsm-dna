@@ -151,6 +151,77 @@ def _make_learned_upsampler(
     return upsampler
 
 
+class ChannelsFirstLayerNorm(nn.Module):
+    """Apply non-affine LayerNorm to channels-first sequence features."""
+
+    def __init__(self, embed_dim: int) -> None:
+        super().__init__()
+        self.normalization = nn.LayerNorm(embed_dim, elementwise_affine=False)
+
+    def forward(
+        self,
+        x: Float[Tensor, "batch embed_dim length"],
+    ) -> Float[Tensor, "batch embed_dim length"]:
+        x = einx.id("b d l -> b l d", x)
+        x = self.normalization(x)
+        return einx.id("b l d -> b d l", x)
+
+
+def _plan_cascade_strides(
+    total_stride: int,
+    base_stride: int = 4,
+) -> list[int]:
+    """Factor a large sampling stride into a sequence of smaller strides."""
+    remaining_stride = total_stride
+    cascade_strides = []
+
+    while remaining_stride > 1:
+        stage_stride = min(base_stride, remaining_stride)
+        while stage_stride > 1 and remaining_stride % stage_stride != 0:
+            stage_stride -= 1
+
+        if stage_stride == 1:
+            stage_stride = remaining_stride
+
+        cascade_strides.append(stage_stride)
+        remaining_stride //= stage_stride
+
+    return cascade_strides or [1]
+
+
+def _make_cascaded_downsampler(
+    embed_dim: int,
+    total_stride: int,
+) -> nn.Sequential:
+    """Create normalized small-stride stages for a large downsampling operation."""
+    strides = _plan_cascade_strides(total_stride)
+    modules: list[nn.Module] = []
+
+    for stage_index, stride in enumerate(strides):
+        modules.append(_make_learned_downsampler(embed_dim, stride))
+
+        # Normalize before the next learned stage so numerical gain cannot compound
+        # through the cascade. The final stage is normalized by first_scale_norm
+        # immediately before codebook lookup.
+        if stage_index < len(strides) - 1:
+            modules.append(ChannelsFirstLayerNorm(embed_dim))
+
+    return nn.Sequential(*modules)
+
+
+def _make_cascaded_upsampler(
+    embed_dim: int,
+    total_stride: int,
+) -> nn.Sequential:
+    """Reverse a cascaded downsampler with learned transposed convolutions."""
+    return nn.Sequential(
+        *(
+            _make_learned_upsampler(embed_dim, stride)
+            for stride in reversed(_plan_cascade_strides(total_stride))
+        )
+    )
+
+
 # ----------------------------------------------------------------------
 # Per-scale blended convolution
 #
@@ -215,18 +286,11 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         # Per-scale post-quantization refinement
         refinement_ratio: float = 0.5,
         refinement_kernel_size: int = 3,
-        # Fine-scale dropout
-        fine_dropout_prob: float = 0.5,
-        min_scales_to_keep: int = 1,
     ) -> None:
         super().__init__()
 
         if len(scale_lengths) != len(codebook_sizes):
             raise ValueError("Each scale length must have one codebook size.")
-        if not 1 <= min_scales_to_keep <= len(scale_lengths):
-            raise ValueError(
-                "min_scales_to_keep must be between 1 and the number of scales."
-            )
 
         self.scale_lengths = scale_lengths
         self.codebook_sizes = codebook_sizes
@@ -235,12 +299,6 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         self.refinement_ratio = refinement_ratio
         self.refinement_kernel_size = refinement_kernel_size
 
-        # During training, fine-scale dropout sometimes truncates the reconstruction
-        # at a random scale after min_scales_to_keep. This forces the decoder to use
-        # information carried by the coarse and intermediate scales.
-        self.fine_dropout_prob = fine_dropout_prob
-        self.min_scales_to_keep = min_scales_to_keep
-
         full_scale_length = scale_lengths[-1]
         first_scale_length = scale_lengths[0]
         if full_scale_length % first_scale_length != 0:
@@ -248,15 +306,17 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
                 "The full scale length must be divisible by the first scale length."
             )
 
+        # Factor the large first-scale stride into small learned stages so its
+        # parameter count grows with the number of stages, not the full kernel.
         first_scale_stride = full_scale_length // first_scale_length
-        self.first_scale_downsampler = _make_learned_downsampler(
+        self.first_scale_downsampler = _make_cascaded_downsampler(
             embed_dim,
-            stride=first_scale_stride,
+            total_stride=first_scale_stride,
         )
         self.first_scale_norm = nn.LayerNorm(embed_dim, elementwise_affine=False)
-        self.first_scale_upsampler = _make_learned_upsampler(
+        self.first_scale_upsampler = _make_cascaded_upsampler(
             embed_dim,
-            stride=first_scale_stride,
+            total_stride=first_scale_stride,
         )
 
         self.codebooks = nn.ModuleList(
@@ -279,8 +339,8 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
     ) -> Float[Tensor, "batch scale_length embed_dim"]:
         """Downsample the residual to the selected scale's sequence length.
 
-        The first scale uses a learned strided convolution. Intermediate scales use
-        area interpolation, and the final scale is already full length.
+        The first scale uses cascaded learned strided convolutions. Intermediate
+        scales use area interpolation, and the final scale is already full length.
         """
         scale_length = self.scale_lengths[scale_index]
         if scale_index == len(self.scale_lengths) - 1:
@@ -348,8 +408,11 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
     def forward(
         self,
         x: Float[Tensor, "batch length embed_dim"],
+        *,
+        include_partial_reconstruction: bool = False,
     ) -> tuple[
         Float[Tensor, "batch length embed_dim"],
+        Float[Tensor, "batch length embed_dim"] | None,
         Float[Tensor, ""],
         list[Int[Tensor, "batch scale_length"]],
     ]:
@@ -361,25 +424,21 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         residual = detached_x.clone()
         reconstruction = torch.zeros_like(residual)
 
-        # Decide whether this training step will drop fine-scale contributions.
-        can_drop_fine_scales = self.min_scales_to_keep < len(self.scale_lengths)
-        apply_fine_dropout = (
-            self.training
-            and can_drop_fine_scales
-            and self.fine_dropout_prob > 0.0
-            and torch.rand(()).item() < self.fine_dropout_prob
-        )
-        num_scales_to_keep = len(self.scale_lengths)
-        if apply_fine_dropout:
-            num_scales_to_keep = torch.randint(
-                low=self.min_scales_to_keep,
-                high=len(self.scale_lengths),
+        partial_scale_index = None
+        if include_partial_reconstruction:
+            if len(self.scale_lengths) < 2:
+                raise ValueError(
+                    "Partial reconstruction requires at least two quantization scales."
+                )
+            partial_scale_index = torch.randint(
+                low=0,
+                high=len(self.scale_lengths) - 1,
                 size=(),
             ).item()
 
         vq_loss = x.new_zeros(())
         indices_by_scale: list[Int[Tensor, "batch scale_length"]] = []
-        decoder_reconstruction: Tensor | None = None
+        partial_reconstruction: Tensor | None = None
 
         for scale_index, codebook in enumerate(self.codebooks):
             scaled_residual = self._downsample_to_scale(residual, scale_index)
@@ -416,16 +475,19 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             )
             vq_loss = vq_loss + encoder_commitment_loss + quantizer_reconstruction_loss
 
-            # Save the reconstruction after the selected number of scales.
-            if scale_index + 1 == num_scales_to_keep:
-                decoder_reconstruction = reconstruction
+            if scale_index == partial_scale_index:
+                partial_reconstruction = reconstruction
 
         vq_loss = vq_loss / len(self.scale_lengths)
-        assert decoder_reconstruction is not None
 
         # Give the decoder quantized values while passing its gradients to the encoder.
-        quantized_latent = x + (decoder_reconstruction - x).detach()
-        return quantized_latent, vq_loss, indices_by_scale
+        quantized_latent = x + (reconstruction - x).detach()
+
+        # The auxiliary partial loss follows the quantized reconstruction directly.
+        # Its gradients train the learned samplers and refiners without moving the
+        # shared encoder target. The main full-reconstruction path above retains the
+        # straight-through encoder gradient.
+        return quantized_latent, partial_reconstruction, vq_loss, indices_by_scale
 
     @torch.no_grad()
     def indices_to_cumulative_latents(

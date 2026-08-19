@@ -1,4 +1,4 @@
-# First full VQ-VAE training run on the 20B-base GTDB subset.
+# Stable VQ-VAE configuration for the 20B-base GTDB subset.
 
 run:
   seed: 0
@@ -8,7 +8,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: vqvae
-  name: dna-256-20b-d384-first-scale-4-norm-ema95-lr1e-4-encoder-lr1e-5-no-encoder-dropout-seed0
+  name: dna-256-20b-d384-vqvae
 
 data:
   subset_directory: ../datasets/gtdb/20B_subset
@@ -63,14 +63,18 @@ model:
   pre_quant_num_groups: 4
 
   commitment_cost: 0.25
-  decay: 0.95
+  decay: 0.99
   eps: 1e-5
 
   refinement_ratio: 0.5
   refinement_kernel_size: 3
 
-  fine_dropout_prob: 0.5
-  min_scales_to_keep: 1
+  # Always train the full reconstruction. One randomly selected non-final
+  # cumulative scale receives an auxiliary reconstruction loss. Its gradient is
+  # stronger on the quantizer path than on the shared decoder so it makes each
+  # prefix useful without overwhelming the nearly solved full-decoder objective.
+  partial_reconstruction_quantizer_weight: 0.2
+  partial_reconstruction_decoder_weight: 0.01
 
 optimizer:
   learning_rate: 1e-4

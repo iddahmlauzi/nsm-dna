@@ -8,6 +8,19 @@ from .autoencoder import Decoder, Encoder
 from .quantization import MultiscaleResidualVectorQuantizer
 
 
+class _ScaleGradient(torch.autograd.Function):
+    """Keep a tensor's forward value while scaling its backward gradient."""
+
+    @staticmethod
+    def forward(ctx, tensor: Tensor, scale: float) -> Tensor:
+        ctx.scale = scale
+        return tensor
+
+    @staticmethod
+    def backward(ctx, gradient: Tensor) -> tuple[Tensor, None]:
+        return gradient * ctx.scale, None
+
+
 class VQVAE(nn.Module):
     """VQ-VAE with a multiscale residual quantization bottleneck."""
 
@@ -32,9 +45,6 @@ class VQVAE(nn.Module):
         # Per-scale post-quantization refinement
         refinement_ratio: float = 0.5,
         refinement_kernel_size: int = 3,
-        # Fine-scale dropout
-        fine_dropout_prob: float = 0.5,
-        min_scales_to_keep: int = 1,
     ) -> None:
         super().__init__()
 
@@ -89,8 +99,6 @@ class VQVAE(nn.Module):
             eps=eps,
             refinement_ratio=refinement_ratio,
             refinement_kernel_size=refinement_kernel_size,
-            fine_dropout_prob=fine_dropout_prob,
-            min_scales_to_keep=min_scales_to_keep,
         )
         self.decoder = Decoder(
             self.vocab_size,
@@ -117,16 +125,40 @@ class VQVAE(nn.Module):
     def forward(
         self,
         token_ids: Int[Tensor, "batch length"],
+        *,
+        include_partial_reconstruction: bool = False,
+        partial_latent_gradient_scale: float = 1.0,
     ) -> tuple[
         Float[Tensor, "batch length vocab_size"],
+        Float[Tensor, "batch length vocab_size"] | None,
         Float[Tensor, ""],
         list[Int[Tensor, "batch scale_length"]],
     ]:
         latent = self._encode_pre_quant(token_ids)
-        quantized_latent, vq_loss, indices_by_scale = self.quantizer(latent)
+        (
+            quantized_latent,
+            partial_quantized_latent,
+            vq_loss,
+            indices_by_scale,
+        ) = self.quantizer(
+            latent,
+            include_partial_reconstruction=include_partial_reconstruction,
+        )
         logits = self.decoder(quantized_latent)
 
-        return logits, vq_loss, indices_by_scale
+        partial_logits = None
+        if partial_quantized_latent is not None:
+            # The partial loss uses one decoder pass, but its gradient can have
+            # different strengths on the quantizer path and decoder parameters.
+            # Scaling at the decoder input affects only the gradient flowing back
+            # into the quantizer; the loss coefficient controls the decoder.
+            partial_quantized_latent = _ScaleGradient.apply(
+                partial_quantized_latent,
+                partial_latent_gradient_scale,
+            )
+            partial_logits = self.decoder(partial_quantized_latent)
+
+        return logits, partial_logits, vq_loss, indices_by_scale
 
     @torch.no_grad()
     def encode(
@@ -143,7 +175,7 @@ class VQVAE(nn.Module):
             raise RuntimeError("Call model.eval() before encoding sequences.")
 
         latent = self._encode_pre_quant(token_ids)
-        _, _, indices_by_scale = self.quantizer(latent)
+        _, _, _, indices_by_scale = self.quantizer(latent)
         return indices_by_scale
 
     @torch.no_grad()
