@@ -63,13 +63,6 @@ def evaluate(
     # Encoder magnitude, which GroupNorm should keep stable.
     encoder_latent_squared_sum = 0.0
 
-    # Magnitude before and after the fixed first-scale normalization. The raw
-    # value exposes compounded gain inside the cascade, while the normalized
-    # value verifies that the codebook continues to receive a fixed-scale input.
-    first_scale_pre_norm_squared_sum = 0.0
-    first_scale_post_norm_squared_sum = 0.0
-    num_first_scale_values = 0
-
     for batch_index, batch in enumerate(data_loader):
         if max_batches is not None and batch_index == max_batches:
             break
@@ -87,25 +80,12 @@ def evaluate(
             )
 
             encoder_latent = model._encode_pre_quant(input_ids)
-            first_scale_pre_norm = model.quantizer.first_scale_downsampler(
-                encoder_latent.transpose(1, 2)
-            ).transpose(1, 2)
-            first_scale_post_norm = model.quantizer.first_scale_norm(
-                first_scale_pre_norm
-            )
             cumulative_latents = model.quantizer.indices_to_cumulative_latents(
                 indices_by_scale
             )
             previous_latent = torch.zeros_like(cumulative_latents[0])
 
             encoder_latent_squared_sum += encoder_latent.float().square().sum().item()
-            first_scale_pre_norm_squared_sum += (
-                first_scale_pre_norm.float().square().sum().item()
-            )
-            first_scale_post_norm_squared_sum += (
-                first_scale_post_norm.float().square().sum().item()
-            )
-            num_first_scale_values += first_scale_pre_norm.numel()
             for scale_index, cumulative_latent in enumerate(cumulative_latents):
                 scale_logits = model.decoder(cumulative_latent)
                 scale_reconstruction_loss = F.cross_entropy(
@@ -153,14 +133,6 @@ def evaluate(
         "total_loss": reconstruction_loss + vq_loss,
         "accuracy": correct_tokens / num_tokens,
         "encoder_latent_rms": (encoder_latent_squared_sum / num_latent_values) ** 0.5,
-        "first_scale_pre_norm_rms": (
-            first_scale_pre_norm_squared_sum / num_first_scale_values
-        )
-        ** 0.5,
-        "first_scale_post_norm_rms": (
-            first_scale_post_norm_squared_sum / num_first_scale_values
-        )
-        ** 0.5,
     }
 
     scale_metrics = zip(
@@ -561,12 +533,6 @@ def main(config: DictConfig) -> None:
                         "validation/accuracy": validation_metrics["accuracy"],
                         "validation/encoder_latent_rms": validation_metrics[
                             "encoder_latent_rms"
-                        ],
-                        "validation/first_scale_pre_norm_rms": validation_metrics[
-                            "first_scale_pre_norm_rms"
-                        ],
-                        "validation/first_scale_post_norm_rms": validation_metrics[
-                            "first_scale_post_norm_rms"
                         ],
                         "validation/best_reconstruction_loss": best_validation_loss,
                     }

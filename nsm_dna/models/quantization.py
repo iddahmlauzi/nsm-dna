@@ -177,6 +177,9 @@ def _plan_cascade_strides(
 
     while remaining_stride > 1:
         stage_stride = min(base_stride, remaining_stride)
+
+        # Choose a factor of the remaining stride so the cascade reduces the
+        # sequence to exactly the requested length without a partial final stage.
         while stage_stride > 1 and remaining_stride % stage_stride != 0:
             stage_stride -= 1
 
@@ -193,18 +196,15 @@ def _make_cascaded_downsampler(
     embed_dim: int,
     total_stride: int,
 ) -> nn.Sequential:
-    """Create normalized small-stride stages for a large downsampling operation."""
+    """Create a large downsampler from normalized small-stride stages."""
     strides = _plan_cascade_strides(total_stride)
     modules: list[nn.Module] = []
 
-    for stage_index, stride in enumerate(strides):
+    for stride in strides:
         modules.append(_make_learned_downsampler(embed_dim, stride))
-
-        # Normalize before the next learned stage so numerical gain cannot compound
-        # through the cascade. The final stage is normalized by first_scale_norm
-        # immediately before codebook lookup.
-        if stage_index < len(strides) - 1:
-            modules.append(ChannelsFirstLayerNorm(embed_dim))
+        # Interstage norms prevent numerical gain from compounding. The final norm
+        # fixes the scale presented to the first codebook.
+        modules.append(ChannelsFirstLayerNorm(embed_dim))
 
     return nn.Sequential(*modules)
 
@@ -313,7 +313,6 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             embed_dim,
             total_stride=first_scale_stride,
         )
-        self.first_scale_norm = nn.LayerNorm(embed_dim, elementwise_affine=False)
         self.first_scale_upsampler = _make_cascaded_upsampler(
             embed_dim,
             total_stride=first_scale_stride,
@@ -350,14 +349,6 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         residual = einx.id("b l d -> b d l", residual)
         if scale_index == 0:
             scaled_residual = self.first_scale_downsampler(residual)
-            scaled_residual = einx.id("b d l -> b l d", scaled_residual)
-
-            # The encoder was normalized before quantization, but the learned
-            # convolution can increase its magnitude again. Normalize each coarse
-            # vector before codebook lookup so the codebook and refiner do not chase
-            # and then cancel increasingly large values. Disabling LayerNorm's
-            # affine transform prevents it from learning that scale back.
-            return self.first_scale_norm(scaled_residual)
         else:
             scaled_residual = F.interpolate(
                 residual,
@@ -416,6 +407,13 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         Float[Tensor, ""],
         list[Int[Tensor, "batch scale_length"]],
     ]:
+        """Quantize an encoder latent into cumulative multiscale contributions.
+
+        When partial reconstruction is enabled, the second return value is one
+        randomly selected non-final cumulative latent. The caller decodes that
+        latent and computes the auxiliary reconstruction loss against the input
+        tokens.
+        """
         x = x.float()
 
         # Quantize the encoder output without backpropagating through the residual
@@ -438,7 +436,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
 
         vq_loss = x.new_zeros(())
         indices_by_scale: list[Int[Tensor, "batch scale_length"]] = []
-        partial_reconstruction: Tensor | None = None
+        partial_quantized_latent: Tensor | None = None
 
         for scale_index, codebook in enumerate(self.codebooks):
             scaled_residual = self._downsample_to_scale(residual, scale_index)
@@ -476,18 +474,14 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             vq_loss = vq_loss + encoder_commitment_loss + quantizer_reconstruction_loss
 
             if scale_index == partial_scale_index:
-                partial_reconstruction = reconstruction
+                partial_quantized_latent = reconstruction
 
         vq_loss = vq_loss / len(self.scale_lengths)
 
         # Give the decoder quantized values while passing its gradients to the encoder.
         quantized_latent = x + (reconstruction - x).detach()
 
-        # The auxiliary partial loss follows the quantized reconstruction directly.
-        # Its gradients train the learned samplers and refiners without moving the
-        # shared encoder target. The main full-reconstruction path above retains the
-        # straight-through encoder gradient.
-        return quantized_latent, partial_reconstruction, vq_loss, indices_by_scale
+        return quantized_latent, partial_quantized_latent, vq_loss, indices_by_scale
 
     @torch.no_grad()
     def indices_to_cumulative_latents(

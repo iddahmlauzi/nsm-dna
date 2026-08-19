@@ -208,8 +208,6 @@ def test_evaluate_reports_vq_diagnostics_by_scale() -> None:
     )
 
     assert "encoder_latent_rms" in metrics
-    assert "first_scale_pre_norm_rms" in metrics
-    assert "first_scale_post_norm_rms" in metrics
     mean_cumulative_latent_mse = sum(
         metrics[f"cumulative_latent_mse_scale_{scale_length}"]
         for scale_length in model.scale_lengths
