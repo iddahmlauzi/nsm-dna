@@ -1,0 +1,288 @@
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from omegaconf import OmegaConf
+
+from nsm_dna.models.nsm import NSM
+from nsm_dna.models.vqvae import VQVAE
+from scripts.train_nsm import (
+    build_scale_loss_weights,
+    calculate_training_steps,
+    compute_next_scale_loss,
+    evaluate,
+    load_tokenizer,
+    prepare_block_predictions,
+    prepare_nsm_batch,
+)
+
+
+def _build_tokenizer() -> VQVAE:
+    return VQVAE(
+        vocab_size=4,
+        context_length=4,
+        embed_dim=8,
+        num_heads=2,
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[8, 8, 8],
+        encoder_dropout=0.0,
+        decoder_dropout=0.0,
+        pre_quant_num_groups=2,
+    )
+
+
+def _build_nsm(max_prefix_length: int = 0) -> NSM:
+    return NSM(
+        vq_embed_dim=8,
+        model_dim=8,
+        scale_lengths=[1, 2, 4],
+        codebook_size=8,
+        num_layers=1,
+        num_heads=2,
+        dropout=0.0,
+        max_prefix_length=max_prefix_length,
+    )
+
+
+def test_training_steps_are_derived_from_epochs(tmp_path: Path) -> None:
+    (tmp_path / "subset_stats.json").write_text(
+        '{"splits": {"train": {"bases": 1000}}}'
+    )
+    config = OmegaConf.create(
+        {
+            "data": {
+                "subset_directory": str(tmp_path),
+                "train_split": "train",
+                "sequence_length": 16,
+                "train_batch_size": 5,
+            },
+            "optimizer": {"gradient_accumulation_steps": 2},
+            "training": {"num_epochs": 3, "max_steps": None},
+        }
+    )
+
+    assert calculate_training_steps(config, world_size=2) == 12
+
+    config.training.max_steps = 7
+    assert calculate_training_steps(config, world_size=2) == 7
+
+
+def test_scale_loss_alpha_controls_each_scale_share() -> None:
+    equal_scale_weights = build_scale_loss_weights(
+        [1, 2, 4],
+        scale_loss_alpha=1.0,
+        device=torch.device("cpu"),
+    )
+    equal_position_weights = build_scale_loss_weights(
+        [1, 2, 4],
+        scale_loss_alpha=0.0,
+        device=torch.device("cpu"),
+    )
+
+    torch.testing.assert_close(
+        equal_scale_weights,
+        torch.full((3,), 1 / 3),
+    )
+    torch.testing.assert_close(
+        equal_position_weights,
+        torch.tensor([1 / 7, 2 / 7, 4 / 7]),
+    )
+
+
+def test_next_scale_loss_includes_and_aligns_every_scale() -> None:
+    targets_by_scale = [
+        torch.tensor([[0], [1]]),
+        torch.tensor([[1, 2], [2, 3]]),
+        torch.tensor([[3, 2, 1, 0], [0, 1, 2, 3]]),
+    ]
+    logits = torch.randn(2, 7, 4)
+    scale_weights = torch.tensor([0.2, 0.3, 0.5])
+
+    loss, losses_by_scale = compute_next_scale_loss(
+        logits,
+        targets_by_scale,
+        scale_weights,
+    )
+
+    logits_by_scale = torch.split(logits, [1, 2, 4], dim=1)
+    expected_losses = torch.stack(
+        [
+            F.cross_entropy(
+                scale_logits.flatten(0, 1),
+                scale_targets.flatten(),
+            )
+            for scale_logits, scale_targets in zip(
+                logits_by_scale,
+                targets_by_scale,
+            )
+        ]
+    )
+
+    torch.testing.assert_close(losses_by_scale, expected_losses)
+    torch.testing.assert_close(loss, torch.sum(expected_losses * scale_weights))
+
+
+def test_next_scale_loss_matches_original_position_weighting() -> None:
+    scale_lengths = [1, 2, 4]
+    scale_loss_alpha = 0.25
+    targets_by_scale = [
+        torch.tensor([[0], [1]]),
+        torch.tensor([[1, 2], [2, 3]]),
+        torch.tensor([[3, 2, 1, 0], [0, 1, 2, 3]]),
+    ]
+    targets = torch.cat(targets_by_scale, dim=1)
+    logits = torch.randn(2, sum(scale_lengths), 4)
+    scale_weights = build_scale_loss_weights(
+        scale_lengths,
+        scale_loss_alpha,
+        device=torch.device("cpu"),
+    )
+
+    loss, _ = compute_next_scale_loss(
+        logits,
+        targets_by_scale,
+        scale_weights,
+    )
+
+    normalization = sum(
+        scale_length ** (1.0 - scale_loss_alpha) for scale_length in scale_lengths
+    )
+    position_weights = torch.cat(
+        [
+            torch.full(
+                (scale_length,),
+                scale_length**-scale_loss_alpha / normalization,
+            )
+            for scale_length in scale_lengths
+        ]
+    )
+    loss_by_position = F.cross_entropy(
+        logits.flatten(0, 1),
+        targets.flatten(),
+        reduction="none",
+    ).reshape(targets.shape)
+    expected_loss = (loss_by_position * position_weights).sum(dim=1).mean()
+
+    torch.testing.assert_close(loss, expected_loss)
+
+
+def test_tokenizer_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
+    tokenizer = _build_tokenizer()
+    checkpoint_path = tmp_path / "tokenizer.pt"
+    torch.save(
+        {
+            "config": {
+                "model": {
+                    "vocab_size": 4,
+                    "context_length": 4,
+                    "embed_dim": 8,
+                    "num_heads": 2,
+                    "scale_lengths": [1, 2, 4],
+                    "codebook_sizes": [8, 8, 8],
+                    "encoder_dropout": 0.0,
+                    "decoder_dropout": 0.0,
+                    "bias": False,
+                    "pre_quant_num_groups": 2,
+                    "commitment_cost": 0.25,
+                    "decay": 0.99,
+                    "eps": 1e-5,
+                    "refinement_ratio": 0.5,
+                    "refinement_kernel_size": 3,
+                }
+            },
+            "model": tokenizer.state_dict(),
+        },
+        checkpoint_path,
+    )
+
+    restored_tokenizer = load_tokenizer(
+        checkpoint_path,
+        device=torch.device("cpu"),
+    )
+
+    assert restored_tokenizer.training is False
+    assert all(
+        parameter.requires_grad is False
+        for parameter in restored_tokenizer.parameters()
+    )
+    for name, expected_value in tokenizer.state_dict().items():
+        torch.testing.assert_close(
+            restored_tokenizer.state_dict()[name],
+            expected_value,
+        )
+
+
+def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
+    tokenizer = _build_tokenizer().eval()
+    tokenizer.requires_grad_(False)
+    model = _build_nsm()
+    input_ids = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
+    scale_weights = build_scale_loss_weights(
+        tokenizer.scale_lengths,
+        scale_loss_alpha=0.25,
+        device=torch.device("cpu"),
+    )
+
+    next_scale_inputs, targets_by_scale = prepare_nsm_batch(tokenizer, input_ids)
+    logits = model(next_scale_inputs)
+    loss, _ = compute_next_scale_loss(logits, targets_by_scale, scale_weights)
+    loss.backward()
+
+    assert [scale_input.shape[1] for scale_input in next_scale_inputs] == [2, 4]
+    assert [targets.shape[1] for targets in targets_by_scale] == [1, 2, 4]
+    assert logits.shape == (2, 7, 8)
+    assert all(parameter.grad is None for parameter in tokenizer.parameters())
+    assert any(parameter.grad is not None for parameter in model.parameters())
+
+
+def test_block_predictions_use_every_available_prefix_length() -> None:
+    tokenizer = _build_tokenizer().eval()
+    input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
+    blocks = input_ids.reshape(2, 4, 4)
+
+    block_predictions = prepare_block_predictions(tokenizer, input_ids)
+    assert [
+        0 if prediction.prefix is None else prediction.prefix.shape[1]
+        for prediction in block_predictions
+    ] == [0, 4, 8, 12]
+
+    encoded_blocks = [tokenizer.encode(block) for block in blocks.unbind(dim=1)]
+    for block_index, (block, prediction) in enumerate(
+        zip(blocks.unbind(dim=1), block_predictions)
+    ):
+        if block_index > 0:
+            expected_prefix = torch.cat(encoded_blocks[:block_index], dim=1)
+            torch.testing.assert_close(prediction.prefix, expected_prefix)
+
+        expected_inputs, expected_targets = prepare_nsm_batch(tokenizer, block)
+        for actual, expected in zip(prediction.scale_inputs, expected_inputs):
+            torch.testing.assert_close(actual, expected)
+        for actual, expected in zip(prediction.targets_by_scale, expected_targets):
+            torch.testing.assert_close(actual, expected)
+
+
+def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
+    tokenizer = _build_tokenizer().eval()
+    tokenizer.requires_grad_(False)
+    model = _build_nsm(max_prefix_length=12)
+    input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
+    scale_weights = build_scale_loss_weights(
+        tokenizer.scale_lengths,
+        scale_loss_alpha=0.25,
+        device=torch.device("cpu"),
+    )
+
+    metrics = evaluate(
+        model,
+        tokenizer,
+        data_loader=[{"input_ids": input_ids}],
+        scale_loss_weights=scale_weights,
+        use_mixed_precision=False,
+    )
+
+    assert model.training is True
+    assert metrics["loss"] > 0
+    assert 0 <= metrics["accuracy"] <= 1
+    for scale_length in tokenizer.scale_lengths:
+        assert metrics[f"loss_scale_{scale_length}"] > 0
+        assert 0 <= metrics[f"accuracy_scale_{scale_length}"] <= 1

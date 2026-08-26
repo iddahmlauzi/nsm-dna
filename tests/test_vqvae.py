@@ -70,6 +70,58 @@ def test_cumulative_decode_matches_full_reconstruction() -> None:
     torch.testing.assert_close(cumulative_logits[-1], logits)
 
 
+def test_encode_returns_continuous_prefix_latents() -> None:
+    model = VQVAE(
+        vocab_size=4,
+        context_length=4,
+        embed_dim=8,
+        num_heads=2,
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[8, 8, 8],
+        encoder_dropout=0.0,
+        decoder_dropout=0.0,
+        pre_quant_num_groups=2,
+    ).eval()
+    token_ids = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
+
+    prefix_latents = model.encode(token_ids)
+    encoder_latents = model.encoder(token_ids)
+    expected_latents = model.pre_quant_norm(
+        encoder_latents.transpose(1, 2)
+    ).transpose(1, 2)
+
+    assert prefix_latents.shape == (2, 4, 8)
+    torch.testing.assert_close(prefix_latents, expected_latents)
+
+
+def test_next_scale_inputs_are_resized_cumulative_latents() -> None:
+    quantizer = MultiscaleResidualVectorQuantizer(
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[8, 8, 8],
+        embed_dim=8,
+    ).eval()
+    indices_by_scale = [
+        torch.tensor([[0], [1]]),
+        torch.tensor([[2, 3], [4, 5]]),
+        torch.tensor([[6, 7, 0, 1], [2, 3, 4, 5]]),
+    ]
+
+    next_scale_inputs = quantizer.indices_to_next_scale_inputs(indices_by_scale)
+    cumulative_latents = quantizer.indices_to_cumulative_latents(indices_by_scale)
+    first_cumulative_latent = cumulative_latents[0].transpose(1, 2)
+    expected_second_scale_input = F.interpolate(
+        first_cumulative_latent,
+        size=2,
+        mode="area",
+    ).transpose(1, 2)
+
+    assert len(next_scale_inputs) == 2
+    assert next_scale_inputs[0].shape == (2, 2, 8)
+    assert next_scale_inputs[1].shape == (2, 4, 8)
+    torch.testing.assert_close(next_scale_inputs[0], expected_second_scale_input)
+    torch.testing.assert_close(next_scale_inputs[1], cumulative_latents[1])
+
+
 def test_partial_reconstruction_trains_quantizer_without_moving_encoder() -> None:
     model = VQVAE(
         vocab_size=4,

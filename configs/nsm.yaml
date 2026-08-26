@@ -1,21 +1,80 @@
-# Planned configuration for second-stage NSM training.
-#
-# run:
-#   Experiment identity, output directory, seed, and optional resume checkpoint.
-#
-# data:
-#   GTDB location, batching, workers, streaming shuffle, and eventual split.
-#
-# tokenizer_checkpoint:
-#   The exact trained VQ-VAE checkpoint. Its stored configuration is the source
-#   of truth for levels, codebook sizes, and tokenizer architecture; those
-#   settings must not be duplicated here.
-#
-# model:
-#   Only NSM-transformer settings, such as width, depth, attention heads,
-#   dropout, and positional representation.
-#
-# optimizer, training, and wandb:
-#   The same categories used by the VQ-VAE configuration, with stage-specific
-#   optimization values and optional W&B reporting.
+# NSM-DNA pilot using four 64-base blocks per 256-base training sequence.
 
+run:
+  seed: 0
+  resume_from: null
+
+# The checkpoint's stored model configuration is the source of truth for the
+# tokenizer architecture, scale lengths, and codebook sizes.
+tokenizer_checkpoint: ../runs/vqvae-64-block/checkpoints/final.pt
+
+wandb:
+  enabled: true
+  entity: nsm-dna
+  project: nsm
+  name: nsm-64-block-equal-scale
+
+data:
+  subset_directory: ../datasets/gtdb/5B_subset
+  train_split: train
+  validation_split: validation
+  sequence_length: 256
+  # Batch 64 yields 152,588 optimizer updates over two epochs on four GPUs.
+  train_batch_size: 64
+  validation_batch_size: 128
+  num_workers: 3
+  shuffle_buffer_size: 10_000
+
+model:
+  model_dim: 384
+  num_layers: 6
+  num_heads: 6
+  dropout: 0.1
+  bias: true
+
+  use_qk_norm: true
+  rope_base: 10_000
+
+  head_num_blocks: 2
+  head_hidden_multiplier: 2.0
+  input_refinement_kernel_size: 3
+
+optimizer:
+  learning_rate: 5e-4
+  min_learning_rate: 1e-5
+  warmup_steps: 300
+  beta_1: 0.9
+  beta_2: 0.99
+  weight_decay: 0.01
+  max_gradient_norm: 1.0
+  gradient_accumulation_steps: 1
+
+  # A scale's loss share is proportional to length ** (1 - alpha).
+  scale_loss_alpha: 1.0
+
+mixed_precision:
+  enabled: true
+
+training:
+  num_epochs: 2
+  # Set an integer here to override the epoch-derived training length.
+  max_steps: null
+  log_interval: 10
+
+evaluation:
+  interval: 1_000
+  max_batches: 10
+
+checkpoint:
+  # Overwrite one recovery checkpoint frequently, while retaining a sparser
+  # history for comparing or restarting from earlier training stages.
+  recovery_interval: 3_000
+  milestone_interval: 50_000
+  huggingface:
+    enabled: true
+    repository_id: Iddah/nsm-dna-checkpoints
+    repository_directory: nsm-64-block-equal-scale
+
+hydra:
+  run:
+    dir: ../runs/${wandb.name}

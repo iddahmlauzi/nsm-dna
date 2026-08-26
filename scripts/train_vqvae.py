@@ -1,3 +1,5 @@
+import json
+import math
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -6,6 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
+from huggingface_hub import HfApi
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.parallel import DistributedDataParallel
@@ -21,6 +24,26 @@ from nsm_dna.training import (
     load_checkpoint,
     save_checkpoint,
 )
+
+
+def calculate_training_steps(config: DictConfig, world_size: int) -> int:
+    """Use max_steps when set; otherwise derive the run length from num_epochs."""
+    if config.training.max_steps is not None:
+        return int(config.training.max_steps)
+
+    stats_path = Path(config.data.subset_directory) / "subset_stats.json"
+    with stats_path.open() as handle:
+        split_stats = json.load(handle)["splits"][config.data.train_split]
+    num_training_bases = split_stats["bases"]
+
+    bases_per_step = (
+        config.model.context_length
+        * config.data.train_batch_size
+        * world_size
+        * config.optimizer.gradient_accumulation_steps
+    )
+    steps_per_epoch = math.ceil(num_training_bases / bases_per_step)
+    return int(config.training.num_epochs) * steps_per_epoch
 
 
 @torch.no_grad()
@@ -79,7 +102,7 @@ def evaluate(
                 input_ids.flatten(),
             )
 
-            encoder_latent = model._encode_pre_quant(input_ids)
+            encoder_latent = model.encode(input_ids)
             cumulative_latents = model.quantizer.indices_to_cumulative_latents(
                 indices_by_scale
             )
@@ -182,6 +205,25 @@ def main(config: DictConfig) -> None:
     distributed_environment = initialize_distributed_training()
     torch.manual_seed(config.run.seed + distributed_environment.rank)
     run_directory = Path(HydraConfig.get().runtime.output_dir)
+    total_steps = calculate_training_steps(config, distributed_environment.world_size)
+    if distributed_environment.is_main_process:
+        print(f"training for {total_steps:,} optimizer steps")
+
+    hugging_face_api = HfApi() if config.checkpoint.huggingface.enabled else None
+
+    def upload_checkpoint(checkpoint_path: Path) -> None:
+        if hugging_face_api is None:
+            return
+
+        hugging_face_api.upload_file(
+            path_or_fileobj=checkpoint_path,
+            path_in_repo=(
+                f"{config.checkpoint.huggingface.repository_directory}/"
+                f"{checkpoint_path.name}"
+            ),
+            repo_id=config.checkpoint.huggingface.repository_id,
+            repo_type="model",
+        )
 
     # Create the experiment logger.
     wandb_run = None
@@ -296,7 +338,7 @@ def main(config: DictConfig) -> None:
     scheduler = build_learning_rate_scheduler(
         optimizer,
         warmup_steps=config.optimizer.warmup_steps,
-        decay_end_step=config.training.max_steps,
+        decay_end_step=total_steps,
         learning_rate=config.optimizer.learning_rate,
         min_learning_rate=config.optimizer.min_learning_rate,
     )
@@ -325,18 +367,15 @@ def main(config: DictConfig) -> None:
                 model,
                 device_ids=[distributed_environment.local_rank],
                 output_device=distributed_environment.local_rank,
-                forward_sync_buffers=False,
             )
         else:
-            training_model = DistributedDataParallel(
-                model,
-                forward_sync_buffers=False,
-            )
+            training_model = DistributedDataParallel(model)
 
     # Train the model.
+    training_epoch = 0
     train_iterator = iter(train_loader)
     progress_bar = tqdm(
-        range(start_step + 1, config.training.max_steps + 1),
+        range(start_step + 1, total_steps + 1),
         desc="Training",
         disable=not distributed_environment.is_main_process,
     )
@@ -354,7 +393,14 @@ def main(config: DictConfig) -> None:
         vq_loss_sum = 0.0
 
         for micro_step in range(gradient_accumulation_steps):
-            batch = next(train_iterator)
+            try:
+                batch = next(train_iterator)
+            except StopIteration:
+                training_epoch += 1
+                train_dataset.set_epoch(training_epoch)
+                train_iterator = iter(train_loader)
+                batch = next(train_iterator)
+
             input_ids = batch["input_ids"].to(device)
 
             is_last_micro_step = micro_step == gradient_accumulation_steps - 1
@@ -445,8 +491,6 @@ def main(config: DictConfig) -> None:
                     ),
                     vq_loss=f"{vq_loss_value:.4f}",
                     total_loss=f"{total_loss_value:.4f}",
-                    gradient_norm=f"{gradient_norm.item():.4f}",
-                    learning_rate=f"{learning_rate:.2e}",
                 )
 
                 if wandb_run is not None:
@@ -497,6 +541,7 @@ def main(config: DictConfig) -> None:
                         checkpoint_name="best.pt",
                     )
                     tqdm.write(f"saved best checkpoint: {best_checkpoint_path}")
+                    upload_checkpoint(best_checkpoint_path)
 
                 scale_utilizations = {
                     scale_length: utilization.item()
@@ -576,8 +621,10 @@ def main(config: DictConfig) -> None:
                     config,
                     step,
                     best_validation_loss,
+                    checkpoint_name="latest.pt",
                 )
                 tqdm.write(f"saved checkpoint: {checkpoint_path}")
+                upload_checkpoint(checkpoint_path)
 
             if distributed_environment.is_distributed:
                 dist.barrier()
@@ -589,11 +636,12 @@ def main(config: DictConfig) -> None:
             optimizer,
             scheduler,
             config,
-            config.training.max_steps,
+            total_steps,
             best_validation_loss,
             checkpoint_name="final.pt",
         )
         tqdm.write(f"saved final checkpoint: {final_checkpoint_path}")
+        upload_checkpoint(final_checkpoint_path)
 
     if wandb_run is not None:
         wandb_run.finish()

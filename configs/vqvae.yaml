@@ -1,4 +1,4 @@
-# Stable VQ-VAE configuration for the 20B-base GTDB subset.
+# VQ-VAE configuration for the 64-base block-conditioning pilot.
 
 run:
   seed: 0
@@ -8,54 +8,24 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: vqvae
-  name: dna-256-20b-d384-vqvae
+  name: vqvae-64-block
 
 data:
-  subset_directory: ../datasets/gtdb/20B_subset
+  subset_directory: ../datasets/gtdb/5B_subset
   train_split: train
   validation_split: validation
   train_batch_size: 512
-  validation_batch_size: 128
+  validation_batch_size: 512
   num_workers: 3
   shuffle_buffer_size: 10_000
 
 model:
   vocab_size: 4
-  context_length: 256
+  context_length: 64
   embed_dim: 384
   num_heads: 6
-  scale_lengths:
-    - 4
-    - 9
-    - 16
-    - 25
-    - 36
-    - 49
-    - 64
-    - 81
-    - 100
-    - 121
-    - 144
-    - 169
-    - 196
-    - 225
-    - 256
-  codebook_sizes:
-    - 512
-    - 512
-    - 512
-    - 512
-    - 512
-    - 512
-    - 512
-    - 512
-    - 512
-    - 512
-    - 512
-    - 512
-    - 512
-    - 512
-    - 512
+  scale_lengths: [1, 4, 9, 16, 25, 36, 49, 64]
+  codebook_sizes: [256, 256, 256, 256, 256, 256, 256, 256]
 
   encoder_dropout: 0.0
   decoder_dropout: 0.1
@@ -91,8 +61,9 @@ mixed_precision:
   enabled: true
 
 training:
-  # One pass over the 78,124,992 non-overlapping 256-base training windows.
-  max_steps: 152_588
+  num_epochs: 2
+  # Set an integer here to override the epoch-derived training length.
+  max_steps: null
   log_interval: 10
 
 evaluation:
@@ -100,4 +71,12 @@ evaluation:
   max_batches: 10
 
 checkpoint:
-  interval: 10_000
+  interval: 3_000
+  huggingface:
+    enabled: true
+    repository_id: Iddah/nsm-dna-checkpoints
+    repository_directory: vqvae-64-block
+
+hydra:
+  run:
+    dir: ../runs/${wandb.name}

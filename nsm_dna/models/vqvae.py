@@ -108,11 +108,15 @@ class VQVAE(nn.Module):
             bias=bias,
         )
 
-    def _encode_pre_quant(
+    def encode(
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> Float[Tensor, "batch length embed_dim"]:
-        """Return the continuous encoder output used for quantization."""
+        """Encode DNA into the normalized continuous latent space.
+
+        VQ-VAE training quantizes this latent before reconstruction. NSM-DNA
+        uses the same latent directly when a completed block is prefix context.
+        """
         latent = self.encoder(token_ids)
 
         if self.pre_quant_norm is not None:
@@ -134,7 +138,7 @@ class VQVAE(nn.Module):
         Float[Tensor, ""],
         list[Int[Tensor, "batch scale_length"]],
     ]:
-        latent = self._encode_pre_quant(token_ids)
+        latent = self.encode(token_ids)
         (
             quantized_latent,
             partial_quantized_latent,
@@ -161,20 +165,19 @@ class VQVAE(nn.Module):
         return logits, partial_logits, vq_loss, indices_by_scale
 
     @torch.no_grad()
-    def encode(
+    def encode_indices(
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> list[Int[Tensor, "batch scale_length"]]:
-        """Convert token sequences into discrete codebook indices at every scale.
+        """Encode target blocks into discrete codebook indices at every scale.
 
-        These indices are the targets used to train NSM-DNA. Evaluation mode is
-        required so encoding does not update the EMA codebooks or apply fine-scale
-        dropout.
+        These indices provide both teacher-forced hierarchy inputs and prediction
+        targets for stage-two NSM-DNA training.
         """
         if self.training:
             raise RuntimeError("Call model.eval() before encoding sequences.")
 
-        latent = self._encode_pre_quant(token_ids)
+        latent = self.encode(token_ids)
         _, _, _, indices_by_scale = self.quantizer(latent)
         return indices_by_scale
 
