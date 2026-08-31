@@ -61,15 +61,15 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
         num_layers=1,
         num_heads=2,
         dropout=0.0,
-        max_prefix_length=12,
+        max_prefix_length=4,
     ).eval()
-    input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
+    input_ids = torch.arange(2 * 8).reshape(2, 8) % 4
 
     hierarchy_scores, decoder_scores = score_token_ids(model, tokenizer, input_ids)
 
     expected_hierarchy_scores = torch.zeros(2, 3, dtype=torch.float64)
     expected_decoder_scores = torch.zeros(2, dtype=torch.float64)
-    blocks = input_ids.reshape(2, 4, 4)
+    blocks = input_ids.reshape(2, 2, 4)
     for block_index, prediction in enumerate(
         prepare_block_predictions(tokenizer, input_ids)
     ):

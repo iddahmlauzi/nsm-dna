@@ -12,7 +12,6 @@ from scripts.training.train_nsm import (
     compute_next_scale_loss,
     evaluate,
     prepare_block_predictions,
-    prepare_nsm_batch,
     rollout_scale_predictions,
 )
 
@@ -234,7 +233,8 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
         device=torch.device("cpu"),
     )
 
-    next_scale_inputs, targets_by_scale = prepare_nsm_batch(tokenizer, input_ids)
+    targets_by_scale = tokenizer.encode_indices(input_ids)
+    next_scale_inputs = tokenizer.indices_to_next_scale_inputs(targets_by_scale)
     logits = model(next_scale_inputs)
     loss, _ = compute_next_scale_loss(logits, targets_by_scale, scale_weights)
     loss.backward()
@@ -246,31 +246,25 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     assert any(parameter.grad is not None for parameter in model.parameters())
 
 
-def test_block_predictions_require_preceding_context() -> None:
+def test_block_prediction_uses_first_block_as_prefix_and_second_as_target() -> None:
     tokenizer = _build_tokenizer().eval()
-    input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
-    blocks = input_ids.reshape(2, 4, 4)
+    input_ids = torch.arange(2 * 8).reshape(2, 8) % 4
+    prefix_ids = input_ids[:, :4]
+    target_ids = input_ids[:, 4:]
 
     block_predictions = prepare_block_predictions(tokenizer, input_ids)
-    assert [
-        0 if prediction.prefix is None else prediction.prefix.shape[1]
-        for prediction in block_predictions
-    ] == [4, 8, 12]
+    assert len(block_predictions) == 1
 
-    encoded_blocks = [tokenizer.encode(block) for block in blocks.unbind(dim=1)]
-    for block_index, (block, prediction) in enumerate(
-        zip(blocks[:, 1:].unbind(dim=1), block_predictions),
-        start=1,
-    ):
-        torch.testing.assert_close(prediction.target_ids, block)
-        expected_prefix = torch.cat(encoded_blocks[:block_index], dim=1)
-        torch.testing.assert_close(prediction.prefix, expected_prefix)
+    prediction = block_predictions[0]
+    torch.testing.assert_close(prediction.target_ids, target_ids)
+    torch.testing.assert_close(prediction.prefix, tokenizer.encode(prefix_ids))
 
-        expected_inputs, expected_targets = prepare_nsm_batch(tokenizer, block)
-        for actual, expected in zip(prediction.scale_inputs, expected_inputs):
-            torch.testing.assert_close(actual, expected)
-        for actual, expected in zip(prediction.targets_by_scale, expected_targets):
-            torch.testing.assert_close(actual, expected)
+    expected_targets = tokenizer.encode_indices(target_ids)
+    expected_inputs = tokenizer.indices_to_next_scale_inputs(expected_targets)
+    for actual, expected in zip(prediction.scale_inputs, expected_inputs):
+        torch.testing.assert_close(actual, expected)
+    for actual, expected in zip(prediction.targets_by_scale, expected_targets):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_default_config_matches_next_token_transformer_recipe() -> None:
@@ -296,8 +290,8 @@ def test_default_config_matches_next_token_transformer_recipe() -> None:
 def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
     tokenizer = _build_tokenizer().eval()
     tokenizer.requires_grad_(False)
-    model = _build_nsm(max_prefix_length=12)
-    input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
+    model = _build_nsm(max_prefix_length=4)
+    input_ids = torch.arange(2 * 8).reshape(2, 8) % 4
     scale_weights = build_scale_loss_weights(
         tokenizer.scale_lengths,
         scale_loss_alpha=0.25,

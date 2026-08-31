@@ -318,9 +318,12 @@ def test_nsm_returns_only_hierarchy_logits_when_prefix_is_present() -> None:
     prefix = torch.randn(2, 4, 3)
     scale_inputs = [torch.randn(2, 2, 3), torch.randn(2, 3, 3)]
 
+    hidden_states = model.encode(scale_inputs, prefix=prefix)
     logits = model(scale_inputs, prefix=prefix)
 
+    assert hidden_states.shape == (2, 10, 8)
     assert logits.shape == (2, 6, 5)
+    torch.testing.assert_close(logits, model.output_head(hidden_states[:, 4:]))
 
 
 def test_nsm_transformer_keeps_scale_sections_isolated() -> None:

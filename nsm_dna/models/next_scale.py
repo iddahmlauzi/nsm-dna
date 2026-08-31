@@ -6,7 +6,7 @@ import einx
 import torch
 import torch.nn as nn
 from jaxtyping import Bool, Float
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
 from .common import (
@@ -274,6 +274,28 @@ class NSM(nn.Module):
             )
 
     @classmethod
+    def from_config(cls, config: DictConfig, tokenizer: "VQVAE") -> "NSM":
+        """Build NSM-DNA from an experiment configuration and its tokenizer."""
+        return cls(
+            vq_embed_dim=tokenizer.embed_dim,
+            model_dim=config.model.model_dim,
+            scale_lengths=tokenizer.scale_lengths,
+            codebook_size=tokenizer.codebook_sizes[0],
+            num_layers=config.model.num_layers,
+            num_heads=config.model.num_heads,
+            dropout=config.model.dropout,
+            bias=config.model.bias,
+            use_qk_norm=config.model.use_qk_norm,
+            rope_base=config.model.rope_base,
+            head_num_blocks=config.model.head_num_blocks,
+            head_hidden_multiplier=config.model.head_hidden_multiplier,
+            input_refinement_kernel_size=config.model.input_refinement_kernel_size,
+            max_prefix_length=(
+                config.data.sequence_length - tokenizer.context_length
+            ),
+        )
+
+    @classmethod
     def from_checkpoint(
         cls,
         checkpoint_path: Path,
@@ -290,22 +312,7 @@ class NSM(nn.Module):
         )
         config = OmegaConf.create(checkpoint["config"])
 
-        model = cls(
-            vq_embed_dim=tokenizer.embed_dim,
-            model_dim=config.model.model_dim,
-            scale_lengths=tokenizer.scale_lengths,
-            codebook_size=tokenizer.codebook_sizes[0],
-            num_layers=config.model.num_layers,
-            num_heads=config.model.num_heads,
-            dropout=config.model.dropout,
-            bias=config.model.bias,
-            use_qk_norm=config.model.use_qk_norm,
-            rope_base=config.model.rope_base,
-            head_num_blocks=config.model.head_num_blocks,
-            head_hidden_multiplier=config.model.head_hidden_multiplier,
-            input_refinement_kernel_size=config.model.input_refinement_kernel_size,
-            max_prefix_length=(config.data.sequence_length - tokenizer.context_length),
-        )
+        model = cls.from_config(config, tokenizer)
         model.load_state_dict(checkpoint["model"])
         model = model.to(device)
 
@@ -377,12 +384,13 @@ class NSM(nn.Module):
         )
         return cosine, sine
 
-    def forward(
+    def encode(
         self,
         scale_inputs: list[Float[Tensor, "batch scale_length vq_dim"]],
         *,
         prefix: Float[Tensor, "batch prefix_length vq_dim"] | None = None,
-    ) -> Float[Tensor, "batch hierarchy_length codebook_size"]:
+    ) -> Float[Tensor, "batch length model_dim"]:
+        """Return final normalized states for the prefix and target hierarchy."""
         refined_scale_inputs = self._refine_scale_inputs(scale_inputs)
         hierarchy_inputs = torch.cat(refined_scale_inputs, dim=1)
 
@@ -431,6 +439,15 @@ class NSM(nn.Module):
                 rotary_embeddings=rotary_embeddings,
             )
 
-        hidden_states = self.final_norm(hidden_states)
+        return self.final_norm(hidden_states)
+
+    def forward(
+        self,
+        scale_inputs: list[Float[Tensor, "batch scale_length vq_dim"]],
+        *,
+        prefix: Float[Tensor, "batch prefix_length vq_dim"] | None = None,
+    ) -> Float[Tensor, "batch hierarchy_length codebook_size"]:
+        hidden_states = self.encode(scale_inputs, prefix=prefix)
+        prefix_length = 0 if prefix is None else prefix.shape[1]
         hierarchy_hidden_states = hidden_states[:, prefix_length:]
         return self.output_head(hierarchy_hidden_states)

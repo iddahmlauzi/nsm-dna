@@ -1,0 +1,27 @@
+checkpoint: /workspace/runs/nsm-256-40m/checkpoints/final.pt
+tokenizer_checkpoint: /workspace/runs/vqvae-128-block/checkpoints/final.pt
+dataset_directory: /workspace/datasets/lambda/LAMBDA/binary_segments_2k
+output_directory: /workspace/results/nsm-256-40m/lambda-probe-2k
+
+expected_sequence_length: 2_000
+embedding_batch_size: 16
+device_ids: [0, 1, 2, 3]
+random_model_seed: 42
+
+probe:
+  seed: 42
+  hidden_dim: 256
+  dropout: 0.3
+  batch_size: 64
+  max_epochs: 100
+  learning_rate: 1e-3
+  weight_decay: 1e-5
+  scheduler_patience: 10
+  early_stopping_patience: 20
+
+hydra:
+  run:
+    dir: ${output_directory}
+  output_subdir: null
+  job:
+    chdir: false

@@ -80,112 +80,26 @@ def compute_next_scale_loss(
 
 
 @torch.no_grad()
-def prepare_nsm_batch(
-    tokenizer: VQVAE,
-    input_ids: Int[Tensor, "batch block_length"],
-) -> tuple[
-    list[Float[Tensor, "batch scale_length vq_dim"]],
-    list[Int[Tensor, "batch scale_length"]],
-]:
-    """Create hierarchy inputs and targets for a batch of target blocks.
-
-    The first scale has no continuous input because the learned BOS predicts it.
-    Each remaining input is the preceding scales' cumulative reconstruction,
-    resized to the length of the scale that NSM must predict.
-    """
-    targets_by_scale = tokenizer.encode_indices(input_ids)
-    next_scale_inputs = tokenizer.indices_to_next_scale_inputs(targets_by_scale)
-    return next_scale_inputs, targets_by_scale
-
-
-@torch.no_grad()
 def prepare_block_predictions(
     tokenizer: VQVAE,
     input_ids: Int[Tensor, "batch sequence_length"],
 ) -> list[BlockPredictionBatch]:
-    """Create prediction tasks for blocks that have preceding DNA context."""
-    batch_size = input_ids.shape[0]
+    """Create one task that predicts the second block from the first block."""
+    block_length = tokenizer.context_length
+    prefix_ids = input_ids[:, :block_length]
+    target_ids = input_ids[:, block_length:]
+    prefix = tokenizer.encode(prefix_ids)
+    targets_by_scale = tokenizer.encode_indices(target_ids)
+    scale_inputs = tokenizer.indices_to_next_scale_inputs(targets_by_scale)
 
-    # Split every long sequence into tokenizer-sized blocks while retaining
-    # which sequence and block position each piece came from.
-    blocks = einx.id(
-        "batch (num_blocks block_length) -> batch num_blocks block_length",
-        input_ids,
-        block_length=tokenizer.context_length,
-    )
-
-    # The tokenizer operates on one block at a time. Temporarily combine the
-    # batch and block axes so all blocks can be tokenized in one call.
-    flattened_blocks = einx.id(
-        "batch num_blocks block_length -> (batch num_blocks) block_length",
-        blocks,
-    )
-    flattened_scale_inputs, flattened_targets_by_scale = prepare_nsm_batch(
-        tokenizer, flattened_blocks
-    )
-
-    # Restore the separate batch and block axes so tensors can later be selected
-    # by their position in the original long sequence.
-    scale_inputs_by_scale = [
-        einx.id(
-            "(batch num_blocks) scale_length vq_dim -> "
-            "batch num_blocks scale_length vq_dim",
-            scale_input,
-            batch=batch_size,
+    return [
+        BlockPredictionBatch(
+            target_ids=target_ids,
+            prefix=prefix,
+            scale_inputs=scale_inputs,
+            targets_by_scale=targets_by_scale,
         )
-        for scale_input in flattened_scale_inputs
     ]
-    targets_by_scale = [
-        einx.id(
-            "(batch num_blocks) scale_length -> batch num_blocks scale_length",
-            scale_targets,
-            batch=batch_size,
-        )
-        for scale_targets in flattened_targets_by_scale
-    ]
-
-    # Encode each possible prefix block once; later targets concatenate the
-    # required leading blocks without recomputing their representations.
-    flattened_prefix_latents = tokenizer.encode(
-        einx.id(
-            "batch num_blocks block_length -> (batch num_blocks) block_length",
-            blocks[:, :-1],
-        )
-    )
-    prefix_latents_by_block = einx.id(
-        "(batch num_blocks) block_length vq_dim -> "
-        "batch num_blocks block_length vq_dim",
-        flattened_prefix_latents,
-        batch=batch_size,
-    )
-
-    block_predictions = []
-    for block_index in range(1, blocks.shape[1]):
-        # Concatenate every block before the target into one continuous prefix.
-        prefix = einx.id(
-            "batch num_blocks block_length vq_dim -> "
-            "batch (num_blocks block_length) vq_dim",
-            prefix_latents_by_block[:, :block_index],
-        )
-
-        # Select the real DNA block, teacher-forced scale inputs, and scale
-        # targets that all belong to this block position.
-        block_predictions.append(
-            BlockPredictionBatch(
-                target_ids=blocks[:, block_index],
-                prefix=prefix,
-                scale_inputs=[
-                    scale_input[:, block_index]
-                    for scale_input in scale_inputs_by_scale
-                ],
-                targets_by_scale=[
-                    scale_targets[:, block_index]
-                    for scale_targets in targets_by_scale
-                ],
-            )
-        )
-
-    return block_predictions
 
 
 @torch.no_grad()
