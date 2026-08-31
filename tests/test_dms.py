@@ -1,19 +1,15 @@
 import csv
 import io
-import sys
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 
-SCRIPTS_DIR = Path(__file__).parents[1] / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
-
-from dms.jacquier import apply_substitutions  # noqa: E402
-from dms.mavedb import apply_nucleotide_edit  # noqa: E402
-from dms.melnikov import find_mutant_codon, reverse_complement  # noqa: E402
-from dms.ncrna import standardize_ncrna  # noqa: E402
-from dms.shared import (  # noqa: E402
+from nsm_dna.data.variant_effects.jacquier import apply_substitutions
+from nsm_dna.data.variant_effects.mavedb import apply_nucleotide_edit
+from nsm_dna.data.variant_effects.melnikov import find_mutant_codon, reverse_complement
+from nsm_dna.data.variant_effects.ncrna import standardize_ncrna
+from nsm_dna.data.variant_effects.shared import (
     describe_amino_acid_changes,
     describe_coding_edit,
     read_fasta,
@@ -119,7 +115,7 @@ class NcRNATest(unittest.TestCase):
     """Conversion of the Evo 1 ncRNA source files."""
 
     def test_standardize_ncrna(self) -> None:
-        from dms.ncrna import SOURCE_MEMBERS
+        from nsm_dna.data.variant_effects.ncrna import SOURCE_MEMBERS
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

@@ -72,15 +72,15 @@ class LayerNorm(nn.Module):
 class RMSNorm(nn.Module):
     """Normalize a tensor by its root mean square without centering it."""
 
-    def __init__(self, head_dim: int, eps: float = 1e-6) -> None:
+    def __init__(self, normalized_dim: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(head_dim))
+        self.weight = nn.Parameter(torch.ones(normalized_dim))
         self.eps = eps
 
     def forward(
         self,
-        x: Float[Tensor, "batch num_heads length head_dim"],
-    ) -> Float[Tensor, "batch num_heads length head_dim"]:
+        x: Float[Tensor, "... normalized_dim"],
+    ) -> Float[Tensor, "... normalized_dim"]:
         input_dtype = x.dtype
         # Compute the RMS in float32 for stability under mixed precision.
         x = x.float()
@@ -195,10 +195,18 @@ class TransformerBlock(nn.Module):
         dropout: float = 0.1,
         bias: bool = False,
         use_qk_norm: bool = False,
+        use_rms_norm: bool = False,
+        rms_norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
 
-        self.attn_norm = LayerNorm(embed_dim, bias=bias)
+        if use_rms_norm:
+            self.attn_norm = RMSNorm(embed_dim, eps=rms_norm_eps)
+            self.mlp_norm = RMSNorm(embed_dim, eps=rms_norm_eps)
+        else:
+            self.attn_norm = LayerNorm(embed_dim, bias=bias)
+            self.mlp_norm = LayerNorm(embed_dim, bias=bias)
+
         self.attn = SelfAttention(
             embed_dim,
             num_heads,
@@ -206,7 +214,6 @@ class TransformerBlock(nn.Module):
             bias=bias,
             use_qk_norm=use_qk_norm,
         )
-        self.mlp_norm = LayerNorm(embed_dim, bias=bias)
         self.mlp = MLP(embed_dim, dropout=dropout, bias=bias)
 
     def forward(

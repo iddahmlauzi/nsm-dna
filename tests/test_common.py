@@ -9,7 +9,7 @@ from nsm_dna.models.common import (
 
 
 def test_rms_norm_sets_unit_root_mean_square_without_centering() -> None:
-    norm = RMSNorm(head_dim=2, eps=0.0)
+    norm = RMSNorm(normalized_dim=2, eps=0.0)
     x = torch.tensor([[[[1.0, 3.0]]]])
 
     normalized = norm(x)

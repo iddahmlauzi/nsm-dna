@@ -1,13 +1,16 @@
+import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from huggingface_hub import HfApi
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
+from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,67 @@ class DistributedEnvironment:
     @property
     def is_main_process(self) -> bool:
         return self.rank == 0
+
+
+def calculate_training_steps(
+    config: DictConfig,
+    world_size: int,
+    sequence_length: int,
+) -> int:
+    """Use max_steps when set; otherwise derive the run length from num_epochs."""
+    if config.training.max_steps is not None:
+        return int(config.training.max_steps)
+
+    stats_path = Path(config.data.subset_directory) / "subset_stats.json"
+    with stats_path.open() as handle:
+        subset_stats = json.load(handle)
+    split_stats = subset_stats["splits"][config.data.train_split]
+    num_training_bases = (
+        split_stats["chunks"] * subset_stats["selection"]["chunk_length"]
+    )
+
+    bases_per_step = (
+        sequence_length
+        * config.data.train_batch_size
+        * world_size
+        * config.optimizer.gradient_accumulation_steps
+    )
+    steps_per_epoch = math.ceil(num_training_bases / bases_per_step)
+    return int(config.training.num_epochs) * steps_per_epoch
+
+
+def build_learning_rate_scheduler(
+    optimizer: Optimizer,
+    warmup_steps: int,
+    decay_end_step: int,
+    learning_rate: float,
+    min_learning_rate: float,
+) -> LambdaLR:
+    """Create a linear-warmup, cosine-decay learning-rate schedule.
+
+    The learning rate increases to `learning_rate` over the warmup, follows a
+    cosine curve down to `min_learning_rate`, and remains there after
+    `decay_end_step`.
+    """
+    min_learning_rate_factor = min_learning_rate / learning_rate
+
+    def learning_rate_factor(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return (step + 1) / (warmup_steps + 1)
+
+        if step >= decay_end_step:
+            return min_learning_rate_factor
+
+        decay_progress = (step - warmup_steps) / max(
+            1,
+            decay_end_step - warmup_steps,
+        )
+        cosine_factor = 0.5 * (1 + math.cos(math.pi * decay_progress))
+        return min_learning_rate_factor + cosine_factor * (
+            1 - min_learning_rate_factor
+        )
+
+    return LambdaLR(optimizer, learning_rate_factor)
 
 
 def initialize_distributed_training() -> DistributedEnvironment:
@@ -60,7 +124,7 @@ def cleanup_distributed_training() -> None:
         dist.destroy_process_group()
 
 
-def save_checkpoint(
+def save_training_checkpoint(
     run_directory: Path,
     model: nn.Module,
     optimizer: Optimizer,
@@ -90,7 +154,23 @@ def save_checkpoint(
     return checkpoint_path
 
 
-def load_checkpoint(
+def upload_checkpoint_to_hugging_face(
+    checkpoint_path: Path,
+    config: DictConfig,
+) -> None:
+    """Upload a saved checkpoint when Hugging Face syncing is enabled."""
+    if not config.enabled:
+        return
+
+    HfApi().upload_file(
+        path_or_fileobj=checkpoint_path,
+        path_in_repo=f"{config.repository_directory}/{checkpoint_path.name}",
+        repo_id=config.repository_id,
+        repo_type="model",
+    )
+
+
+def load_training_checkpoint(
     checkpoint_path: Path,
     model: nn.Module,
     optimizer: Optimizer,

@@ -1,6 +1,6 @@
+import csv
 import gzip
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,10 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from datasets import load_dataset
 
-SCRIPTS_DIR = Path(__file__).parents[1] / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
-
-from create_gtdb_subset import (  # noqa: E402
+from scripts.data.create_gtdb_subset import (
     PARENT_CHUNK_LENGTH,
     GenomeAllocation,
     Taxonomy,
@@ -21,6 +18,7 @@ from create_gtdb_subset import (  # noqa: E402
     create_gtdb_subset,
     selected_chunk_ordinals,
 )
+from scripts.data.plot_data_composition import plot_composition
 
 
 def taxonomy(genus: str, species: str) -> Taxonomy:
@@ -44,8 +42,10 @@ class GTDBSubsetTest(unittest.TestCase):
         self.dataset_dir = self.root / "gtdb"
         self.input_dir = self.dataset_dir / "processed"
         self.raw_dir = self.dataset_dir / "raw"
+        self.assay_dir = self.root / "assays"
         self.input_dir.mkdir(parents=True)
         self.raw_dir.mkdir()
+        self.assay_dir.mkdir()
         self.bacterial_taxonomy_path = (
             self.raw_dir / "bac120_taxonomy_r232.tsv.gz"
         )
@@ -66,6 +66,7 @@ class GTDBSubsetTest(unittest.TestCase):
         with gzip.open(self.archaeal_taxonomy_path, "wt", encoding="utf-8"):
             pass
         self._write_source_shards(self.genomes)
+        self._write_assay("CCCCGGGG", "Escherichia coli")
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -131,10 +132,27 @@ class GTDBSubsetTest(unittest.TestCase):
             compression="zstd",
         )
 
+    def _write_assay(self, wild_type: str, organism: str) -> None:
+        path = self.assay_dir / "evaluation.csv"
+        with path.open("w", encoding="utf-8", newline="") as assay_file:
+            writer = csv.DictWriter(
+                assay_file,
+                fieldnames=["assay_id", "organism", "wt_nt"],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "assay_id": "evaluation",
+                    "organism": organism,
+                    "wt_nt": wild_type,
+                }
+            )
+
     def _create_subset(self, output_name: str, seed: int = 17) -> Path:
         train_bases = 8 * PARENT_CHUNK_LENGTH
         create_gtdb_subset(
             dataset_dir=self.dataset_dir,
+            assay_dir=self.assay_dir,
             train_bases=train_bases,
             validation_fraction=0.25,
             seed=seed,
@@ -163,7 +181,7 @@ class GTDBSubsetTest(unittest.TestCase):
 
         rows_by_split = {
             split: self._read_split_rows(first_output, split)
-            for split in ("train", "validation", "escherichia_holdout")
+            for split in ("train", "validation")
         }
         accessions_by_split = {
             split: {row["gtdb_accession"] for row in rows}
@@ -174,22 +192,17 @@ class GTDBSubsetTest(unittest.TestCase):
                 accessions_by_split["validation"]
             )
         )
-        self.assertTrue(
-            accessions_by_split["escherichia_holdout"].isdisjoint(
-                accessions_by_split["train"] | accessions_by_split["validation"]
-            )
-        )
 
         manifest_by_accession = {
             row["gtdb_accession"]: row for row in first_manifest
         }
-        self.assertEqual(
+        self.assertIn(
             manifest_by_accession["RS_GCF_000001.1"]["split"],
-            "escherichia_holdout",
+            {"train", "validation"},
         )
-        self.assertEqual(
+        self.assertIn(
             manifest_by_accession["RS_GCF_000002.1"]["split"],
-            "escherichia_holdout",
+            {"train", "validation"},
         )
         self.assertEqual(
             manifest_by_accession["RS_GCF_000009.1"]["split"],
@@ -230,6 +243,13 @@ class GTDBSubsetTest(unittest.TestCase):
                 len(rows),
                 subset_stats["splits"][split]["chunks"],
             )
+            for rank in ("domain", "phylum"):
+                taxon_counts = subset_stats["composition"][split][rank].values()
+                for count_name in ("genomes", "chunks"):
+                    self.assertEqual(
+                        sum(counts[count_name] for counts in taxon_counts),
+                        subset_stats["splits"][split][count_name],
+                    )
 
     def test_different_seed_changes_the_selection(self) -> None:
         first_output = self._create_subset("subset-a", seed=17)
@@ -237,12 +257,12 @@ class GTDBSubsetTest(unittest.TestCase):
 
         first_ids = {
             row["chunk_id"]
-            for split in ("train", "validation", "escherichia_holdout")
+            for split in ("train", "validation")
             for row in self._read_split_rows(first_output, split)
         }
         second_ids = {
             row["chunk_id"]
-            for split in ("train", "validation", "escherichia_holdout")
+            for split in ("train", "validation")
             for row in self._read_split_rows(second_output, split)
         }
         self.assertNotEqual(first_ids, second_ids)
@@ -304,6 +324,7 @@ class GTDBSubsetTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Missing taxonomy"):
             create_gtdb_subset(
                 dataset_dir=self.dataset_dir,
+                assay_dir=self.assay_dir,
                 train_bases=8 * PARENT_CHUNK_LENGTH,
                 validation_fraction=0.25,
                 seed=17,
@@ -314,6 +335,7 @@ class GTDBSubsetTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "contain only .* full chunks"):
             create_gtdb_subset(
                 dataset_dir=self.dataset_dir,
+                assay_dir=self.assay_dir,
                 train_bases=1_000 * PARENT_CHUNK_LENGTH,
                 validation_fraction=0.25,
                 seed=17,
@@ -325,16 +347,73 @@ class GTDBSubsetTest(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             create_gtdb_subset(
                 dataset_dir=self.dataset_dir,
+                assay_dir=self.assay_dir,
                 train_bases=8 * PARENT_CHUNK_LENGTH,
                 validation_fraction=0.25,
                 seed=17,
             )
 
+    def test_replaces_matching_training_chunk(self) -> None:
+        baseline = self._create_subset("baseline")
+        baseline_rows = self._read_split_rows(baseline, "train")
+        manifest = pq.read_table(baseline / "genome_manifest.parquet").to_pylist()
+        target_accession = next(
+            row["gtdb_accession"]
+            for row in manifest
+            if row["split"] == "train"
+            and row["available_full_chunks"] >= row["selected_chunks"] + 2
+        )
+        reference = "ACGTCCGTTGCA"
+        reverse_complement = reference.translate(
+            str.maketrans("ACGT", "TGCA")
+        )[::-1]
+
+        source_rows = [
+            row
+            for path in sorted(self.input_dir.glob("chunks-*.parquet"))
+            for row in pq.read_table(path).to_pylist()
+            if row["gtdb_accession"] == target_accession
+            and row["chunk_length"] == PARENT_CHUNK_LENGTH
+        ]
+        selected_ids = {row["chunk_id"] for row in baseline_rows}
+        left_row, right_row = next(
+            (left, right)
+            for left, right in zip(source_rows, source_rows[1:])
+            if left["record_id"] == right["record_id"]
+            and left["chunk_end"] == right["chunk_start"]
+            and {left["chunk_id"], right["chunk_id"]} & selected_ids
+        )
+        split = len(reverse_complement) // 2
+
+        for path in sorted(self.input_dir.glob("chunks-*.parquet")):
+            table = pq.read_table(path)
+            rows = table.to_pylist()
+            for row in rows:
+                if row["chunk_id"] == left_row["chunk_id"]:
+                    row["sequence"] = (
+                        row["sequence"][:-split] + reverse_complement[:split]
+                    )
+                elif row["chunk_id"] == right_row["chunk_id"]:
+                    row["sequence"] = (
+                        reverse_complement[split:] + row["sequence"][split:]
+                    )
+            pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), path)
+
+        genus = self.genomes[target_accession][0].split("_", maxsplit=1)[0]
+        self._write_assay(reference, f"{genus} species")
+        filtered = self._create_subset("filtered")
+        filtered_rows = self._read_split_rows(filtered, "train")
+        self.assertEqual(len(filtered_rows), len(baseline_rows))
+        filtered_ids = {row["chunk_id"] for row in filtered_rows}
+        self.assertTrue(
+            {left_row["chunk_id"], right_row["chunk_id"]}.isdisjoint(filtered_ids)
+        )
+
     def test_output_loads_as_hugging_face_streaming_splits(self) -> None:
         output_dir = self._create_subset("subset")
         data_files = {
             split: str(output_dir / split / "chunks-*.parquet")
-            for split in ("train", "validation", "escherichia_holdout")
+            for split in ("train", "validation")
         }
         # This sandbox blocks the shared-memory helper that Hugging Face uses
         # only to communicate epochs to persistent DataLoader workers.
@@ -352,6 +431,17 @@ class GTDBSubsetTest(unittest.TestCase):
             for split in data_files:
                 first_row = next(iter(dataset[split]))
                 self.assertEqual(first_row["chunk_length"], PARENT_CHUNK_LENGTH)
+
+    def test_plots_composition_from_subset_statistics(self) -> None:
+        output_dir = self._create_subset("subset")
+        statistics = json.loads(
+            (output_dir / "subset_stats.json").read_text(encoding="utf-8")
+        )
+        output_path = output_dir / "composition.png"
+
+        plot_composition(statistics, output_path)
+
+        self.assertGreater(output_path.stat().st_size, 0)
 
 
 if __name__ == "__main__":

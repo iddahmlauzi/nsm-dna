@@ -1,7 +1,10 @@
+from pathlib import Path
+
 import einx
 import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
+from omegaconf import OmegaConf
 from torch import Tensor
 
 from .autoencoder import Decoder, Encoder
@@ -108,6 +111,48 @@ class VQVAE(nn.Module):
             bias=bias,
         )
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_path: Path,
+        device: torch.device,
+        *,
+        frozen: bool = False,
+    ) -> "VQVAE":
+        """Rebuild a VQ-VAE from its saved configuration and weights."""
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        config = OmegaConf.create(checkpoint["config"]).model
+
+        model = cls(
+            vocab_size=config.vocab_size,
+            context_length=config.context_length,
+            embed_dim=config.embed_dim,
+            num_heads=config.num_heads,
+            scale_lengths=list(config.scale_lengths),
+            codebook_sizes=list(config.codebook_sizes),
+            encoder_dropout=config.encoder_dropout,
+            decoder_dropout=config.decoder_dropout,
+            bias=config.bias,
+            pre_quant_num_groups=config.pre_quant_num_groups,
+            commitment_cost=config.commitment_cost,
+            decay=config.decay,
+            eps=config.eps,
+            refinement_ratio=config.refinement_ratio,
+            refinement_kernel_size=config.refinement_kernel_size,
+        )
+        model.load_state_dict(checkpoint["model"])
+        model = model.to(device)
+
+        if frozen:
+            model.eval()
+            model.requires_grad_(False)
+
+        return model
+
     def encode(
         self,
         token_ids: Int[Tensor, "batch length"],
@@ -180,6 +225,35 @@ class VQVAE(nn.Module):
         latent = self.encode(token_ids)
         _, _, _, indices_by_scale = self.quantizer(latent)
         return indices_by_scale
+
+    @torch.no_grad()
+    def indices_to_next_scale_inputs(
+        self,
+        indices_by_scale: list[Int[Tensor, "batch scale_length"]],
+    ) -> list[Float[Tensor, "batch scale_length embed_dim"]]:
+        """Construct teacher-forced inputs for each scale after the first."""
+        return self.quantizer.indices_to_next_scale_inputs(indices_by_scale)
+
+    @torch.no_grad()
+    def indices_to_next_scale_input(
+        self,
+        preceding_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
+    ) -> Float[Tensor, "batch next_scale_length embed_dim"]:
+        """Construct the next input from autoregressively predicted indices."""
+        return self.quantizer.indices_to_next_scale_input(
+            preceding_indices_by_scale
+        )
+
+    @torch.no_grad()
+    def decode(
+        self,
+        indices_by_scale: list[Int[Tensor, "batch scale_length"]],
+    ) -> Float[Tensor, "batch length vocab_size"]:
+        """Decode a complete hierarchy of codebook indices into nucleotide logits."""
+        quantized_latent = self.quantizer.indices_to_cumulative_latents(
+            indices_by_scale
+        )[-1]
+        return self.decoder(quantized_latent)
 
     @torch.no_grad()
     def decode_cumulative(

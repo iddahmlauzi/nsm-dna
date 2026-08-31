@@ -1,7 +1,71 @@
+import math
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from nsm_dna.models.common import RMSNorm
-from nsm_dna.models.nsm import NSM, SharedOutputHead
+from nsm_dna.models.next_scale import NSM, SharedOutputHead
+
+
+def test_nsm_from_checkpoint_restores_model_and_step(tmp_path: Path) -> None:
+    tokenizer = SimpleNamespace(
+        embed_dim=3,
+        scale_lengths=[1, 2],
+        codebook_sizes=[5, 5],
+        context_length=4,
+    )
+    model = NSM(
+        vq_embed_dim=tokenizer.embed_dim,
+        model_dim=8,
+        scale_lengths=tokenizer.scale_lengths,
+        codebook_size=tokenizer.codebook_sizes[0],
+        num_layers=1,
+        num_heads=2,
+        dropout=0.0,
+        max_prefix_length=2,
+    )
+    checkpoint_path = tmp_path / "nsm.pt"
+    torch.save(
+        {
+            "step": 17,
+            "model": model.state_dict(),
+            "config": {
+                "data": {"sequence_length": 6},
+                "model": {
+                    "model_dim": 8,
+                    "num_layers": 1,
+                    "num_heads": 2,
+                    "dropout": 0.0,
+                    "bias": False,
+                    "use_qk_norm": True,
+                    "rope_base": 10000.0,
+                    "head_num_blocks": 2,
+                    "head_hidden_multiplier": 2.0,
+                    "input_refinement_kernel_size": 3,
+                },
+            },
+        },
+        checkpoint_path,
+    )
+
+    restored_model, checkpoint_step = NSM.from_checkpoint(
+        checkpoint_path,
+        tokenizer,
+        torch.device("cpu"),
+        frozen=True,
+    )
+
+    assert checkpoint_step == 17
+    assert not restored_model.training
+    assert all(not parameter.requires_grad for parameter in restored_model.parameters())
+    for parameter, restored_parameter in zip(
+        model.parameters(),
+        restored_model.parameters(),
+        strict=True,
+    ):
+        torch.testing.assert_close(restored_parameter, parameter)
 
 
 def test_shared_output_head_starts_as_a_linear_classifier() -> None:
@@ -166,6 +230,49 @@ def test_nsm_normalizes_queries_and_keys() -> None:
 
     assert isinstance(model.blocks[0].attn.q_norm, RMSNorm)
     assert isinstance(model.blocks[0].attn.k_norm, RMSNorm)
+
+
+def test_nsm_uses_pre_rms_norm() -> None:
+    model = NSM(
+        vq_embed_dim=3,
+        model_dim=8,
+        scale_lengths=[1, 2, 3],
+        codebook_size=5,
+        num_layers=1,
+        num_heads=2,
+        dropout=0.0,
+    )
+
+    assert isinstance(model.blocks[0].attn_norm, RMSNorm)
+    assert isinstance(model.blocks[0].mlp_norm, RMSNorm)
+    assert isinstance(model.final_norm, RMSNorm)
+    assert model.blocks[0].attn_norm.eps == pytest.approx(1e-5)
+    assert model.blocks[0].mlp_norm.eps == pytest.approx(1e-5)
+    assert model.final_norm.eps == pytest.approx(1e-5)
+
+
+def test_nsm_scales_residual_projection_initialization() -> None:
+    num_layers = 4
+    model = NSM(
+        vq_embed_dim=8,
+        model_dim=64,
+        scale_lengths=[1, 2, 4],
+        codebook_size=8,
+        num_layers=num_layers,
+        num_heads=4,
+        dropout=0.0,
+    )
+    expected_standard_deviation = 0.02 / math.sqrt(2 * num_layers)
+
+    for block in model.blocks:
+        assert block.attn.out_proj.weight.std().item() == pytest.approx(
+            expected_standard_deviation,
+            rel=0.05,
+        )
+        assert block.mlp.down_proj.weight.std().item() == pytest.approx(
+            expected_standard_deviation,
+            rel=0.05,
+        )
 
 
 def test_nsm_prepends_learned_bos() -> None:

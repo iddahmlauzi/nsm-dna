@@ -3,7 +3,7 @@ import torch.nn.functional as F
 
 from nsm_dna.models.quantization import MultiscaleResidualVectorQuantizer
 from nsm_dna.models.vqvae import VQVAE
-from scripts.train_vqvae import evaluate
+from scripts.training.train_vqvae import evaluate
 
 
 def test_first_scale_sampler_uses_a_cascade() -> None:
@@ -15,35 +15,30 @@ def test_first_scale_sampler_uses_a_cascade() -> None:
     channels_first = torch.arange(2 * 256, dtype=torch.float32).reshape(1, 2, 256)
 
     downsampled = quantizer.first_scale_downsampler(channels_first)
-    normalized = quantizer._downsample_to_scale(
+    normalized = quantizer._resize_to_scale(
         channels_first.transpose(1, 2),
         scale_index=0,
     )
-    expected_normalized = F.layer_norm(
-        downsampled.transpose(1, 2),
-        normalized_shape=(2,),
-    )
     upsampled = quantizer.first_scale_upsampler(normalized.transpose(1, 2))
 
-    assert len(quantizer.first_scale_downsampler) == 5
+    assert len(quantizer.first_scale_downsampler) == 6
     assert len(quantizer.first_scale_upsampler) == 3
     internal_norms = [
         module
         for module in quantizer.first_scale_downsampler
         if hasattr(module, "normalization")
     ]
-    assert len(internal_norms) == 2
+    assert len(internal_norms) == 3
     assert all(
         norm.normalization.elementwise_affine is False for norm in internal_norms
     )
-    assert quantizer.first_scale_norm.elementwise_affine is False
     assert downsampled.shape == (1, 2, 4)
     assert upsampled.shape == channels_first.shape
     torch.testing.assert_close(
         upsampled,
         normalized.transpose(1, 2).repeat_interleave(64, dim=-1),
     )
-    torch.testing.assert_close(normalized, expected_normalized)
+    torch.testing.assert_close(normalized, downsampled.transpose(1, 2))
 
 
 def test_cumulative_decode_matches_full_reconstruction() -> None:

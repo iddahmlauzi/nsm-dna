@@ -4,16 +4,16 @@ import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 
-from nsm_dna.models.nsm import NSM
+from nsm_dna.models.next_scale import NSM
 from nsm_dna.models.vqvae import VQVAE
-from scripts.train_nsm import (
+from nsm_dna.training import calculate_training_steps
+from scripts.training.train_nsm import (
     build_scale_loss_weights,
-    calculate_training_steps,
     compute_next_scale_loss,
     evaluate,
-    load_tokenizer,
     prepare_block_predictions,
     prepare_nsm_batch,
+    rollout_scale_predictions,
 )
 
 
@@ -46,7 +46,8 @@ def _build_nsm(max_prefix_length: int = 0) -> NSM:
 
 def test_training_steps_are_derived_from_epochs(tmp_path: Path) -> None:
     (tmp_path / "subset_stats.json").write_text(
-        '{"splits": {"train": {"bases": 1000}}}'
+        '{"selection": {"chunk_length": 100}, '
+        '"splits": {"train": {"chunks": 10}}}'
     )
     config = OmegaConf.create(
         {
@@ -61,10 +62,10 @@ def test_training_steps_are_derived_from_epochs(tmp_path: Path) -> None:
         }
     )
 
-    assert calculate_training_steps(config, world_size=2) == 12
+    assert calculate_training_steps(config, world_size=2, sequence_length=16) == 12
 
     config.training.max_steps = 7
-    assert calculate_training_steps(config, world_size=2) == 7
+    assert calculate_training_steps(config, world_size=2, sequence_length=16) == 7
 
 
 def test_scale_loss_alpha_controls_each_scale_share() -> None:
@@ -195,9 +196,10 @@ def test_tokenizer_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
         checkpoint_path,
     )
 
-    restored_tokenizer = load_tokenizer(
+    restored_tokenizer = VQVAE.from_checkpoint(
         checkpoint_path,
         device=torch.device("cpu"),
+        frozen=True,
     )
 
     assert restored_tokenizer.training is False
@@ -210,6 +212,15 @@ def test_tokenizer_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
             restored_tokenizer.state_dict()[name],
             expected_value,
         )
+
+    trainable_tokenizer = VQVAE.from_checkpoint(
+        checkpoint_path,
+        device=torch.device("cpu"),
+    )
+    assert trainable_tokenizer.training is True
+    assert all(
+        parameter.requires_grad for parameter in trainable_tokenizer.parameters()
+    )
 
 
 def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
@@ -235,7 +246,7 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     assert any(parameter.grad is not None for parameter in model.parameters())
 
 
-def test_block_predictions_use_every_available_prefix_length() -> None:
+def test_block_predictions_require_preceding_context() -> None:
     tokenizer = _build_tokenizer().eval()
     input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
     blocks = input_ids.reshape(2, 4, 4)
@@ -244,21 +255,42 @@ def test_block_predictions_use_every_available_prefix_length() -> None:
     assert [
         0 if prediction.prefix is None else prediction.prefix.shape[1]
         for prediction in block_predictions
-    ] == [0, 4, 8, 12]
+    ] == [4, 8, 12]
 
     encoded_blocks = [tokenizer.encode(block) for block in blocks.unbind(dim=1)]
     for block_index, (block, prediction) in enumerate(
-        zip(blocks.unbind(dim=1), block_predictions)
+        zip(blocks[:, 1:].unbind(dim=1), block_predictions),
+        start=1,
     ):
-        if block_index > 0:
-            expected_prefix = torch.cat(encoded_blocks[:block_index], dim=1)
-            torch.testing.assert_close(prediction.prefix, expected_prefix)
+        torch.testing.assert_close(prediction.target_ids, block)
+        expected_prefix = torch.cat(encoded_blocks[:block_index], dim=1)
+        torch.testing.assert_close(prediction.prefix, expected_prefix)
 
         expected_inputs, expected_targets = prepare_nsm_batch(tokenizer, block)
         for actual, expected in zip(prediction.scale_inputs, expected_inputs):
             torch.testing.assert_close(actual, expected)
         for actual, expected in zip(prediction.targets_by_scale, expected_targets):
             torch.testing.assert_close(actual, expected)
+
+
+def test_default_config_matches_next_token_transformer_recipe() -> None:
+    config_path = Path(__file__).parents[1] / "configs" / "nsm.yaml"
+    config = OmegaConf.load(config_path)
+
+    assert config.run.resume_from is None
+    assert config.tokenizer_checkpoint.endswith("vqvae-128-block/checkpoints/final.pt")
+    assert config.model.model_dim == 640
+    assert config.model.num_layers == 8
+    assert config.model.num_heads == 10
+    assert config.model.dropout == 0.0
+    assert config.model.bias is False
+    assert config.model.use_qk_norm is True
+    assert config.optimizer.warmup_steps == 1907
+    assert config.optimizer.beta_1 == 0.9
+    assert config.optimizer.beta_2 == 0.95
+    assert config.optimizer.weight_decay == 0.05
+    assert config.optimizer.gradient_accumulation_steps == 2
+    assert config.training.num_epochs == 1
 
 
 def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
@@ -278,11 +310,43 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
         data_loader=[{"input_ids": input_ids}],
         scale_loss_weights=scale_weights,
         use_mixed_precision=False,
+        rollout_max_batches=1,
     )
 
     assert model.training is True
     assert metrics["loss"] > 0
     assert 0 <= metrics["accuracy"] <= 1
+    assert metrics["rollout_nucleotide_loss"] > 0
+    assert 0 <= metrics["rollout_nucleotide_accuracy"] <= 1
     for scale_length in tokenizer.scale_lengths:
-        assert metrics[f"loss_scale_{scale_length}"] > 0
         assert 0 <= metrics[f"accuracy_scale_{scale_length}"] <= 1
+
+
+def test_rollout_feeds_predictions_into_the_next_scale() -> None:
+    tokenizer = _build_tokenizer().eval()
+    model = _build_nsm()
+
+    predicted_indices_by_scale = rollout_scale_predictions(
+        model,
+        tokenizer,
+        batch_size=2,
+        prefix=None,
+    )
+
+    assert [indices.shape for indices in predicted_indices_by_scale] == [
+        (2, 1),
+        (2, 2),
+        (2, 4),
+    ]
+
+    teacher_forced_inputs = tokenizer.indices_to_next_scale_inputs(
+        predicted_indices_by_scale
+    )
+    first_rollout_input = tokenizer.indices_to_next_scale_input(
+        predicted_indices_by_scale[:1]
+    )
+    second_rollout_input = tokenizer.indices_to_next_scale_input(
+        predicted_indices_by_scale[:2]
+    )
+    torch.testing.assert_close(first_rollout_input, teacher_forced_inputs[0])
+    torch.testing.assert_close(second_rollout_input, teacher_forced_inputs[1])

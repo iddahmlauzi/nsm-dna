@@ -1,0 +1,71 @@
+# 39.3M-parameter next-nucleotide model over 256-base GTDB sequences.
+
+run:
+  seed: 0
+  resume_from: null
+
+wandb:
+  enabled: true
+  entity: nsm-dna
+  project: nsm
+  name: transformer-plus-plus-256-40m
+  run_id: null
+
+data:
+  subset_directory: ../datasets/gtdb/5B_subset
+  train_split: train
+  validation_split: validation
+  sequence_length: 256
+  # This is the per-GPU batch size.
+  train_batch_size: 128
+  validation_batch_size: 512
+  num_workers: 3
+  shuffle_buffer_size: 10_000
+
+model:
+  vocab_size: 4
+  model_dim: 640
+  num_layers: 8
+  num_heads: 10
+  dropout: 0.0
+  bias: false
+  use_qk_norm: true
+  rope_base: 10_000
+
+optimizer:
+  learning_rate: 5e-4
+  min_learning_rate: 1e-5
+  # Five percent of the 38,147 optimizer steps in this one-epoch run.
+  warmup_steps: 1_907
+  beta_1: 0.9
+  beta_2: 0.95
+  weight_decay: 0.05
+  max_gradient_norm: 1.0
+  gradient_accumulation_steps: 4
+
+mixed_precision:
+  enabled: true
+
+training:
+  num_epochs: 1
+  # Set an integer here for a shorter diagnostic run.
+  max_steps: null
+  log_interval: 10
+
+evaluation:
+  interval: 1_000
+  max_batches: 10
+
+checkpoint:
+  # Upload latest.pt and any improved best.pt at this cadence so an interrupted
+  # Vast instance loses at most 5,000 completed optimizer steps.
+  recovery_interval: 5_000
+  milestone_interval: 10_000
+  huggingface:
+    enabled: true
+    repository_id: Iddah/nsm-dna-checkpoints
+    repository_directory: transformer-plus-plus-256-40m
+
+hydra:
+  run:
+    dir: ../runs/${wandb.name}

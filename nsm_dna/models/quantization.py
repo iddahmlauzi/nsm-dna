@@ -331,32 +331,32 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             for _ in scale_lengths
         )
 
-    def _downsample_to_scale(
+    def _resize_to_scale(
         self,
-        residual: Float[Tensor, "batch length embed_dim"],
+        latent: Float[Tensor, "batch length embed_dim"],
         scale_index: int,
     ) -> Float[Tensor, "batch scale_length embed_dim"]:
-        """Downsample the residual to the selected scale's sequence length.
+        """Resize a full-length latent tensor to the selected scale.
 
         The first scale uses cascaded learned strided convolutions. Intermediate
         scales use area interpolation, and the final scale is already full length.
         """
         scale_length = self.scale_lengths[scale_index]
         if scale_index == len(self.scale_lengths) - 1:
-            return residual
+            return latent
 
         # Conv1d and one-dimensional interpolation expect channels first.
-        residual = einx.id("b l d -> b d l", residual)
+        latent = einx.id("b l d -> b d l", latent)
         if scale_index == 0:
-            scaled_residual = self.first_scale_downsampler(residual)
+            resized_latent = self.first_scale_downsampler(latent)
         else:
-            scaled_residual = F.interpolate(
-                residual,
+            resized_latent = F.interpolate(
+                latent,
                 size=scale_length,
                 mode="area",
             )
 
-        return einx.id("b d l -> b l d", scaled_residual)
+        return einx.id("b d l -> b l d", resized_latent)
 
     def _upsample_to_full_length(
         self,
@@ -439,7 +439,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         partial_quantized_latent: Tensor | None = None
 
         for scale_index, codebook in enumerate(self.codebooks):
-            scaled_residual = self._downsample_to_scale(residual, scale_index)
+            scaled_residual = self._resize_to_scale(residual, scale_index)
             quantized_at_scale, scale_indices = codebook(scaled_residual)
             indices_by_scale.append(scale_indices)
 
@@ -539,13 +539,27 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             )
             reconstruction = reconstruction + scale_contribution
 
-            next_scale_input = self._downsample_to_scale(
+            next_scale_input = self._resize_to_scale(
                 reconstruction,
                 scale_index=scale_index + 1,
             )
             next_scale_inputs.append(next_scale_input)
 
         return next_scale_inputs
+
+    @torch.no_grad()
+    def indices_to_next_scale_input(
+        self,
+        preceding_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
+    ) -> Float[Tensor, "batch next_scale_length embed_dim"]:
+        """Construct the next input from an autoregressively predicted prefix."""
+        cumulative_latent = self.indices_to_cumulative_latents(
+            preceding_indices_by_scale
+        )[-1]
+        return self._resize_to_scale(
+            cumulative_latent,
+            scale_index=len(preceding_indices_by_scale),
+        )
 
     @property
     def utilization_by_scale(self) -> list[Float[Tensor, ""]]:

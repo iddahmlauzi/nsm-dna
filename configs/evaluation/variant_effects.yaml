@@ -1,0 +1,14 @@
+nsm_checkpoint: ../runs/nsm-64-block/checkpoints/latest.pt
+tokenizer_checkpoint: ../runs/vqvae-64-block/checkpoints/final.pt
+output_directory: ../runs/nsm-64-block/variant-effects
+
+assay_paths:
+  - ../datasets/benchmarks/evo1_prokaryotic/BLAT_ECOLX_Jacquier_2013.csv
+  - ../datasets/benchmarks/evo1_prokaryotic/CCDB_ECOLI_Adkar_2012.csv
+
+batch_size: 128
+device: cuda:0
+
+hydra:
+  run:
+    dir: ${output_directory}
