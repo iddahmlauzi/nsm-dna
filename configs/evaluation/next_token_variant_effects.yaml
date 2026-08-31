@@ -1,5 +1,5 @@
-checkpoint: ../runs/next-token-256/checkpoints/latest.pt
-output_directory: ../runs/next-token-256/variant-effects-step-75000
+checkpoint: ../runs/transformer-plus-plus-256-40m/checkpoints/best.pt
+output_directory: ../runs/transformer-plus-plus-256-40m/variant-effects
 
 assay_paths:
   - ../datasets/benchmarks/evo1_prokaryotic/BLAT_ECOLX_Jacquier_2013.csv

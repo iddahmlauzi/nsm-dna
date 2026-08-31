@@ -71,10 +71,11 @@ def evaluate_assay(
     model: NextTokenModel,
     batch_size: int,
     device: torch.device,
-    window_length: int,
+    prefix_length: int,
+    target_length: int,
 ) -> dict[str, str | int | float]:
     """Score one assay and calculate direction-adjusted Spearman correlation."""
-    rows, num_excluded = read_assay_windows(path, window_length)
+    rows, num_excluded = read_assay_windows(path, prefix_length, target_length)
     unique_sequences = list(
         dict.fromkeys(
             sequence
@@ -150,6 +151,8 @@ def main(config: DictConfig) -> None:
         frozen=True,
     )
     window_length = model.max_sequence_length + 1
+    prefix_length = window_length // 2
+    target_length = window_length - prefix_length
 
     results = []
     for path in assay_paths:
@@ -160,7 +163,8 @@ def main(config: DictConfig) -> None:
             model,
             config.batch_size,
             device,
-            window_length,
+            prefix_length,
+            target_length,
         )
         results.append(result)
         print(f"{result['assay_id']}: Spearman {float(result['spearman']):.4f}")
@@ -180,6 +184,8 @@ def main(config: DictConfig) -> None:
         "checkpoint_sha256": sha256(checkpoint_path),
         "checkpoint_step": checkpoint_step,
         "score": "mutant minus reference summed next-nucleotide log probability",
+        "prefix_length": prefix_length,
+        "target_length": target_length,
         "window_length": window_length,
         "batch_size": config.batch_size,
         "device": str(device),

@@ -5,7 +5,7 @@ from nsm_dna.models.next_scale import NSM
 from nsm_dna.models.next_token import NextTokenModel
 from nsm_dna.models.vqvae import VQVAE
 from scripts.evaluation.variant_effects_next_scale import (
-    mutation_centered_window,
+    mutation_target_window,
     score_token_ids,
 )
 from scripts.evaluation.variant_effects_next_token import score_next_token_ids
@@ -28,10 +28,10 @@ def _build_tokenizer() -> VQVAE:
     return tokenizer
 
 
-def test_mutation_centered_window_shifts_at_sequence_boundaries() -> None:
+def test_mutation_target_window_uses_a_full_prefix() -> None:
     reference = "A" * 300
     expected_windows = (
-        (10, 0, 10),
+        (10, None, None),
         (150, 22, 128),
         (290, 44, 246),
     )
@@ -40,14 +40,26 @@ def test_mutation_centered_window_shifts_at_sequence_boundaries() -> None:
         mutant = (
             reference[:mutation_position] + "C" + reference[mutation_position + 1 :]
         )
-        window = mutation_centered_window(reference, mutant, 256)
+        window = mutation_target_window(reference, mutant, 128, 128)
+        if expected_start is None:
+            assert window is None
+            continue
         assert window is not None
         assert window[2] == expected_start
+        assert position_in_window is not None
         assert window[1][position_in_window] == "C"
 
 
-def test_mutation_centered_window_excludes_short_sequences() -> None:
-    assert mutation_centered_window("A" * 200, "A" * 100 + "C" + "A" * 99, 256) is None
+def test_mutation_target_window_excludes_short_sequences() -> None:
+    assert (
+        mutation_target_window(
+            "A" * 200,
+            "A" * 100 + "C" + "A" * 99,
+            128,
+            128,
+        )
+        is None
+    )
 
 
 def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
@@ -69,10 +81,7 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
 
     expected_hierarchy_scores = torch.zeros(2, 3, dtype=torch.float64)
     expected_decoder_scores = torch.zeros(2, dtype=torch.float64)
-    blocks = input_ids.reshape(2, 2, 4)
-    for block_index, prediction in enumerate(
-        prepare_block_predictions(tokenizer, input_ids)
-    ):
+    for prediction in prepare_block_predictions(tokenizer, input_ids):
         logits = model(prediction.scale_inputs, prefix=prediction.prefix)
         logits_by_scale = torch.split(logits, tokenizer.scale_lengths, dim=1)
         for scale_index, (scale_logits, scale_targets) in enumerate(
@@ -88,9 +97,9 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
         decoder_logits = tokenizer.decode(prediction.targets_by_scale)
         decoder_losses = F.cross_entropy(
             decoder_logits.flatten(0, 1),
-            blocks[:, block_index].flatten(),
+            prediction.target_ids.flatten(),
             reduction="none",
-        ).reshape(blocks[:, block_index].shape)
+        ).reshape(prediction.target_ids.shape)
         expected_decoder_scores -= decoder_losses.sum(1).double()
 
     torch.testing.assert_close(hierarchy_scores, expected_hierarchy_scores)

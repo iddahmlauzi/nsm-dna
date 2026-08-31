@@ -4,7 +4,6 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-import einx
 import hydra
 import torch
 import torch.nn.functional as F
@@ -33,14 +32,16 @@ PREDICTION_COLUMNS = (
 )
 
 
-def mutation_centered_window(
+def mutation_target_window(
     reference: str,
     mutant: str,
-    window_length: int,
+    prefix_length: int,
+    target_length: int,
 ) -> tuple[str, str, int] | None:
-    """Return paired windows centered on the changed nucleotides when possible."""
+    """Place every changed nucleotide in the target after a full prefix."""
     reference = reference.upper()
     mutant = mutant.upper()
+    window_length = prefix_length + target_length
     if len(reference) != len(mutant) or len(reference) < window_length:
         return None
 
@@ -52,10 +53,20 @@ def mutation_centered_window(
     if not changed_positions:
         return None
 
-    mutation_center = (changed_positions[0] + changed_positions[-1]) // 2
-    window_start = mutation_center - window_length // 2
-    window_start = min(max(window_start, 0), len(reference) - window_length)
+    first_change = changed_positions[0]
+    last_change = changed_positions[-1]
+    if first_change < prefix_length:
+        return None
+
+    window_start = min(
+        first_change - prefix_length,
+        len(reference) - window_length,
+    )
     window_end = window_start + window_length
+    target_start = window_start + prefix_length
+    if first_change < target_start or last_change >= window_end:
+        return None
+
     return (
         reference[window_start:window_end],
         mutant[window_start:window_end],
@@ -102,15 +113,7 @@ def score_token_ids(
     decoder_scores = torch.zeros(
         input_ids.shape[0], device=input_ids.device, dtype=torch.float64
     )
-    blocks = einx.id(
-        "batch (num_blocks block_length) -> batch num_blocks block_length",
-        input_ids,
-        block_length=tokenizer.context_length,
-    )
-
-    for block_index, prediction in enumerate(
-        prepare_block_predictions(tokenizer, input_ids)
-    ):
+    for prediction in prepare_block_predictions(tokenizer, input_ids):
         with torch.autocast(
             device_type=input_ids.device.type,
             dtype=torch.bfloat16,
@@ -136,7 +139,7 @@ def score_token_ids(
         # The decoder supplies the probability of the observed nucleotides given
         # the same complete hierarchy whose probability NSM-DNA assigned above.
         nucleotide_log_probabilities = F.log_softmax(decoder_logits.float(), dim=-1)
-        nucleotide_targets = blocks[:, block_index]
+        nucleotide_targets = prediction.target_ids
         decoder_scores += (
             nucleotide_log_probabilities.gather(-1, nucleotide_targets.unsqueeze(-1))
             .squeeze(-1)
@@ -180,16 +183,20 @@ def score_sequences(
 
 def read_assay_windows(
     path: Path,
-    window_length: int,
+    prefix_length: int,
+    target_length: int,
 ) -> tuple[list[dict[str, str]], int]:
-    """Read one assay and exclude rows that cannot provide a complete window."""
+    """Read rows with a full prefix and all edits inside the target."""
     selected_rows = []
     num_excluded = 0
 
     with path.open(encoding="utf-8", newline="") as input_file:
         for row in csv.DictReader(input_file):
-            window = mutation_centered_window(
-                row["wt_nt"], row["mutant_nt"], window_length
+            window = mutation_target_window(
+                row["wt_nt"],
+                row["mutant_nt"],
+                prefix_length,
+                target_length,
             )
             if window is None:
                 num_excluded += 1
@@ -228,10 +235,11 @@ def evaluate_assay(
     tokenizer: VQVAE,
     batch_size: int,
     device: torch.device,
-    window_length: int,
+    prefix_length: int,
+    target_length: int,
 ) -> dict[str, str | int | float]:
     """Score one assay and calculate its direction-adjusted Spearman correlation."""
-    rows, num_excluded = read_assay_windows(path, window_length)
+    rows, num_excluded = read_assay_windows(path, prefix_length, target_length)
 
     # Variants at nearby positions often share a reference window. Score each
     # distinct sequence once and reuse its result for every matching row.
@@ -336,7 +344,8 @@ def main(config: DictConfig) -> None:
         tokenizer_checkpoint_path,
         device,
     )
-    window_length = int(model.max_prefix_length + tokenizer.context_length)
+    prefix_length = int(model.max_prefix_length)
+    target_length = int(tokenizer.context_length)
     component_names = [f"scale_{length}" for length in tokenizer.scale_lengths]
     component_names.extend(["hierarchy", "decoder"])
 
@@ -350,7 +359,8 @@ def main(config: DictConfig) -> None:
             tokenizer,
             config.batch_size,
             device,
-            window_length,
+            prefix_length,
+            target_length,
         )
         results.append(result)
         correlations = [
@@ -386,7 +396,9 @@ def main(config: DictConfig) -> None:
             "mutant minus reference summed hierarchy and nucleotide log probability"
         ),
         "score_components": ["joint"] + component_names,
-        "window_length": window_length,
+        "prefix_length": prefix_length,
+        "target_length": target_length,
+        "window_length": prefix_length + target_length,
         "batch_size": config.batch_size,
         "device": str(device),
         "input_files": [
