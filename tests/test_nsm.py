@@ -135,7 +135,7 @@ def test_scale_attention_mask_allows_only_the_current_scale() -> None:
     torch.testing.assert_close(model.scale_attention_mask, expected_mask)
 
 
-def test_prefix_attention_mask_exposes_prefix_to_every_scale() -> None:
+def test_prefix_attention_mask_routes_prefix_through_first_scale() -> None:
     model = NSM(
         vq_embed_dim=3,
         model_dim=8,
@@ -152,8 +152,8 @@ def test_prefix_attention_mask_exposes_prefix_to_every_scale() -> None:
             [True, True, False, False, False],
             [True, True, False, False, False],
             [True, True, True, False, False],
-            [True, True, False, True, True],
-            [True, True, False, True, True],
+            [False, False, True, True, True],
+            [False, False, True, True, True],
         ]
     ).reshape(1, 1, 5, 5)
 

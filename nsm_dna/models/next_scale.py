@@ -352,7 +352,7 @@ class NSM(nn.Module):
         self,
         prefix_length: int,
     ) -> Bool[Tensor, "1 1 length length"]:
-        """Let target scales read the prefix while keeping scales isolated."""
+        """Route prefix context to later scales through the first scale."""
         if prefix_length == 0:
             return self.scale_attention_mask
 
@@ -366,10 +366,17 @@ class NSM(nn.Module):
         column_section_ids = einx.id("column -> 1 column", section_ids)
 
         same_section = row_section_ids == column_section_ids
-        target_reads_prefix = (row_section_ids >= 0) & (column_section_ids == -1)
+        first_scale_reads_prefix = (row_section_ids == 0) & (
+            column_section_ids == -1
+        )
+        later_scales_read_first_scale = (row_section_ids > 0) & (
+            column_section_ids == 0
+        )
         return einx.id(
             "row column -> 1 1 row column",
-            same_section | target_reads_prefix,
+            same_section
+            | first_scale_reads_prefix
+            | later_scales_read_first_scale,
         )
 
     def _get_rotary_embeddings(self, prefix_length: int) -> RotaryEmbeddings:

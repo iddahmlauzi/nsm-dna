@@ -1,4 +1,44 @@
-from scripts.evaluation.lambda_probe_next_scale import segment_window_starts
+import torch
+import torch.nn as nn
+
+from scripts.evaluation.lambda_probe_next_scale import (
+    NSMWindowEncoder,
+    segment_window_starts,
+)
+
+
+def test_window_encoder_extracts_final_first_scale_memory_state() -> None:
+    class StubTokenizer(nn.Module):
+        context_length = 2
+
+        def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
+            return token_ids.unsqueeze(-1).float()
+
+        def encode_indices(self, token_ids: torch.Tensor) -> list[torch.Tensor]:
+            return [token_ids]
+
+        def indices_to_next_scale_inputs(
+            self,
+            indices_by_scale: list[torch.Tensor],
+        ) -> list[torch.Tensor]:
+            return [indices_by_scale[0].unsqueeze(-1).float()]
+
+    class StubModel(nn.Module):
+        def encode(
+            self,
+            scale_inputs: list[torch.Tensor],
+            *,
+            prefix: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.tensor(
+                [[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]
+            )
+
+    encoder = NSMWindowEncoder(StubModel(), StubTokenizer())
+
+    embedding = encoder(torch.tensor([[0, 1, 2, 3]]))
+
+    torch.testing.assert_close(embedding, torch.tensor([[5.0, 6.0]]))
 
 
 def test_segment_windows_advance_by_one_target_block() -> None:

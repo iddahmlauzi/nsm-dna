@@ -23,7 +23,7 @@ from scripts.evaluation.lambda_probe_next_token import (
 
 
 class NSMWindowEncoder(nn.Module):
-    """Mean-pool final NSM states for one prefix-target DNA window."""
+    """Extract the final first-scale memory state for one NSM window."""
 
     def __init__(self, model: NSM, tokenizer: VQVAE) -> None:
         super().__init__()
@@ -47,7 +47,8 @@ class NSMWindowEncoder(nn.Module):
             )
             hidden_states = self.model.encode(scale_inputs, prefix=prefix)
 
-        return hidden_states.float().mean(dim=1)
+        memory_token_index = prefix.shape[1]
+        return hidden_states[:, memory_token_index].float()
 
 
 def segment_window_starts(
@@ -75,7 +76,7 @@ def extract_segment_embeddings(
     *,
     description: str,
 ) -> np.ndarray:
-    """Mean-pool native-window NSM embeddings for each 2 kb segment."""
+    """Average final first-scale memory states across each 2 kb segment."""
     embeddings = np.empty((len(sequences), model_dim), dtype=np.float32)
     window_starts = segment_window_starts(
         len(sequences[0]),
@@ -328,9 +329,9 @@ def main(config: DictConfig) -> None:
             for name, path in split_paths.items()
         },
         "representation": (
-            "mean of all final normalized NSM transformer states for each "
-            "teacher-forced 128-base prefix and 128-base target window, then "
-            "mean across windows"
+            "final normalized first-scale BOS state after the last NSM "
+            "transformer layer for each teacher-forced 128-base prefix and "
+            "128-base target window, then mean across windows"
         ),
         "window_length": window_length,
         "window_stride": stride,

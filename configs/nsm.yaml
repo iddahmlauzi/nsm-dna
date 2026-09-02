@@ -6,16 +6,16 @@ run:
 
 # The checkpoint's stored model configuration is the source of truth for the
 # tokenizer architecture, scale lengths, and codebook sizes.
-tokenizer_checkpoint: ../runs/vqvae-128-block/checkpoints/final.pt
+tokenizer_checkpoint: ../runs/vqvae-9scale-500m/checkpoints/final.pt
 
 wandb:
   enabled: true
   entity: nsm-dna
   project: nsm
-  name: nsm-256-40m
+  name: nsm-9scale-scale1-memory
 
 data:
-  subset_directory: ../datasets/gtdb/5B_subset
+  subset_directory: ../datasets/gtdb/500M_subset
   train_split: train
   validation_split: validation
   sequence_length: 256
@@ -28,11 +28,11 @@ data:
 
 model:
   # Match the 39.30M-parameter NTP Transformer backbone exactly. NSM-specific
-  # scale refiners and the output head bring the stage-two total to 47.85M.
+  # scale refiners and the output head bring the stage-two total to 46.52M.
   model_dim: 640
   num_layers: 8
   num_heads: 10
-  dropout: 0.0
+  dropout: 0.1
   bias: false
 
   use_qk_norm: true
@@ -45,7 +45,7 @@ model:
 optimizer:
   learning_rate: 5e-4
   min_learning_rate: 1e-5
-  # Five percent of the 38,147 optimizer steps in this one-epoch run.
+  # Five percent of the 38,150 optimizer steps across ten epochs.
   warmup_steps: 1_907
   beta_1: 0.9
   beta_2: 0.95
@@ -60,9 +60,11 @@ mixed_precision:
   enabled: true
 
 training:
-  num_epochs: 1
+  num_epochs: 10
   # Set an integer here to override the epoch-derived training length.
   max_steps: null
+  # Replace this fraction of teacher-forced input codes during training.
+  input_code_corruption_probability: 0.1
   log_interval: 10
 
 evaluation:
@@ -77,9 +79,9 @@ checkpoint:
   recovery_interval: 5_000
   milestone_interval: 10_000
   huggingface:
-    enabled: true
+    enabled: false
     repository_id: Iddah/nsm-dna-checkpoints
-    repository_directory: nsm-256-40m
+    repository_directory: nsm-9scale-scale1-memory
 
 hydra:
   run:

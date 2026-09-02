@@ -79,10 +79,35 @@ def compute_next_scale_loss(
     return loss, losses_by_scale
 
 
+def corrupt_scale_indices(
+    indices_by_scale: list[Tensor],
+    codebook_sizes: list[int],
+    probability: float,
+) -> list[Tensor]:
+    """Randomly replace preceding-scale codes used as model inputs."""
+    if probability == 0.0:
+        return indices_by_scale
+
+    corrupted_indices = [
+        torch.where(
+            torch.rand(indices.shape, device=indices.device) < probability,
+            torch.randint(codebook_size, indices.shape, device=indices.device),
+            indices,
+        )
+        for indices, codebook_size in zip(
+            indices_by_scale[:-1],
+            codebook_sizes[:-1],
+            strict=True,
+        )
+    ]
+    return [*corrupted_indices, indices_by_scale[-1]]
+
+
 @torch.no_grad()
 def prepare_block_predictions(
     tokenizer: VQVAE,
     input_ids: Int[Tensor, "batch sequence_length"],
+    corruption_probability: float = 0.0,
 ) -> list[BlockPredictionBatch]:
     """Create one task that predicts the second block from the first block."""
     block_length = tokenizer.context_length
@@ -90,7 +115,12 @@ def prepare_block_predictions(
     target_ids = input_ids[:, block_length:]
     prefix = tokenizer.encode(prefix_ids)
     targets_by_scale = tokenizer.encode_indices(target_ids)
-    scale_inputs = tokenizer.indices_to_next_scale_inputs(targets_by_scale)
+    input_indices_by_scale = corrupt_scale_indices(
+        targets_by_scale,
+        tokenizer.codebook_sizes,
+        corruption_probability,
+    )
+    scale_inputs = tokenizer.indices_to_next_scale_inputs(input_indices_by_scale)
 
     return [
         BlockPredictionBatch(
@@ -431,6 +461,7 @@ def main(config: DictConfig) -> None:
         disable=not distributed_environment.is_main_process,
     )
     gradient_accumulation_steps = config.optimizer.gradient_accumulation_steps
+    corruption_probability = config.training.input_code_corruption_probability
 
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
@@ -451,7 +482,11 @@ def main(config: DictConfig) -> None:
                 batch = next(train_iterator)
 
             input_ids = batch["input_ids"].to(device)
-            block_predictions = prepare_block_predictions(tokenizer, input_ids)
+            block_predictions = prepare_block_predictions(
+                tokenizer,
+                input_ids,
+                corruption_probability=corruption_probability,
+            )
             num_predictions_per_step = gradient_accumulation_steps * len(
                 block_predictions
             )

@@ -10,6 +10,7 @@ from nsm_dna.training import calculate_training_steps
 from scripts.training.train_nsm import (
     build_scale_loss_weights,
     compute_next_scale_loss,
+    corrupt_scale_indices,
     evaluate,
     prepare_block_predictions,
     rollout_scale_predictions,
@@ -267,16 +268,45 @@ def test_block_prediction_uses_first_block_as_prefix_and_second_as_target() -> N
         torch.testing.assert_close(actual, expected)
 
 
+def test_corruption_changes_inputs_without_changing_targets() -> None:
+    targets_by_scale = [
+        torch.tensor([[3]]),
+        torch.tensor([[2, 4]]),
+        torch.tensor([[1, 5, 6, 7]]),
+    ]
+
+    corrupted_indices = corrupt_scale_indices(
+        targets_by_scale,
+        codebook_sizes=[1, 1, 1],
+        probability=1.0,
+    )
+
+    torch.testing.assert_close(
+        corrupted_indices[0],
+        torch.zeros_like(targets_by_scale[0]),
+    )
+    torch.testing.assert_close(
+        corrupted_indices[1],
+        torch.zeros_like(targets_by_scale[1]),
+    )
+    torch.testing.assert_close(corrupted_indices[2], targets_by_scale[2])
+    torch.testing.assert_close(targets_by_scale[0], torch.tensor([[3]]))
+    torch.testing.assert_close(targets_by_scale[1], torch.tensor([[2, 4]]))
+
+
 def test_default_config_matches_next_token_transformer_recipe() -> None:
     config_path = Path(__file__).parents[1] / "configs" / "nsm.yaml"
     config = OmegaConf.load(config_path)
 
     assert config.run.resume_from is None
-    assert config.tokenizer_checkpoint.endswith("vqvae-128-block/checkpoints/final.pt")
+    assert config.tokenizer_checkpoint.endswith(
+        "vqvae-9scale-500m/checkpoints/final.pt"
+    )
+    assert config.data.subset_directory.endswith("gtdb/500M_subset")
     assert config.model.model_dim == 640
     assert config.model.num_layers == 8
     assert config.model.num_heads == 10
-    assert config.model.dropout == 0.0
+    assert config.model.dropout == 0.1
     assert config.model.bias is False
     assert config.model.use_qk_norm is True
     assert config.optimizer.warmup_steps == 1907
@@ -284,7 +314,8 @@ def test_default_config_matches_next_token_transformer_recipe() -> None:
     assert config.optimizer.beta_2 == 0.95
     assert config.optimizer.weight_decay == 0.05
     assert config.optimizer.gradient_accumulation_steps == 2
-    assert config.training.num_epochs == 1
+    assert config.training.num_epochs == 10
+    assert config.training.input_code_corruption_probability == 0.1
 
 
 def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
