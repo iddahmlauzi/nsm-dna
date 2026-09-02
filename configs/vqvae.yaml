@@ -8,10 +8,10 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: vqvae
-  name: vqvae-128-block
+  name: vqvae-9scale-500m
 
 data:
-  subset_directory: ../datasets/gtdb/5B_subset
+  subset_directory: ../datasets/gtdb/500M_subset
   train_split: train
   validation_split: validation
   train_batch_size: 256
@@ -22,10 +22,11 @@ data:
 model:
   vocab_size: 4
   context_length: 128
-  embed_dim: 384
-  num_heads: 6
-  scale_lengths: [1, 4, 9, 16, 25, 36, 49, 64, 81, 100, 121, 128]
-  codebook_sizes: [256, 256, 256, 256, 256, 256, 256, 256, 256, 256, 256, 256]
+  embed_dim: 256
+  num_heads: 8
+  rope_base: 10_000
+  scale_lengths: [1, 4, 9, 16, 25, 36, 49, 64, 128]
+  codebook_sizes: [256, 256, 256, 256, 256, 256, 256, 256, 256]
 
   encoder_dropout: 0.0
   decoder_dropout: 0.1
@@ -61,7 +62,7 @@ mixed_precision:
   enabled: true
 
 training:
-  num_epochs: 1
+  num_epochs: 10
   # Set an integer here to override the epoch-derived training length.
   max_steps: null
   log_interval: 10
@@ -73,7 +74,7 @@ evaluation:
 checkpoint:
   interval: 3_000
   huggingface:
-    enabled: true
+    enabled: false
     repository_id: Iddah/nsm-dna-checkpoints
     repository_directory: vqvae-128-block
 

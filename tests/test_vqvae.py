@@ -1,9 +1,59 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
+from nsm_dna.models.autoencoder import Decoder, Encoder
 from nsm_dna.models.quantization import MultiscaleResidualVectorQuantizer
 from nsm_dna.models.vqvae import VQVAE
 from scripts.training.train_vqvae import evaluate
+
+
+def test_encoder_uses_token_embeddings_without_absolute_positions() -> None:
+    encoder = Encoder(vocab_size=4, embed_dim=4, dropout=0.0)
+    with torch.no_grad():
+        encoder.token_embedding.weight.copy_(torch.eye(4))
+
+    first_sequence = torch.tensor([[3, 1, 0, 2]])
+    shifted_sequence = torch.tensor([[3, 3, 1, 0]])
+
+    first_embeddings = encoder(first_sequence)
+    shifted_embeddings = encoder(shifted_sequence)
+
+    torch.testing.assert_close(first_embeddings[:, :3], shifted_embeddings[:, 1:])
+
+
+def test_decoder_supplies_rope_to_attention() -> None:
+    class RecordingBlock(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rotary_embeddings = None
+
+        def forward(
+            self,
+            x: torch.Tensor,
+            *,
+            rotary_embeddings=None,
+            is_causal: bool = False,
+        ) -> torch.Tensor:
+            self.rotary_embeddings = rotary_embeddings
+            return x
+
+    decoder = Decoder(
+        vocab_size=4,
+        context_length=4,
+        embed_dim=8,
+        num_heads=2,
+        dropout=0.0,
+    )
+    recording_block = RecordingBlock()
+    decoder.block = recording_block
+
+    decoder(torch.randn(1, 4, 8))
+
+    assert recording_block.rotary_embeddings is not None
+    cosine, sine = recording_block.rotary_embeddings
+    torch.testing.assert_close(cosine, decoder.rope_cosine)
+    torch.testing.assert_close(sine, decoder.rope_sine)
 
 
 def test_first_scale_sampler_uses_a_cascade() -> None:

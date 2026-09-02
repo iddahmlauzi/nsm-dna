@@ -40,6 +40,7 @@ class VQVAE(nn.Module):
         encoder_dropout: float = 0.0,
         decoder_dropout: float = 0.1,
         bias: bool = False,
+        rope_base: float = 10000.0,
         pre_quant_num_groups: int | None = None,
         # Codebook updates and quantization loss
         commitment_cost: float = 0.25,
@@ -62,12 +63,12 @@ class VQVAE(nn.Module):
         self.context_length = context_length
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.rope_base = rope_base
         self.scale_lengths = list(scale_lengths)
         self.codebook_sizes = list(codebook_sizes)
 
         self.encoder = Encoder(
             self.vocab_size,
-            self.context_length,
             self.embed_dim,
             dropout=encoder_dropout,
         )
@@ -105,10 +106,12 @@ class VQVAE(nn.Module):
         )
         self.decoder = Decoder(
             self.vocab_size,
+            self.context_length,
             self.embed_dim,
             self.num_heads,
             dropout=decoder_dropout,
             bias=bias,
+            rope_base=self.rope_base,
         )
 
     @classmethod
@@ -137,6 +140,7 @@ class VQVAE(nn.Module):
             encoder_dropout=config.encoder_dropout,
             decoder_dropout=config.decoder_dropout,
             bias=config.bias,
+            rope_base=getattr(config, "rope_base", 10000.0),
             pre_quant_num_groups=config.pre_quant_num_groups,
             commitment_cost=config.commitment_cost,
             decay=config.decay,

@@ -254,6 +254,7 @@ def main(config: DictConfig) -> None:
         encoder_dropout=config.model.encoder_dropout,
         decoder_dropout=config.model.decoder_dropout,
         bias=config.model.bias,
+        rope_base=config.model.rope_base,
         pre_quant_num_groups=config.model.pre_quant_num_groups,
         commitment_cost=config.model.commitment_cost,
         decay=config.model.decay,
