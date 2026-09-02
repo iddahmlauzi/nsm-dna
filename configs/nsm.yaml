@@ -12,7 +12,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: nsm
-  name: nsm-9scale-scale1-memory
+  name: nsm-9scale-scale1-memory-quantized-prefix
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -81,7 +81,7 @@ checkpoint:
   huggingface:
     enabled: false
     repository_id: Iddah/nsm-dna-checkpoints
-    repository_directory: nsm-9scale-scale1-memory
+    repository_directory: nsm-9scale-scale1-memory-quantized-prefix
 
 hydra:
   run:

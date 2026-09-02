@@ -258,7 +258,10 @@ def test_block_prediction_uses_first_block_as_prefix_and_second_as_target() -> N
 
     prediction = block_predictions[0]
     torch.testing.assert_close(prediction.target_ids, target_ids)
-    torch.testing.assert_close(prediction.prefix, tokenizer.encode(prefix_ids))
+    torch.testing.assert_close(
+        prediction.prefix,
+        tokenizer.encode_quantized(prefix_ids),
+    )
 
     expected_targets = tokenizer.encode_indices(target_ids)
     expected_inputs = tokenizer.indices_to_next_scale_inputs(expected_targets)
@@ -303,6 +306,7 @@ def test_default_config_matches_next_token_transformer_recipe() -> None:
         "vqvae-9scale-500m/checkpoints/final.pt"
     )
     assert config.data.subset_directory.endswith("gtdb/500M_subset")
+    assert config.data.train_batch_size == 64
     assert config.model.model_dim == 640
     assert config.model.num_layers == 8
     assert config.model.num_heads == 10

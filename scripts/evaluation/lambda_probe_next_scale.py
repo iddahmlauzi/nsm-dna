@@ -40,7 +40,7 @@ class NSMWindowEncoder(nn.Module):
             dtype=torch.bfloat16,
             enabled=input_ids.device.type == "cuda",
         ):
-            prefix = self.tokenizer.encode(prefix_ids)
+            prefix = self.tokenizer.encode_quantized(prefix_ids)
             targets_by_scale = self.tokenizer.encode_indices(target_ids)
             scale_inputs = self.tokenizer.indices_to_next_scale_inputs(
                 targets_by_scale

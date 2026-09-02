@@ -1,11 +1,11 @@
-checkpoint: /workspace/runs/nsm-9scale-scale1-memory/checkpoints/final.pt
+checkpoint: /workspace/runs/nsm-9scale-scale1-memory-quantized-prefix/checkpoints/final.pt
 tokenizer_checkpoint: /workspace/runs/vqvae-9scale-500m/checkpoints/final.pt
 dataset_directory: /workspace/datasets/lambda/LAMBDA/binary_segments_2k
-output_directory: /workspace/results/nsm-9scale-scale1-memory/lambda-probe-2k-first-scale-memory
+output_directory: /workspace/results/nsm-9scale-scale1-memory-quantized-prefix/lambda-probe-2k-first-scale-memory
 
 expected_sequence_length: 2_000
 embedding_batch_size: 16
-device_ids: [0, 1, 2, 3]
+device_ids: [0, 1]
 random_model_seed: 42
 
 probe:
