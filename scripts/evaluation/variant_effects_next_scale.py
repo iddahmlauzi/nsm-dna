@@ -16,7 +16,7 @@ from tqdm import tqdm
 from nsm_dna.data import encode_sequence
 from nsm_dna.models.next_scale import NSM
 from nsm_dna.models.vqvae import VQVAE
-from scripts.training.train_nsm import prepare_block_predictions
+from scripts.training.train_nsm import BlockPredictionBatch, prepare_block_predictions
 
 PREDICTION_COLUMNS = (
     "study_id",
@@ -32,17 +32,16 @@ PREDICTION_COLUMNS = (
 )
 
 
-def mutation_target_window(
+def target_block_window(
     reference: str,
     mutant: str,
     prefix_length: int,
     target_length: int,
 ) -> tuple[str, str, int] | None:
-    """Place every changed nucleotide in the target after a full prefix."""
+    """Use the fixed target block containing the edit and its preceding prefix."""
     reference = reference.upper()
     mutant = mutant.upper()
-    window_length = prefix_length + target_length
-    if len(reference) != len(mutant) or len(reference) < window_length:
+    if len(reference) != len(mutant):
         return None
 
     changed_positions = [
@@ -55,16 +54,10 @@ def mutation_target_window(
 
     first_change = changed_positions[0]
     last_change = changed_positions[-1]
-    if first_change < prefix_length:
-        return None
-
-    window_start = min(
-        first_change - prefix_length,
-        len(reference) - window_length,
-    )
-    window_end = window_start + window_length
-    target_start = window_start + prefix_length
-    if first_change < target_start or last_change >= window_end:
+    target_start = (first_change // target_length) * target_length
+    window_start = target_start - prefix_length
+    window_end = target_start + target_length
+    if window_start < 0 or window_end > len(reference) or last_change >= window_end:
         return None
 
     return (
@@ -113,7 +106,23 @@ def score_token_ids(
     decoder_scores = torch.zeros(
         input_ids.shape[0], device=input_ids.device, dtype=torch.float64
     )
-    for prediction in prepare_block_predictions(tokenizer, input_ids):
+    if input_ids.shape[1] == tokenizer.context_length:
+        target_ids = input_ids
+        targets_by_scale = tokenizer.encode_indices(target_ids)
+        predictions = [
+            BlockPredictionBatch(
+                target_ids=target_ids,
+                prefix=None,
+                scale_inputs=tokenizer.indices_to_next_scale_inputs(
+                    targets_by_scale
+                ),
+                targets_by_scale=targets_by_scale,
+            )
+        ]
+    else:
+        predictions = prepare_block_predictions(tokenizer, input_ids)
+
+    for prediction in predictions:
         with torch.autocast(
             device_type=input_ids.device.type,
             dtype=torch.bfloat16,
@@ -192,7 +201,7 @@ def read_assay_windows(
 
     with path.open(encoding="utf-8", newline="") as input_file:
         for row in csv.DictReader(input_file):
-            window = mutation_target_window(
+            window = target_block_window(
                 row["wt_nt"],
                 row["mutant_nt"],
                 prefix_length,
@@ -344,7 +353,17 @@ def main(config: DictConfig) -> None:
         tokenizer_checkpoint_path,
         device,
     )
-    prefix_length = int(model.max_prefix_length)
+    configured_prefix_length = config.prefix_length
+    prefix_length = (
+        int(model.max_prefix_length)
+        if configured_prefix_length is None
+        else int(configured_prefix_length)
+    )
+    if not 0 <= prefix_length <= model.max_prefix_length:
+        raise ValueError(
+            f"Evaluation prefix length {prefix_length} must be between 0 and "
+            f"the model maximum of {model.max_prefix_length}."
+        )
     target_length = int(tokenizer.context_length)
     component_names = [f"scale_{length}" for length in tokenizer.scale_lengths]
     component_names.extend(["hierarchy", "decoder"])

@@ -9,6 +9,7 @@ assay_paths:
 
 batch_size: 128
 device: cuda:0
+prefix_length: null
 
 hydra:
   run:

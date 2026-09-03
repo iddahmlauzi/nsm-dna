@@ -54,7 +54,7 @@ optimizer:
   gradient_accumulation_steps: 2
 
   # A scale's loss share is proportional to length ** (1 - alpha).
-  scale_loss_alpha: 0.25
+  scale_loss_alpha: 1
 
 mixed_precision:
   enabled: true
