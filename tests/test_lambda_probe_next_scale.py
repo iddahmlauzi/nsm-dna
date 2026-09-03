@@ -11,7 +11,7 @@ def test_window_encoder_extracts_final_first_scale_memory_state() -> None:
     class StubTokenizer(nn.Module):
         context_length = 2
 
-        def encode_quantized(self, token_ids: torch.Tensor) -> torch.Tensor:
+        def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
             return token_ids.unsqueeze(-1).float()
 
         def encode_indices(self, token_ids: torch.Tensor) -> list[torch.Tensor]:

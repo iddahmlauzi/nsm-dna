@@ -258,10 +258,7 @@ def test_block_prediction_uses_first_block_as_prefix_and_second_as_target() -> N
 
     prediction = block_predictions[0]
     torch.testing.assert_close(prediction.target_ids, target_ids)
-    torch.testing.assert_close(
-        prediction.prefix,
-        tokenizer.encode_quantized(prefix_ids),
-    )
+    torch.testing.assert_close(prediction.prefix, tokenizer.encode(prefix_ids))
 
     expected_targets = tokenizer.encode_indices(target_ids)
     expected_inputs = tokenizer.indices_to_next_scale_inputs(expected_targets)

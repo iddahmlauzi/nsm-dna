@@ -113,7 +113,7 @@ def prepare_block_predictions(
     block_length = tokenizer.context_length
     prefix_ids = input_ids[:, :block_length]
     target_ids = input_ids[:, block_length:]
-    prefix = tokenizer.encode_quantized(prefix_ids)
+    prefix = tokenizer.encode(prefix_ids)
     targets_by_scale = tokenizer.encode_indices(target_ids)
     input_indices_by_scale = corrupt_scale_indices(
         targets_by_scale,

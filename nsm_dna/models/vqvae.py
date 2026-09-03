@@ -161,7 +161,11 @@ class VQVAE(nn.Module):
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> Float[Tensor, "batch length embed_dim"]:
-        """Encode DNA into the normalized continuous latent space."""
+        """Encode DNA into the normalized continuous latent space.
+
+        VQ-VAE training quantizes this latent before reconstruction. NSM-DNA
+        uses the same latent directly when a completed block is prefix context.
+        """
         latent = self.encoder(token_ids)
 
         if self.pre_quant_norm is not None:
@@ -170,15 +174,6 @@ class VQVAE(nn.Module):
             latent = einx.id("b d l -> b l d", latent)
 
         return latent
-
-    @torch.no_grad()
-    def encode_quantized(
-        self,
-        token_ids: Int[Tensor, "batch length"],
-    ) -> Float[Tensor, "batch length embed_dim"]:
-        """Encode DNA as the complete multiscale quantized latent."""
-        indices_by_scale = self.encode_indices(token_ids)
-        return self.quantizer.indices_to_cumulative_latents(indices_by_scale)[-1]
 
     def forward(
         self,
