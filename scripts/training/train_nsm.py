@@ -19,6 +19,7 @@ from nsm_dna.models.next_scale import NSMDNA, NSMDNAOutput
 from nsm_dna.training import (
     GenFirstLossSchedule,
     GenerativeLossWeights,
+    LinearSelfConditioningSchedule,
     build_learning_rate_scheduler,
     calculate_training_steps,
     cleanup_distributed_training,
@@ -436,6 +437,12 @@ def main(config: DictConfig) -> None:
             entropy=refinement_config.entropy_loss_weight,
         ),
     )
+    self_conditioning_config = config.training.self_conditioning
+    self_conditioning_schedule = LinearSelfConditioningSchedule(
+        total_steps=total_steps,
+        ramp_fraction=self_conditioning_config.ramp_fraction,
+        max_probability=self_conditioning_config.max_probability,
+    )
     if distributed_environment.is_main_process:
         print(
             f"training for {total_steps:,} optimizer steps "
@@ -446,6 +453,11 @@ def main(config: DictConfig) -> None:
             f"{loss_schedule.generation_first_steps:,} generation-first steps, "
             f"{total_steps - loss_schedule.generation_first_steps:,} "
             "reconstruction-refinement steps"
+        )
+        print(
+            "self-conditioning schedule: 0 to "
+            f"{self_conditioning_schedule.max_probability:.0%} over "
+            f"{self_conditioning_schedule.ramp_steps:,} steps"
         )
 
     wandb_run = None
@@ -589,6 +601,9 @@ def main(config: DictConfig) -> None:
 
     for step in progress_bar:
         generative_loss_weights = loss_schedule.weights_at_step(step)
+        self_conditioning_probability = (
+            self_conditioning_schedule.probability_at_step(step)
+        )
         if (
             distributed_environment.is_main_process
             and step == loss_schedule.generation_first_steps + 1
@@ -647,11 +662,14 @@ def main(config: DictConfig) -> None:
                     dtype=torch.bfloat16,
                     enabled=use_mixed_precision,
                 ):
-                    # Code corruption changes only transformer inputs. Entropy uses
-                    # the original target assignments, as do reconstruction and EMA.
+                    # Model-produced conditioning changes only transformer inputs.
+                    # Labels, reconstruction, entropy, and EMA use clean assignments.
                     output = training_model(
                         sequence_ids,
                         corruption_probability=corruption_probability,
+                        self_conditioning_probability=(
+                            self_conditioning_probability
+                        ),
                         return_autoregressive_reconstruction=True,
                     )
                     losses = nsm_dna_losses(
@@ -739,6 +757,9 @@ def main(config: DictConfig) -> None:
                     ).item(),
                     "optimization/gradient_norm": gradient_norm.item(),
                     "optimization/learning_rate": learning_rate,
+                    "optimization/self_conditioning_probability": (
+                        self_conditioning_probability
+                    ),
                 }
                 assert component_gradient_norms is not None
                 for component, norm in component_gradient_norms.items():

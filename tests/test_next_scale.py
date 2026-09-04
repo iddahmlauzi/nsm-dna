@@ -394,6 +394,40 @@ def test_forward_decodes_hard_predictions_with_soft_gradients_for_apr() -> None:
     )
 
 
+def test_forward_can_condition_on_detached_model_predictions() -> None:
+    model = NSMDNA.from_config(_build_end_to_end_config()).eval()
+    sequence_ids = torch.tensor(
+        [
+            [0, 1, 2, 3, 3, 2, 1, 0],
+            [3, 2, 1, 0, 0, 1, 2, 3],
+        ]
+    )
+    transformer_calls = 0
+
+    def count_transformer_call(_module, _inputs, _output) -> None:
+        nonlocal transformer_calls
+        transformer_calls += 1
+
+    hook = model.transformer.register_forward_hook(count_transformer_call)
+    output = model(sequence_ids, self_conditioning_probability=1.0)
+    hook.remove()
+
+    assert transformer_calls == 2
+    assert [logits.shape for logits in output.next_scale_logits_by_scale] == [
+        (2, 1, 8),
+        (2, 2, 8),
+        (2, 4, 8),
+    ]
+
+
+def test_forward_rejects_invalid_self_conditioning_probability() -> None:
+    model = NSMDNA.from_config(_build_end_to_end_config())
+    sequence_ids = torch.tensor([[0, 1, 2, 3, 3, 2, 1, 0]])
+
+    with pytest.raises(ValueError, match="Self-conditioning probability"):
+        model(sequence_ids, self_conditioning_probability=1.1)
+
+
 def test_joint_loss_reaches_every_trainable_submodule() -> None:
     model = NSMDNA.from_config(_build_end_to_end_config())
     sequence_ids = torch.tensor(

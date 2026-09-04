@@ -15,8 +15,11 @@ from torch import Tensor
 from tqdm import tqdm
 
 from nsm_dna.data import encode_sequence
-from nsm_dna.models.next_scale import NextScaleTransformer
-from nsm_dna.models.next_scale import MultiscaleTokenizer
+from nsm_dna.models.next_scale import (
+    NSMDNA,
+    MultiscaleTokenizer,
+    NextScaleTransformer,
+)
 
 
 @dataclass(frozen=True)
@@ -98,22 +101,15 @@ def target_block_window(
 
 def load_model(
     checkpoint_path: Path,
-    tokenizer_checkpoint_path: Path,
     device: torch.device,
 ) -> tuple[NextScaleTransformer, MultiscaleTokenizer, int]:
-    """Restore the frozen tokenizer and one trained NSM-DNA checkpoint."""
-    tokenizer = MultiscaleTokenizer.from_checkpoint(
-        tokenizer_checkpoint_path,
-        device,
-        frozen=True,
-    )
-    model, checkpoint_step = NextScaleTransformer.from_checkpoint(
+    """Restore the frozen components of one jointly trained NSM-DNA checkpoint."""
+    system, checkpoint_step = NSMDNA.from_checkpoint(
         checkpoint_path,
-        tokenizer,
         device,
         frozen=True,
     )
-    return model, tokenizer, checkpoint_step
+    return system.transformer, system.tokenizer, checkpoint_step
 
 
 @torch.inference_mode()
@@ -375,11 +371,9 @@ def main(config: DictConfig) -> None:
     device = torch.device(config.device)
     assay_paths = [Path(path) for path in config.assay_paths]
     output_directory = Path(config.output_directory)
-    checkpoint_path = Path(config.nsm_checkpoint)
-    tokenizer_checkpoint_path = Path(config.tokenizer_checkpoint)
+    checkpoint_path = Path(config.checkpoint)
     model, tokenizer, checkpoint_step = load_model(
         checkpoint_path,
-        tokenizer_checkpoint_path,
         device,
     )
     configured_prefix_length = config.prefix_length
@@ -438,8 +432,6 @@ def main(config: DictConfig) -> None:
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": sha256(checkpoint_path),
         "checkpoint_step": checkpoint_step,
-        "tokenizer_checkpoint": str(tokenizer_checkpoint_path),
-        "tokenizer_checkpoint_sha256": sha256(tokenizer_checkpoint_path),
         "score": (
             "mutant minus reference summed hierarchy and nucleotide log probability"
         ),

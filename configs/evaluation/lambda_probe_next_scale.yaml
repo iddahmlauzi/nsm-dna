@@ -5,6 +5,8 @@ output_directory: /workspace/results/nsm-dna-end-to-end-genfirst/lambda-probe-2k
 expected_sequence_length: 2_000
 embedding_batch_size: 16
 device_ids: [0, 1]
+evaluate_three_layer_probe: true
+evaluate_random_model: true
 random_model_seed: 42
 
 probe:

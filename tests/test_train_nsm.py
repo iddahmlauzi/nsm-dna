@@ -15,6 +15,7 @@ from nsm_dna.models.next_scale import NSMDNA
 from nsm_dna.training import (
     GenFirstLossSchedule,
     GenerativeLossWeights,
+    LinearSelfConditioningSchedule,
     build_learning_rate_scheduler,
     load_training_checkpoint,
     save_training_checkpoint,
@@ -206,6 +207,20 @@ def test_genfirst_schedule_rejects_invalid_configuration() -> None:
         )
 
 
+def test_self_conditioning_schedule_ramps_then_holds() -> None:
+    schedule = LinearSelfConditioningSchedule(
+        total_steps=10,
+        ramp_fraction=0.5,
+        max_probability=0.5,
+    )
+
+    assert schedule.ramp_steps == 5
+    assert schedule.probability_at_step(1) == 0.0
+    assert schedule.probability_at_step(3) == 0.25
+    assert schedule.probability_at_step(5) == 0.5
+    assert schedule.probability_at_step(10) == 0.5
+
+
 def test_one_optimizer_step_updates_the_joint_model() -> None:
     model = NSMDNA.from_config(_build_config())
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -378,7 +393,7 @@ def test_default_config_matches_the_joint_training_contract() -> None:
 
     assert config.run.resume_from is None
     assert config.wandb.project == "nsm-dna-end-to-end"
-    assert config.wandb.name == "nsm-dna-end-to-end-neighbor-corruption-apr"
+    assert config.wandb.name == "nsm-dna-end-to-end-self-conditioning-apr"
     assert config.data.subset_directory.endswith("gtdb/500M_subset")
     assert config.data.sequence_length == 256
     assert config.model.tokenizer.context_length == 128
@@ -410,5 +425,7 @@ def test_default_config_matches_the_joint_training_contract() -> None:
         config.training.loss_schedule.reconstruction_refinement.entropy_loss_weight
         == 0.5
     )
-    assert config.training.input_code_corruption_probability == 0.1
+    assert config.training.self_conditioning.max_probability == 0.5
+    assert config.training.self_conditioning.ramp_fraction == 0.5
+    assert config.training.input_code_corruption_probability == 0.0
     assert "huggingface" not in config.checkpoint

@@ -134,7 +134,7 @@ def evaluate_probes(
     output_directory: Path,
     device: torch.device,
 ) -> dict[str, object]:
-    """Fit the official linear and 3-layer LAMBDA probes."""
+    """Fit the requested LAMBDA probes."""
     linear_metrics, linear_predictions, linear_probabilities = fit_linear_probe(
         embeddings["train"],
         splits["train"].labels,
@@ -142,38 +142,39 @@ def evaluate_probes(
         splits["test"].labels,
         int(config.probe.seed),
     )
-    nn_metrics, nn_predictions, nn_probabilities, completed_epochs = (
-        fit_three_layer_probe(
-            embeddings["train"],
-            splits["train"].labels,
-            embeddings["validation"],
-            splits["validation"].labels,
-            embeddings["test"],
-            splits["test"].labels,
-            config.probe,
-            device,
-        )
-    )
-
     write_predictions(
         output_directory / "predictions" / f"{name}_linear.csv",
         splits["test"],
         linear_predictions,
         linear_probabilities,
     )
-    write_predictions(
-        output_directory / "predictions" / f"{name}_three_layer.csv",
-        splits["test"],
-        nn_predictions,
-        nn_probabilities,
-    )
-    return {
-        "linear_probe": linear_metrics,
-        "three_layer_probe": {
+    results: dict[str, object] = {"linear_probe": linear_metrics}
+
+    if bool(config.evaluate_three_layer_probe):
+        nn_metrics, nn_predictions, nn_probabilities, completed_epochs = (
+            fit_three_layer_probe(
+                embeddings["train"],
+                splits["train"].labels,
+                embeddings["validation"],
+                splits["validation"].labels,
+                embeddings["test"],
+                splits["test"].labels,
+                config.probe,
+                device,
+            )
+        )
+        write_predictions(
+            output_directory / "predictions" / f"{name}_three_layer.csv",
+            splits["test"],
+            nn_predictions,
+            nn_probabilities,
+        )
+        results["three_layer_probe"] = {
             **nn_metrics,
             "completed_epochs": completed_epochs,
-        },
-    }
+        }
+
+    return results
 
 
 def evaluate_representation(
@@ -187,19 +188,22 @@ def evaluate_representation(
     output_directory: Path,
     device: torch.device,
 ) -> dict[str, object]:
-    """Extract one NSM representation and run both LAMBDA probes."""
+    """Extract one NSM representation and run the requested probes."""
+    split_names = ["train", "test"]
+    if bool(config.evaluate_three_layer_probe):
+        split_names.insert(1, "validation")
     embeddings = {
         split_name: extract_segment_embeddings(
             encoder,
             embedding_dim,
             window_length,
             stride,
-            split.sequences,
+            splits[split_name].sequences,
             int(config.embedding_batch_size),
             device,
             description=f"{name} {split_name}",
         )
-        for split_name, split in splits.items()
+        for split_name in split_names
     }
     return evaluate_probes(
         name,
@@ -233,7 +237,7 @@ def build_parallel_encoder(
     config_name="lambda_probe_next_scale",
 )
 def main(config: DictConfig) -> None:
-    """Compare trained and random NSM-DNA final embeddings on LAMBDA."""
+    """Evaluate trained NSM-DNA embeddings and an optional random baseline."""
     device_ids = [int(device_id) for device_id in config.device_ids]
     device = torch.device(f"cuda:{device_ids[0]}")
     dataset_directory = Path(config.dataset_directory)
@@ -278,40 +282,37 @@ def main(config: DictConfig) -> None:
         output_directory,
         device,
     )
-    del trained_model, trained_system
-    torch.cuda.empty_cache()
+    results = {"trained": trained_results}
+    random_seed = None
+    if bool(config.evaluate_random_model):
+        del trained_model, trained_system
+        torch.cuda.empty_cache()
 
-    random_seed = int(config.random_model_seed)
-    torch.manual_seed(random_seed)
-    random_model = NSMDNA.from_config(model_config).transformer.to(device)
-    random_model.eval()
-    random_model.requires_grad_(False)
-    random_results = evaluate_representation(
-        f"random_seed_{random_seed}",
-        build_parallel_encoder(random_model, tokenizer, device_ids),
-        random_model.model_dim,
-        window_length,
-        stride,
-        splits,
-        config,
-        output_directory,
-        device,
-    )
-
-    results = {
-        "trained": trained_results,
-        f"random_seed_{random_seed}": random_results,
-        "delta_mcc": {
-            "linear_probe": (
-                trained_results["linear_probe"]["mcc"]
-                - random_results["linear_probe"]["mcc"]
-            ),
-            "three_layer_probe": (
-                trained_results["three_layer_probe"]["mcc"]
-                - random_results["three_layer_probe"]["mcc"]
-            ),
-        },
-    }
+        random_seed = int(config.random_model_seed)
+        torch.manual_seed(random_seed)
+        random_model = NSMDNA.from_config(model_config).transformer.to(device)
+        random_model.eval()
+        random_model.requires_grad_(False)
+        random_name = f"random_seed_{random_seed}"
+        random_results = evaluate_representation(
+            random_name,
+            build_parallel_encoder(random_model, tokenizer, device_ids),
+            random_model.model_dim,
+            window_length,
+            stride,
+            splits,
+            config,
+            output_directory,
+            device,
+        )
+        results[random_name] = random_results
+        results["delta_mcc"] = {
+            probe_name: (
+                trained_results[probe_name]["mcc"]
+                - random_results[probe_name]["mcc"]
+            )
+            for probe_name in trained_results
+        }
     window_starts = segment_window_starts(
         int(config.expected_sequence_length),
         window_length,
@@ -343,6 +344,8 @@ def main(config: DictConfig) -> None:
         "window_starts": window_starts,
         "embedding_batch_size": int(config.embedding_batch_size),
         "device_ids": device_ids,
+        "evaluate_three_layer_probe": bool(config.evaluate_three_layer_probe),
+        "evaluate_random_model": bool(config.evaluate_random_model),
         "random_model_seed": random_seed,
         "probe_config": OmegaConf.to_container(config.probe, resolve=True),
         "results": results,

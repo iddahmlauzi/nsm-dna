@@ -8,7 +8,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: nsm-dna-end-to-end
-  name: nsm-dna-end-to-end-neighbor-corruption-apr
+  name: nsm-dna-end-to-end-self-conditioning-apr
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -77,6 +77,11 @@ training:
   # This softens only the distribution used by the entropy loss. Hard code
   # selection, straight-through quantization, and EMA updates are unchanged.
   entropy_temperature: 16.0
+  # During the first epoch, progressively replace the complete teacher-forced
+  # preceding hierarchy for an example with codes predicted by the model.
+  self_conditioning:
+    max_probability: 0.5
+    ramp_fraction: 0.5
   # Reconstruction and VQ retain unit weight throughout. Generation and entropy
   # shape the latent hierarchy first, then recede so reconstruction can refine it.
   loss_schedule:
@@ -90,7 +95,7 @@ training:
   num_epochs: 2
   # Set an integer here for a shorter diagnostic run.
   max_steps: null
-  input_code_corruption_probability: 0.1
+  input_code_corruption_probability: 0.0
   log_interval: 10
 
 evaluation:
