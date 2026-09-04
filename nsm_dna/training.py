@@ -31,6 +31,53 @@ class DistributedEnvironment:
         return self.rank == 0
 
 
+@dataclass(frozen=True)
+class GenerativeLossWeights:
+    """Weights for the objectives that shape how modelable the latent space is."""
+
+    next_scale_prediction: float
+    entropy: float
+
+
+@dataclass(frozen=True)
+class GenFirstLossSchedule:
+    """Use strong generative pressure before reconstruction refinement."""
+
+    total_steps: int
+    generation_first_fraction: float
+    generation_first_weights: GenerativeLossWeights
+    refinement_weights: GenerativeLossWeights
+
+    def __post_init__(self) -> None:
+        if self.total_steps < 1:
+            raise ValueError("total_steps must be positive.")
+        if not 0 < self.generation_first_fraction < 1:
+            raise ValueError("generation_first_fraction must be between zero and one.")
+        weights = (
+            self.generation_first_weights.next_scale_prediction,
+            self.generation_first_weights.entropy,
+            self.refinement_weights.next_scale_prediction,
+            self.refinement_weights.entropy,
+        )
+        if any(weight < 0 for weight in weights):
+            raise ValueError("GenFirst loss weights must be nonnegative.")
+
+    @property
+    def generation_first_steps(self) -> int:
+        return round(self.total_steps * self.generation_first_fraction)
+
+    def weights_at_step(self, step: int) -> GenerativeLossWeights:
+        """Return the piecewise-constant weights for one optimizer step."""
+        if step <= self.generation_first_steps:
+            return self.generation_first_weights
+        return self.refinement_weights
+
+    def phase_at_step(self, step: int) -> str:
+        if step <= self.generation_first_steps:
+            return "generation_first"
+        return "reconstruction_refinement"
+
+
 def calculate_training_steps(
     config: DictConfig,
     world_size: int,

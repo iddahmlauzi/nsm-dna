@@ -1,12 +1,23 @@
 import torch
 import torch.nn as nn
 
+from nsm_dna.models.next_scale.quantization import QuantizerOutput
 from scripts.evaluation.lambda_probe_tokenizer import TokenizerWindowEncoder
 
 
 class _Quantizer(nn.Module):
-    def forward(self, latent: torch.Tensor) -> tuple:
-        return latent + 1, None, None, None
+    def forward(self, latent: torch.Tensor) -> QuantizerOutput:
+        zero = latent.new_zeros(())
+        return QuantizerOutput(
+            final_latent=latent + 1,
+            cumulative_latents=[latent + 1],
+            next_scale_inputs=[],
+            indices_by_scale=[torch.zeros_like(latent[..., 0], dtype=torch.long)],
+            assignment_probabilities_by_scale=[latent.new_ones(*latent.shape[:2], 1)],
+            assignment_logits_by_scale=[latent.new_zeros(*latent.shape[:2], 1)],
+            commitment_losses_by_scale=[zero],
+            quantization_losses_by_scale=[zero],
+        )
 
 
 class _Tokenizer(nn.Module):

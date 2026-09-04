@@ -1,71 +1,13 @@
 import math
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from nsm_dna.models.common import RMSNorm
-from nsm_dna.models.next_scale import NSM, SharedOutputHead
-
-
-def test_nsm_from_checkpoint_restores_model_and_step(tmp_path: Path) -> None:
-    tokenizer = SimpleNamespace(
-        embed_dim=3,
-        scale_lengths=[1, 2],
-        codebook_sizes=[5, 5],
-        context_length=4,
-    )
-    model = NSM(
-        vq_embed_dim=tokenizer.embed_dim,
-        model_dim=8,
-        scale_lengths=tokenizer.scale_lengths,
-        codebook_size=tokenizer.codebook_sizes[0],
-        num_layers=1,
-        num_heads=2,
-        dropout=0.0,
-        max_prefix_length=2,
-    )
-    checkpoint_path = tmp_path / "nsm.pt"
-    torch.save(
-        {
-            "step": 17,
-            "model": model.state_dict(),
-            "config": {
-                "data": {"sequence_length": 6},
-                "model": {
-                    "model_dim": 8,
-                    "num_layers": 1,
-                    "num_heads": 2,
-                    "dropout": 0.0,
-                    "bias": False,
-                    "use_qk_norm": True,
-                    "rope_base": 10000.0,
-                    "head_num_blocks": 2,
-                    "head_hidden_multiplier": 2.0,
-                    "input_refinement_kernel_size": 3,
-                },
-            },
-        },
-        checkpoint_path,
-    )
-
-    restored_model, checkpoint_step = NSM.from_checkpoint(
-        checkpoint_path,
-        tokenizer,
-        torch.device("cpu"),
-        frozen=True,
-    )
-
-    assert checkpoint_step == 17
-    assert not restored_model.training
-    assert all(not parameter.requires_grad for parameter in restored_model.parameters())
-    for parameter, restored_parameter in zip(
-        model.parameters(),
-        restored_model.parameters(),
-        strict=True,
-    ):
-        torch.testing.assert_close(restored_parameter, parameter)
+from nsm_dna.models.next_scale import NSMDNA, NextScaleTransformer
+from nsm_dna.models.next_scale.transformer import SharedOutputHead
 
 
 def test_shared_output_head_starts_as_a_linear_classifier() -> None:
@@ -85,8 +27,8 @@ def test_shared_output_head_starts_as_a_linear_classifier() -> None:
 
 
 def test_scale_input_refinement_starts_as_identity() -> None:
-    model = NSM(
-        vq_embed_dim=3,
+    model = NextScaleTransformer(
+        input_dim=3,
         model_dim=8,
         scale_lengths=[1, 2, 3],
         codebook_size=5,
@@ -111,8 +53,8 @@ def test_scale_input_refinement_starts_as_identity() -> None:
 
 
 def test_scale_attention_mask_allows_only_the_current_scale() -> None:
-    model = NSM(
-        vq_embed_dim=3,
+    model = NextScaleTransformer(
+        input_dim=3,
         model_dim=8,
         scale_lengths=[1, 2, 3],
         codebook_size=5,
@@ -135,9 +77,9 @@ def test_scale_attention_mask_allows_only_the_current_scale() -> None:
     torch.testing.assert_close(model.scale_attention_mask, expected_mask)
 
 
-def test_prefix_attention_mask_routes_prefix_through_first_scale() -> None:
-    model = NSM(
-        vq_embed_dim=3,
+def test_prefix_attention_mask_connects_prefix_directly_to_every_scale() -> None:
+    model = NextScaleTransformer(
+        input_dim=3,
         model_dim=8,
         scale_lengths=[1, 2],
         codebook_size=5,
@@ -152,8 +94,8 @@ def test_prefix_attention_mask_routes_prefix_through_first_scale() -> None:
             [True, True, False, False, False],
             [True, True, False, False, False],
             [True, True, True, False, False],
-            [False, False, True, True, True],
-            [False, False, True, True, True],
+            [True, True, False, True, True],
+            [True, True, False, True, True],
         ]
     ).reshape(1, 1, 5, 5)
 
@@ -161,8 +103,8 @@ def test_prefix_attention_mask_routes_prefix_through_first_scale() -> None:
 
 
 def test_scale_ids_match_hierarchy_sections() -> None:
-    model = NSM(
-        vq_embed_dim=3,
+    model = NextScaleTransformer(
+        input_dim=3,
         model_dim=8,
         scale_lengths=[1, 2, 3],
         codebook_size=5,
@@ -175,8 +117,8 @@ def test_scale_ids_match_hierarchy_sections() -> None:
 
 
 def test_rope_positions_reset_at_each_scale() -> None:
-    model = NSM(
-        vq_embed_dim=3,
+    model = NextScaleTransformer(
+        input_dim=3,
         model_dim=8,
         scale_lengths=[1, 2, 3],
         codebook_size=5,
@@ -198,8 +140,8 @@ def test_rope_positions_reset_at_each_scale() -> None:
 
 
 def test_prefix_rope_precedes_reset_scale_positions() -> None:
-    model = NSM(
-        vq_embed_dim=3,
+    model = NextScaleTransformer(
+        input_dim=3,
         model_dim=8,
         scale_lengths=[1, 2, 3],
         codebook_size=5,
@@ -218,8 +160,8 @@ def test_prefix_rope_precedes_reset_scale_positions() -> None:
 
 
 def test_nsm_normalizes_queries_and_keys() -> None:
-    model = NSM(
-        vq_embed_dim=3,
+    model = NextScaleTransformer(
+        input_dim=3,
         model_dim=8,
         scale_lengths=[1, 2, 3],
         codebook_size=5,
@@ -233,8 +175,8 @@ def test_nsm_normalizes_queries_and_keys() -> None:
 
 
 def test_nsm_uses_pre_rms_norm() -> None:
-    model = NSM(
-        vq_embed_dim=3,
+    model = NextScaleTransformer(
+        input_dim=3,
         model_dim=8,
         scale_lengths=[1, 2, 3],
         codebook_size=5,
@@ -253,8 +195,8 @@ def test_nsm_uses_pre_rms_norm() -> None:
 
 def test_nsm_scales_residual_projection_initialization() -> None:
     num_layers = 4
-    model = NSM(
-        vq_embed_dim=8,
+    model = NextScaleTransformer(
+        input_dim=8,
         model_dim=64,
         scale_lengths=[1, 2, 4],
         codebook_size=8,
@@ -276,8 +218,8 @@ def test_nsm_scales_residual_projection_initialization() -> None:
 
 
 def test_nsm_prepends_learned_bos() -> None:
-    model = NSM(
-        vq_embed_dim=3,
+    model = NextScaleTransformer(
+        input_dim=3,
         model_dim=8,
         scale_lengths=[1, 2, 3],
         codebook_size=5,
@@ -305,8 +247,8 @@ def test_nsm_prepends_learned_bos() -> None:
 
 
 def test_nsm_returns_only_hierarchy_logits_when_prefix_is_present() -> None:
-    model = NSM(
-        vq_embed_dim=3,
+    model = NextScaleTransformer(
+        input_dim=3,
         model_dim=8,
         scale_lengths=[1, 2, 3],
         codebook_size=5,
@@ -327,8 +269,8 @@ def test_nsm_returns_only_hierarchy_logits_when_prefix_is_present() -> None:
 
 
 def test_nsm_transformer_keeps_scale_sections_isolated() -> None:
-    model = NSM(
-        vq_embed_dim=3,
+    model = NextScaleTransformer(
+        input_dim=3,
         model_dim=8,
         scale_lengths=[1, 2],
         codebook_size=5,
@@ -348,3 +290,167 @@ def test_nsm_transformer_keeps_scale_sections_isolated() -> None:
         output[:, :1],
         output_with_changed_second_scale[:, :1],
     )
+
+
+def _build_end_to_end_config():
+    return OmegaConf.create(
+        {
+            "data": {"sequence_length": 8},
+            "model": {
+                "tokenizer": {
+                    "vocab_size": 4,
+                    "context_length": 4,
+                    "embed_dim": 8,
+                    "num_heads": 2,
+                    "scale_lengths": [1, 2, 4],
+                    "codebook_size": 8,
+                    "encoder_dropout": 0.0,
+                    "decoder_dropout": 0.0,
+                    "bias": False,
+                    "rope_base": 10_000.0,
+                    "pre_quant_num_groups": 2,
+                    "commitment_cost": 0.25,
+                    "decay": 0.99,
+                    "eps": 1e-5,
+                    "temperature": 1.0,
+                    "refinement_ratio": 0.5,
+                    "refinement_kernel_size": 3,
+                },
+                "transformer": {
+                    "model_dim": 8,
+                    "num_layers": 1,
+                    "num_heads": 2,
+                    "dropout": 0.0,
+                    "bias": False,
+                    "use_qk_norm": True,
+                    "rope_base": 10_000.0,
+                    "head_num_blocks": 2,
+                    "head_hidden_multiplier": 2.0,
+                    "input_refinement_kernel_size": 3,
+                },
+            }
+        }
+    )
+
+
+def test_forward_runs_the_complete_pipeline_in_one_model_call() -> None:
+    model = NSMDNA.from_config(_build_end_to_end_config())
+    encoder_calls = 0
+
+    def count_encoder_call(_module, _inputs, _output) -> None:
+        nonlocal encoder_calls
+        encoder_calls += 1
+
+    hook = model.tokenizer.encoder.register_forward_hook(count_encoder_call)
+    output = model(
+        torch.tensor(
+            [
+                [0, 1, 2, 3, 3, 2, 1, 0],
+                [3, 2, 1, 0, 0, 1, 2, 3],
+            ]
+        ),
+        corruption_probability=0.1,
+    )
+    hook.remove()
+
+    assert encoder_calls == 1
+    assert output.reconstruction_logits.shape == (2, 4, 4)
+    assert [logits.shape for logits in output.next_scale_logits_by_scale] == [
+        (2, 1, 8),
+        (2, 2, 8),
+        (2, 4, 8),
+    ]
+    assert len(output.quantizer.cumulative_latents) == 3
+    assert len(output.quantizer.next_scale_inputs) == 2
+
+
+def test_joint_loss_reaches_every_trainable_submodule() -> None:
+    model = NSMDNA.from_config(_build_end_to_end_config())
+    sequence_ids = torch.tensor(
+        [
+            [0, 1, 2, 3, 3, 2, 1, 0],
+            [3, 2, 1, 0, 0, 1, 2, 3],
+        ]
+    )
+
+    output = model(sequence_ids, corruption_probability=0.1)
+    loss = (
+        output.reconstruction_logits.square().mean()
+        + torch.stack(
+            [logits.square().mean() for logits in output.next_scale_logits_by_scale]
+        ).mean()
+        + output.quantizer.vq_loss
+    )
+    loss.backward()
+
+    parameters_without_gradients = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    assert parameters_without_gradients == []
+    assert all(
+        codebook.codebook.grad is None
+        for codebook in model.tokenizer.quantizer.codebooks
+    )
+
+
+def test_complete_model_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
+    config = _build_end_to_end_config()
+    model = NSMDNA.from_config(config)
+    checkpoint_path = tmp_path / "nsm-dna.pt"
+    torch.save(
+        {
+            "step": 17,
+            "model": model.state_dict(),
+            "config": OmegaConf.to_container(config, resolve=True),
+        },
+        checkpoint_path,
+    )
+
+    restored_model, checkpoint_step = NSMDNA.from_checkpoint(
+        checkpoint_path,
+        torch.device("cpu"),
+        frozen=True,
+    )
+
+    assert checkpoint_step == 17
+    assert not restored_model.training
+    assert all(not parameter.requires_grad for parameter in restored_model.parameters())
+    for name, expected_value in model.state_dict().items():
+        torch.testing.assert_close(
+            restored_model.state_dict()[name],
+            expected_value,
+        )
+
+
+def test_generate_predicts_and_decodes_a_hard_hierarchy() -> None:
+    model = NSMDNA.from_config(_build_end_to_end_config()).eval()
+
+    generation = model.generate(torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]]))
+
+    assert generation.nucleotide_logits.shape == (2, 4, 4)
+    assert [indices.shape for indices in generation.indices_by_scale] == [
+        (2, 1),
+        (2, 2),
+        (2, 4),
+    ]
+
+
+def test_forward_accepts_a_prefix_shorter_than_the_target() -> None:
+    model = NSMDNA.from_config(_build_end_to_end_config())
+
+    output = model(torch.zeros(1, 7, dtype=torch.long))
+
+    assert output.reconstruction_logits.shape == (1, 4, 4)
+
+
+def test_forward_allows_a_target_without_a_prefix() -> None:
+    config = _build_end_to_end_config()
+    config.data.sequence_length = 4
+    model = NSMDNA.from_config(config)
+
+    output = model(torch.zeros(1, 4, dtype=torch.long))
+
+    assert model.transformer.max_prefix_length == 0
+    assert output.reconstruction_logits.shape == (1, 4, 4)

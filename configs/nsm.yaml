@@ -1,87 +1,102 @@
-# Transformer++ NSM-DNA over a 128-base prefix and 128-base target block.
+# Joint NSM-DNA training over a variable prefix and 128-base target block.
 
 run:
   seed: 0
   resume_from: null
 
-# The checkpoint's stored model configuration is the source of truth for the
-# tokenizer architecture, scale lengths, and codebook sizes.
-tokenizer_checkpoint: ../runs/vqvae-9scale-500m/checkpoints/final.pt
-
 wandb:
   enabled: true
   entity: nsm-dna
-  project: nsm
-  name: nsm-9scale-scale1-memory
+  project: nsm-dna-end-to-end
+  name: nsm-dna-end-to-end-genfirst
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
   train_split: train
   validation_split: validation
   sequence_length: 256
-  # Four GPUs at batch 64 with two accumulation steps match the NTP effective
-  # batch of 512 sequences per optimizer update.
+  # Per-GPU batch size. Four GPUs with two accumulation steps produce an
+  # effective batch of 512 sequences per optimizer update.
   train_batch_size: 64
   validation_batch_size: 128
-  num_workers: 3
+  num_workers: 1
   shuffle_buffer_size: 10_000
 
 model:
-  # Match the 39.30M-parameter NTP Transformer backbone exactly. NSM-specific
-  # scale refiners and the output head bring the stage-two total to 46.52M.
-  model_dim: 640
-  num_layers: 8
-  num_heads: 10
-  dropout: 0.1
-  bias: false
+  tokenizer:
+    vocab_size: 4
+    context_length: 128
+    embed_dim: 384
+    num_heads: 8
+    scale_lengths: [1, 4, 9, 16, 25, 36, 49, 64, 128]
+    codebook_size: 256
 
-  use_qk_norm: true
-  rope_base: 10_000
+    encoder_dropout: 0.0
+    decoder_dropout: 0.1
+    bias: false
+    rope_base: 10_000
+    pre_quant_num_groups: 4
 
-  head_num_blocks: 2
-  head_hidden_multiplier: 2.0
-  input_refinement_kernel_size: 3
+    commitment_cost: 0.25
+    decay: 0.99
+    eps: 1e-5
+    temperature: 1.0
+
+    refinement_ratio: 0.5
+    refinement_kernel_size: 3
+
+  transformer:
+    model_dim: 640
+    num_layers: 8
+    num_heads: 10
+    dropout: 0.1
+    bias: false
+    use_qk_norm: true
+    rope_base: 10_000
+    head_num_blocks: 2
+    head_hidden_multiplier: 2.0
+    input_refinement_kernel_size: 3
 
 optimizer:
-  learning_rate: 5e-4
+  learning_rate: 1e-4
   min_learning_rate: 1e-5
-  # Five percent of the 38,150 optimizer steps across ten epochs.
-  warmup_steps: 1_907
+  warmup_fraction: 0.05
   beta_1: 0.9
   beta_2: 0.95
   weight_decay: 0.05
   max_gradient_norm: 1.0
   gradient_accumulation_steps: 2
 
-  # A scale's loss share is proportional to length ** (1 - alpha).
-  scale_loss_alpha: 1
-
 mixed_precision:
   enabled: true
 
 training:
-  num_epochs: 10
-  # Set an integer here to override the epoch-derived training length.
+  # This softens only the distribution used by the entropy loss. Hard code
+  # selection, straight-through quantization, and EMA updates are unchanged.
+  entropy_temperature: 16.0
+  # Reconstruction and VQ retain unit weight throughout. Generation and entropy
+  # shape the latent hierarchy first, then recede so reconstruction can refine it.
+  loss_schedule:
+    generation_first_fraction: 0.8
+    generation_first:
+      next_scale_prediction_loss_weight: 8.0
+      entropy_loss_weight: 2.0
+    reconstruction_refinement:
+      next_scale_prediction_loss_weight: 2.0
+      entropy_loss_weight: 0.5
+  num_epochs: 2
+  # Set an integer here for a shorter diagnostic run.
   max_steps: null
-  # Replace this fraction of teacher-forced input codes during training.
   input_code_corruption_probability: 0.1
   log_interval: 10
 
 evaluation:
   interval: 1_000
   max_batches: 10
-  # Greedy scale rollout is substantially more expensive than teacher forcing.
-  rollout_max_batches: 1
 
 checkpoint:
-  # Overwrite one recovery checkpoint frequently, while retaining a sparser
-  # history for comparing or restarting from earlier training stages.
   recovery_interval: 5_000
   milestone_interval: 10_000
-  huggingface:
-    enabled: false
-    repository_id: Iddah/nsm-dna-checkpoints
-    repository_directory: nsm-9scale-scale1-memory
 
 hydra:
   run:

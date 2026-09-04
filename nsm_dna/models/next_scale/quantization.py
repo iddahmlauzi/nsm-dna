@@ -1,3 +1,7 @@
+"""Differentiable multiscale vector quantization and EMA codebooks."""
+
+from dataclasses import dataclass
+
 import einx
 import torch
 import torch.distributed as dist
@@ -5,6 +9,42 @@ import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Float, Int
 from torch import Tensor
+
+
+@dataclass(frozen=True)
+class QuantizerOutput:
+    """Differentiable multiscale quantization results for one target block."""
+
+    final_latent: Float[Tensor, "batch length embed_dim"]
+    cumulative_latents: list[Float[Tensor, "batch length embed_dim"]]
+    next_scale_inputs: list[Float[Tensor, "batch scale_length embed_dim"]]
+    indices_by_scale: list[Int[Tensor, "batch scale_length"]]
+    assignment_probabilities_by_scale: list[
+        Float[Tensor, "batch scale_length codebook_size"]
+    ]
+    assignment_logits_by_scale: list[
+        Float[Tensor, "batch scale_length codebook_size"]
+    ]
+    commitment_losses_by_scale: list[Float[Tensor, ""]]
+    quantization_losses_by_scale: list[Float[Tensor, ""]]
+    partial_latent: Float[Tensor, "batch length embed_dim"] | None = None
+
+    @property
+    def vq_losses_by_scale(self) -> list[Float[Tensor, ""]]:
+        """Combined commitment and quantization loss for every scale."""
+        return [
+            commitment_loss + quantization_loss
+            for commitment_loss, quantization_loss in zip(
+                self.commitment_losses_by_scale,
+                self.quantization_losses_by_scale,
+                strict=True,
+            )
+        ]
+
+    @property
+    def vq_loss(self) -> Float[Tensor, ""]:
+        """Mean VQ loss across scales."""
+        return torch.stack(self.vq_losses_by_scale).mean()
 
 
 class EMACodebook(nn.Module):
@@ -16,13 +56,18 @@ class EMACodebook(nn.Module):
         embed_dim: int,
         decay: float = 0.99,
         eps: float = 1e-5,
+        temperature: float = 1.0,
     ) -> None:
         super().__init__()
+
+        if temperature <= 0:
+            raise ValueError("temperature must be positive.")
 
         self.codebook_size = codebook_size
         self.embed_dim = embed_dim
         self.base_decay = decay
         self.eps = eps
+        self.temperature = temperature
 
         codebook = torch.randn(codebook_size, embed_dim)
         self.register_buffer("codebook", codebook)
@@ -47,26 +92,48 @@ class EMACodebook(nn.Module):
     ) -> tuple[
         Float[Tensor, "batch length embed_dim"],
         Int[Tensor, "batch length"],
+        Float[Tensor, "batch length codebook_size"],
+        Float[Tensor, "batch length codebook_size"],
     ]:
-        flat_input = einx.id("b l d -> (b l) d", x.detach().float())
+        flat_input = einx.id("b l d -> (b l) d", x.float())
+        codebook = self.codebook.detach().clone()
 
         # Compute the distance from each input to every codebook vector.
         distances = (
             torch.sum(flat_input**2, dim=1, keepdim=True)
-            + torch.sum(self.codebook**2, dim=1)
-            - 2 * einx.dot("n d, k d -> n k", flat_input, self.codebook)
+            + torch.sum(codebook**2, dim=1)
+            - 2 * einx.dot("n d, k d -> n k", flat_input, codebook)
+        )
+        flat_assignment_logits = -distances
+        flat_probabilities = torch.softmax(
+            flat_assignment_logits / self.temperature,
+            dim=-1,
         )
         flat_indices = distances.argmin(dim=-1)
         indices = einx.id("(b l) -> b l", flat_indices, b=x.shape[0])
 
+        # Use the nearest code exactly in the forward pass, while differentiating
+        # through the soft distance-based probabilities in the backward pass:
+        # assignment = one_hot(argmin(distance)) + p - stop_gradient(p).
+        # This lets downstream losses train the encoder and learned samplers
+        # without replacing the discrete codes used at inference.
+        hard_assignments = F.one_hot(
+            flat_indices,
+            num_classes=self.codebook_size,
+        ).to(flat_probabilities.dtype)
+        assignments = (
+            hard_assignments + flat_probabilities - flat_probabilities.detach()
+        )
+        flat_quantized = assignments @ codebook
+
         if self.training:
+            detached_input = flat_input.detach()
             batch_counts = torch.bincount(
                 flat_indices,
                 minlength=self.codebook_size,
             ).to(self.ema_counts.dtype)
-
             batch_vector_sums = torch.zeros_like(self.ema_vector_sums)
-            batch_vector_sums.index_add_(0, flat_indices, flat_input)
+            batch_vector_sums.index_add_(0, flat_indices, detached_input)
 
             # Combine batch statistics so every DDP worker applies the same update.
             if dist.is_available() and dist.is_initialized():
@@ -75,10 +142,7 @@ class EMACodebook(nn.Module):
 
             decay = self._get_ema_decay()
             with torch.no_grad():
-                self.ema_counts.mul_(decay).add_(
-                    batch_counts,
-                    alpha=1 - decay,
-                )
+                self.ema_counts.mul_(decay).add_(batch_counts, alpha=1 - decay)
                 self.ema_vector_sums.mul_(decay).add_(
                     batch_vector_sums,
                     alpha=1 - decay,
@@ -95,9 +159,22 @@ class EMACodebook(nn.Module):
                 self.codebook.copy_(self.ema_vector_sums / smoothed_counts)
                 self.codebook_hits.logical_or_(batch_counts > 0)
 
-        quantized = self.codebook[indices]
-
-        return quantized.to(x.dtype), indices
+        quantized = einx.id(
+            "(b l) d -> b l d",
+            flat_quantized,
+            b=x.shape[0],
+        )
+        probabilities = einx.id(
+            "(b l) k -> b l k",
+            flat_probabilities,
+            b=x.shape[0],
+        )
+        assignment_logits = einx.id(
+            "(b l) k -> b l k",
+            flat_assignment_logits,
+            b=x.shape[0],
+        )
+        return quantized.to(x.dtype), indices, probabilities, assignment_logits
 
     @property
     def utilization(self) -> Float[Tensor, ""]:
@@ -283,6 +360,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         commitment_cost: float = 0.25,
         decay: float = 0.99,
         eps: float = 1e-5,
+        temperature: float = 1.0,
         # Per-scale post-quantization refinement
         refinement_ratio: float = 0.5,
         refinement_kernel_size: int = 3,
@@ -296,6 +374,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         self.codebook_sizes = codebook_sizes
         self.embed_dim = embed_dim
         self.commitment_cost = commitment_cost
+        self.temperature = temperature
         self.refinement_ratio = refinement_ratio
         self.refinement_kernel_size = refinement_kernel_size
 
@@ -319,7 +398,13 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         )
 
         self.codebooks = nn.ModuleList(
-            EMACodebook(codebook_size, embed_dim, decay=decay, eps=eps)
+            EMACodebook(
+                codebook_size,
+                embed_dim,
+                decay=decay,
+                eps=eps,
+                temperature=temperature,
+            )
             for codebook_size in codebook_sizes
         )
         self.refiners = nn.ModuleList(
@@ -396,17 +481,74 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         scale_contribution = self.refiners[scale_index](scale_contribution)
         return einx.id("b d l -> b l d", scale_contribution)
 
+    def _corrupt_quantized_vectors(
+        self,
+        quantized: Float[Tensor, "batch scale_length embed_dim"],
+        indices: Int[Tensor, "batch scale_length"],
+        scale_index: int,
+        probability: float,
+    ) -> Float[Tensor, "batch scale_length embed_dim"]:
+        """Replace selected vectors with nearby hard codes for teacher forcing."""
+        if probability == 0:
+            return quantized
+
+        replacement_mask = (
+            torch.rand(
+                quantized.shape[:2],
+                device=quantized.device,
+            )
+            < probability
+        )
+        if not replacement_mask.any():
+            return quantized
+
+        codebook = self.codebooks[scale_index].codebook
+        neighbor_count = min(20, codebook.shape[0] - 1)
+        if neighbor_count == 0:
+            return quantized
+
+        # NSM corrupts a teacher-forced code with a plausible local mistake rather
+        # than an arbitrary code. Find the 20 nearest alternatives to each selected
+        # code and sample among them with probability proportional to 1 / distance.
+        with torch.no_grad():
+            selected_indices = indices[replacement_mask]
+            selected_codes = codebook[selected_indices]
+            distances = torch.cdist(selected_codes.float(), codebook.float())
+            distances.scatter_(
+                dim=1,
+                index=selected_indices.unsqueeze(1),
+                value=torch.inf,
+            )
+            neighbor_distances, neighbor_indices = distances.topk(
+                k=neighbor_count,
+                dim=1,
+                largest=False,
+                sorted=False,
+            )
+            sampling_weights = neighbor_distances.clamp_min(
+                torch.finfo(neighbor_distances.dtype).eps
+            ).reciprocal()
+            sampled_neighbor_offsets = torch.multinomial(
+                sampling_weights,
+                num_samples=1,
+            )
+            replacement_indices = neighbor_indices.gather(
+                dim=1,
+                index=sampled_neighbor_offsets,
+            ).squeeze(1)
+            replacements = codebook[replacement_indices].to(quantized.dtype)
+
+        corrupted_quantized = quantized.clone()
+        corrupted_quantized[replacement_mask] = replacements
+        return corrupted_quantized
+
     def forward(
         self,
         x: Float[Tensor, "batch length embed_dim"],
         *,
         include_partial_reconstruction: bool = False,
-    ) -> tuple[
-        Float[Tensor, "batch length embed_dim"],
-        Float[Tensor, "batch length embed_dim"] | None,
-        Float[Tensor, ""],
-        list[Int[Tensor, "batch scale_length"]],
-    ]:
+        corruption_probability: float = 0.0,
+    ) -> QuantizerOutput:
         """Quantize an encoder latent into cumulative multiscale contributions.
 
         When partial reconstruction is enabled, the second return value is one
@@ -414,13 +556,13 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         latent and computes the auxiliary reconstruction loss against the input
         tokens.
         """
-        x = x.float()
+        if not 0 <= corruption_probability <= 1:
+            raise ValueError("corruption_probability must be between zero and one.")
 
-        # Quantize the encoder output without backpropagating through the residual
-        # hierarchy. The commitment loss and final STE provide encoder gradients.
-        detached_x = x.detach()
-        residual = detached_x.clone()
+        x = x.float()
+        residual = x
         reconstruction = torch.zeros_like(residual)
+        corrupted_reconstruction = torch.zeros_like(residual)
 
         partial_scale_index = None
         if include_partial_reconstruction:
@@ -434,22 +576,34 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
                 size=(),
             ).item()
 
-        vq_loss = x.new_zeros(())
         indices_by_scale: list[Int[Tensor, "batch scale_length"]] = []
+        probabilities_by_scale: list[
+            Float[Tensor, "batch scale_length codebook_size"]
+        ] = []
+        assignment_logits_by_scale: list[
+            Float[Tensor, "batch scale_length codebook_size"]
+        ] = []
+        cumulative_latents: list[Float[Tensor, "batch length embed_dim"]] = []
+        next_scale_inputs: list[Float[Tensor, "batch scale_length embed_dim"]] = []
+        commitment_losses_by_scale: list[Float[Tensor, ""]] = []
+        quantization_losses_by_scale: list[Float[Tensor, ""]] = []
         partial_quantized_latent: Tensor | None = None
 
         for scale_index, codebook in enumerate(self.codebooks):
             scaled_residual = self._resize_to_scale(residual, scale_index)
-            quantized_at_scale, scale_indices = codebook(scaled_residual)
+            # Each returned vector is a hard code in the forward pass but carries
+            # a soft-assignment gradient. Consequently, every cumulative latent
+            # remains discrete-valued while the full residual hierarchy is
+            # differentiable with respect to the encoder and learned resamplers.
+            (
+                quantized_at_scale,
+                scale_indices,
+                assignment_probabilities,
+                assignment_logits,
+            ) = codebook(scaled_residual)
             indices_by_scale.append(scale_indices)
-
-            # Nearest-code selection blocks gradients to the learned downsampler.
-            # This preserves the selected code in the forward pass while treating
-            # the lookup as an identity when calculating downsampler gradients.
-            if scale_index == 0 and len(self.scale_lengths) > 1:
-                quantized_at_scale = (
-                    scaled_residual + (quantized_at_scale - scaled_residual).detach()
-                )
+            probabilities_by_scale.append(assignment_probabilities)
+            assignment_logits_by_scale.append(assignment_logits)
 
             scale_contribution = self._prepare_scale_contribution(
                 quantized_at_scale,
@@ -457,31 +611,62 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             )
 
             reconstruction = reconstruction + scale_contribution
+            cumulative_latents.append(reconstruction)
             residual = residual - scale_contribution
+
+            if scale_index < len(self.scale_lengths) - 1:
+                corrupted_quantized = self._corrupt_quantized_vectors(
+                    quantized_at_scale,
+                    scale_indices,
+                    scale_index,
+                    corruption_probability,
+                )
+                if corrupted_quantized is quantized_at_scale:
+                    corrupted_contribution = scale_contribution
+                else:
+                    corrupted_contribution = self._prepare_scale_contribution(
+                        corrupted_quantized,
+                        scale_index,
+                    )
+                corrupted_reconstruction = (
+                    corrupted_reconstruction + corrupted_contribution
+                )
+                next_scale_inputs.append(
+                    self._resize_to_scale(
+                        corrupted_reconstruction,
+                        scale_index=scale_index + 1,
+                    )
+                )
 
             # Pull the encoder toward the current quantized reconstruction.
             encoder_commitment_loss = self.commitment_cost * F.mse_loss(
                 reconstruction.detach(),
                 x,
             )
+            commitment_losses_by_scale.append(encoder_commitment_loss)
 
             # Train the learned samplers and refiners against a fixed encoder target.
             # The codebooks themselves are updated separately through EMA.
-            quantizer_reconstruction_loss = F.mse_loss(
+            quantization_loss = F.mse_loss(
                 reconstruction,
-                detached_x,
+                x.detach(),
             )
-            vq_loss = vq_loss + encoder_commitment_loss + quantizer_reconstruction_loss
+            quantization_losses_by_scale.append(quantization_loss)
 
             if scale_index == partial_scale_index:
                 partial_quantized_latent = reconstruction
 
-        vq_loss = vq_loss / len(self.scale_lengths)
-
-        # Give the decoder quantized values while passing its gradients to the encoder.
-        quantized_latent = x + (reconstruction - x).detach()
-
-        return quantized_latent, partial_quantized_latent, vq_loss, indices_by_scale
+        return QuantizerOutput(
+            final_latent=reconstruction,
+            cumulative_latents=cumulative_latents,
+            next_scale_inputs=next_scale_inputs,
+            indices_by_scale=indices_by_scale,
+            assignment_probabilities_by_scale=probabilities_by_scale,
+            assignment_logits_by_scale=assignment_logits_by_scale,
+            commitment_losses_by_scale=commitment_losses_by_scale,
+            quantization_losses_by_scale=quantization_losses_by_scale,
+            partial_latent=partial_quantized_latent,
+        )
 
     @torch.no_grad()
     def indices_to_cumulative_latents(
@@ -511,6 +696,8 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
 
         return cumulative_latents
 
+    # TODO: Remove this plural hard-index helper and its tokenizer wrapper after
+    # the remaining evaluations consume QuantizerOutput.next_scale_inputs.
     @torch.no_grad()
     def indices_to_next_scale_inputs(
         self,

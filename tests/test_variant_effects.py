@@ -1,19 +1,19 @@
 import torch
 import torch.nn.functional as F
 
-from nsm_dna.models.next_scale import NSM
+from nsm_dna.models.next_scale import NextScaleTransformer
 from nsm_dna.models.next_token import NextTokenModel
-from nsm_dna.models.vqvae import VQVAE
+from nsm_dna.models.next_scale import MultiscaleTokenizer
 from scripts.evaluation.variant_effects_next_scale import (
+    prepare_block_predictions,
     score_token_ids,
     target_block_window,
 )
 from scripts.evaluation.variant_effects_next_token import score_next_token_ids
-from scripts.training.train_nsm import prepare_block_predictions
 
 
-def _build_tokenizer() -> VQVAE:
-    tokenizer = VQVAE(
+def _build_tokenizer() -> MultiscaleTokenizer:
+    tokenizer = MultiscaleTokenizer(
         vocab_size=4,
         context_length=4,
         embed_dim=8,
@@ -65,8 +65,8 @@ def test_target_block_window_excludes_incomplete_target_blocks() -> None:
 def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
     torch.manual_seed(0)
     tokenizer = _build_tokenizer()
-    model = NSM(
-        vq_embed_dim=8,
+    model = NextScaleTransformer(
+        input_dim=8,
         model_dim=8,
         scale_lengths=[1, 2, 4],
         codebook_size=8,
@@ -109,8 +109,8 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
 def test_sequence_score_supports_target_without_prefix() -> None:
     torch.manual_seed(0)
     tokenizer = _build_tokenizer()
-    model = NSM(
-        vq_embed_dim=8,
+    model = NextScaleTransformer(
+        input_dim=8,
         model_dim=8,
         scale_lengths=[1, 2, 4],
         codebook_size=8,

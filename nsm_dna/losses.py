@@ -1,0 +1,123 @@
+from dataclasses import dataclass
+
+import torch
+import torch.nn.functional as F
+from jaxtyping import Float, Int
+from torch import Tensor
+
+from .models.next_scale import NSMDNAOutput
+
+
+@dataclass(frozen=True)
+class NSMDNALosses:
+    """The four training objectives and per-scale prediction values."""
+
+    total: Float[Tensor, ""]
+    nucleotide_reconstruction: Float[Tensor, ""]
+    vq: Float[Tensor, ""]
+    next_scale_prediction: Float[Tensor, ""]
+    next_scale_prediction_by_scale: list[Float[Tensor, ""]]
+    entropy: Float[Tensor, ""]
+
+
+def nucleotide_reconstruction_loss(
+    logits: Float[Tensor, "batch target_length vocab_size"],
+    target_ids: Int[Tensor, "batch target_length"],
+) -> Float[Tensor, ""]:
+    """Average nucleotide cross-entropy over the target block."""
+    return F.cross_entropy(logits.flatten(0, 1), target_ids.flatten())
+
+
+def next_scale_prediction_loss(
+    logits_by_scale: list[
+        Float[Tensor, "batch scale_length codebook_size"]
+    ],
+    targets_by_scale: list[Int[Tensor, "batch scale_length"]],
+) -> tuple[Float[Tensor, ""], list[Float[Tensor, ""]]]:
+    """Average token cross-entropy within each scale, then across scales."""
+    losses_by_scale = [
+        F.cross_entropy(scale_logits.flatten(0, 1), scale_targets.flatten())
+        for scale_logits, scale_targets in zip(
+            logits_by_scale,
+            targets_by_scale,
+            strict=True,
+        )
+    ]
+    return torch.stack(losses_by_scale).mean(), losses_by_scale
+
+
+def codebook_entropy_loss(
+    assignment_logits_by_scale: list[
+        Float[Tensor, "batch scale_length codebook_size"]
+    ],
+    temperature: float,
+) -> Float[Tensor, ""]:
+    """Favor confident assignments and diverse aggregate code use at every scale."""
+    if temperature <= 0:
+        raise ValueError("entropy temperature must be positive.")
+
+    losses_by_scale = []
+    for assignment_logits in assignment_logits_by_scale:
+        # The entropy objective gets its own softer distribution because squared
+        # distances across a wide latent can saturate the tokenizer's temperature-1
+        # probabilities. This does not change hard codes or their EMA updates.
+        probabilities = torch.softmax(
+            assignment_logits.float() / temperature,
+            dim=-1,
+        )
+        flat_probabilities = probabilities.flatten(0, 1)
+        log_probabilities = torch.log(flat_probabilities.clamp_min(1e-10))
+        mean_assignment_entropy = -(
+            flat_probabilities * log_probabilities
+        ).sum(dim=-1).mean()
+
+        marginal_probabilities = flat_probabilities.mean(dim=0)
+        marginal_entropy = -(
+            marginal_probabilities
+            * torch.log(marginal_probabilities.clamp_min(1e-10))
+        ).sum()
+
+        # Minimizing the difference keeps each individual assignment sharp while
+        # maximizing the entropy of the assignments aggregated across the batch.
+        losses_by_scale.append(mean_assignment_entropy - marginal_entropy)
+
+    return torch.stack(losses_by_scale).mean()
+
+
+def nsm_dna_losses(
+    output: NSMDNAOutput,
+    target_ids: Int[Tensor, "batch target_length"],
+    *,
+    next_scale_prediction_loss_weight: float = 1.0,
+    entropy_loss_weight: float = 1.0,
+    entropy_temperature: float = 1.0,
+) -> NSMDNALosses:
+    """Calculate nucleotide, VQ, next-scale, and codebook entropy losses."""
+    nucleotide_reconstruction = nucleotide_reconstruction_loss(
+        output.reconstruction_logits,
+        target_ids,
+    )
+    (
+        next_scale_prediction,
+        next_scale_prediction_by_scale,
+    ) = next_scale_prediction_loss(
+        output.next_scale_logits_by_scale, output.quantizer.indices_by_scale
+    )
+    entropy = codebook_entropy_loss(
+        output.quantizer.assignment_logits_by_scale,
+        temperature=entropy_temperature,
+    )
+    vq = output.quantizer.vq_loss
+    return NSMDNALosses(
+        total=(
+            nucleotide_reconstruction
+            + vq
+            + next_scale_prediction_loss_weight * next_scale_prediction
+            + entropy_loss_weight * entropy
+        ),
+        nucleotide_reconstruction=nucleotide_reconstruction,
+        vq=vq,
+        next_scale_prediction=next_scale_prediction,
+        next_scale_prediction_by_scale=next_scale_prediction_by_scale,
+        entropy=entropy,
+    )

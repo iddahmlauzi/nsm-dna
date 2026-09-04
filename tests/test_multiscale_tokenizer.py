@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nsm_dna.models.autoencoder import Decoder, Encoder
-from nsm_dna.models.quantization import MultiscaleResidualVectorQuantizer
-from nsm_dna.models.vqvae import VQVAE
-from scripts.training.train_vqvae import evaluate
+from nsm_dna.models.next_scale import MultiscaleTokenizer
+from nsm_dna.models.next_scale.quantization import (
+    MultiscaleResidualVectorQuantizer,
+)
+from nsm_dna.models.next_scale.tokenizer import Decoder, Encoder
 
 
 def test_encoder_uses_token_embeddings_without_absolute_positions() -> None:
@@ -92,7 +93,7 @@ def test_first_scale_sampler_uses_a_cascade() -> None:
 
 
 def test_cumulative_decode_matches_full_reconstruction() -> None:
-    model = VQVAE(
+    model = MultiscaleTokenizer(
         vocab_size=4,
         context_length=4,
         embed_dim=8,
@@ -116,7 +117,7 @@ def test_cumulative_decode_matches_full_reconstruction() -> None:
 
 
 def test_encode_returns_continuous_prefix_latents() -> None:
-    model = VQVAE(
+    model = MultiscaleTokenizer(
         vocab_size=4,
         context_length=4,
         embed_dim=8,
@@ -131,12 +132,40 @@ def test_encode_returns_continuous_prefix_latents() -> None:
 
     prefix_latents = model.encode(token_ids)
     encoder_latents = model.encoder(token_ids)
-    expected_latents = model.pre_quant_norm(
-        encoder_latents.transpose(1, 2)
-    ).transpose(1, 2)
+    expected_latents = model.pre_quant_norm(encoder_latents.transpose(1, 2)).transpose(
+        1, 2
+    )
 
     assert prefix_latents.shape == (2, 4, 8)
     torch.testing.assert_close(prefix_latents, expected_latents)
+
+
+def test_encode_pair_normalizes_prefix_and_target_independently() -> None:
+    tokenizer = MultiscaleTokenizer(
+        vocab_size=4,
+        context_length=4,
+        embed_dim=8,
+        num_heads=2,
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[8, 8, 8],
+        encoder_dropout=0.0,
+        decoder_dropout=0.0,
+        pre_quant_num_groups=2,
+    ).eval()
+    first_sequence = torch.tensor([[0, 1, 2, 0, 0, 0, 0]])
+    changed_target = torch.tensor([[0, 1, 2, 3, 3, 3, 3]])
+
+    prefix, target = tokenizer.encode_pair(first_sequence)
+    unchanged_prefix, changed_target_latent = tokenizer.encode_pair(changed_target)
+
+    torch.testing.assert_close(prefix, unchanged_prefix)
+    assert prefix.shape[1] == 3
+    torch.testing.assert_close(prefix, tokenizer.encode(first_sequence[:, :3]))
+    torch.testing.assert_close(target, tokenizer.encode(first_sequence[:, 3:]))
+    torch.testing.assert_close(
+        changed_target_latent,
+        tokenizer.encode(changed_target[:, 3:]),
+    )
 
 
 def test_next_scale_inputs_are_resized_cumulative_latents() -> None:
@@ -167,8 +196,8 @@ def test_next_scale_inputs_are_resized_cumulative_latents() -> None:
     torch.testing.assert_close(next_scale_inputs[1], cumulative_latents[1])
 
 
-def test_partial_reconstruction_trains_quantizer_without_moving_encoder() -> None:
-    model = VQVAE(
+def test_partial_reconstruction_uses_differentiable_assignments() -> None:
+    model = MultiscaleTokenizer(
         vocab_size=4,
         context_length=4,
         embed_dim=8,
@@ -195,8 +224,8 @@ def test_partial_reconstruction_trains_quantizer_without_moving_encoder() -> Non
         token_ids.flatten(),
     )
     partial_loss.backward()
-    assert all(
-        parameter.grad is None or parameter.grad.count_nonzero() == 0
+    assert any(
+        parameter.grad is not None and parameter.grad.count_nonzero() > 0
         for parameter in model.encoder.parameters()
     )
     assert any(
@@ -210,8 +239,8 @@ def test_partial_reconstruction_trains_quantizer_without_moving_encoder() -> Non
 
 
 def test_partial_reconstruction_uses_separate_gradient_scales() -> None:
-    def build_model() -> VQVAE:
-        return VQVAE(
+    def build_model() -> MultiscaleTokenizer:
+        return MultiscaleTokenizer(
             vocab_size=4,
             context_length=4,
             embed_dim=8,
@@ -224,7 +253,7 @@ def test_partial_reconstruction_uses_separate_gradient_scales() -> None:
         ).eval()
 
     def partial_gradients(
-        model: VQVAE,
+        model: MultiscaleTokenizer,
         token_ids: torch.Tensor,
         *,
         loss_weight: float,
@@ -274,48 +303,7 @@ def test_partial_reconstruction_uses_separate_gradient_scales() -> None:
 
     assert len(baseline_quantizer) == len(split_quantizer)
     assert len(baseline_decoder) == len(split_decoder)
-    for baseline_gradient, split_gradient in zip(
-        baseline_quantizer, split_quantizer
-    ):
+    for baseline_gradient, split_gradient in zip(baseline_quantizer, split_quantizer):
         torch.testing.assert_close(split_gradient, 0.2 * baseline_gradient)
     for baseline_gradient, split_gradient in zip(baseline_decoder, split_decoder):
         torch.testing.assert_close(split_gradient, 0.01 * baseline_gradient)
-
-
-def test_evaluate_reports_vq_diagnostics_by_scale() -> None:
-    model = VQVAE(
-        vocab_size=4,
-        context_length=4,
-        embed_dim=8,
-        num_heads=2,
-        scale_lengths=[1, 2, 4],
-        codebook_sizes=[8, 8, 8],
-        encoder_dropout=0.0,
-        decoder_dropout=0.0,
-        pre_quant_num_groups=2,
-    )
-    batches = [
-        {"input_ids": torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])},
-    ]
-
-    metrics = evaluate(
-        model,
-        batches,
-        use_mixed_precision=False,
-    )
-
-    assert "encoder_latent_rms" in metrics
-    mean_cumulative_latent_mse = sum(
-        metrics[f"cumulative_latent_mse_scale_{scale_length}"]
-        for scale_length in model.scale_lengths
-    ) / len(model.scale_lengths)
-    torch.testing.assert_close(
-        torch.tensor(metrics["vq_loss"]),
-        torch.tensor(1.25 * mean_cumulative_latent_mse),
-    )
-
-    for scale_length in model.scale_lengths:
-        assert f"cumulative_latent_mse_scale_{scale_length}" in metrics
-        assert f"contribution_rms_scale_{scale_length}" in metrics
-        assert f"codebook_perplexity_scale_{scale_length}" in metrics
-        assert f"codebook_rms_scale_{scale_length}" in metrics

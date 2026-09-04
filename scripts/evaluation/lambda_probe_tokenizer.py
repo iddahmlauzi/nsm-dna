@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 
-from nsm_dna.models.vqvae import VQVAE
+from nsm_dna.models.next_scale import MultiscaleTokenizer
 from scripts.evaluation.lambda_probe_next_scale import (
     evaluate_probes,
     extract_segment_embeddings,
@@ -23,7 +23,7 @@ from scripts.evaluation.lambda_probe_next_token import (
 class TokenizerWindowEncoder(nn.Module):
     """Mean-pool VQ-VAE latents before quantization and before decoding."""
 
-    def __init__(self, tokenizer: VQVAE) -> None:
+    def __init__(self, tokenizer: MultiscaleTokenizer) -> None:
         super().__init__()
         self.tokenizer = tokenizer
 
@@ -34,7 +34,7 @@ class TokenizerWindowEncoder(nn.Module):
             enabled=input_ids.device.type == "cuda",
         ):
             pre_quant = self.tokenizer.encode(input_ids)
-            pre_decode, _, _, _ = self.tokenizer.quantizer(pre_quant)
+            pre_decode = self.tokenizer.quantizer(pre_quant).final_latent
 
         return torch.cat(
             [pre_quant.float().mean(dim=1), pre_decode.float().mean(dim=1)],
@@ -89,7 +89,7 @@ def evaluate_tokenizer_representations(
 
 
 def build_parallel_encoder(
-    tokenizer: VQVAE,
+    tokenizer: MultiscaleTokenizer,
     device_ids: list[int],
 ) -> nn.Module:
     """Use every configured GPU for tokenizer embedding extraction."""
@@ -127,7 +127,9 @@ def main(config: DictConfig) -> None:
         for name, path in split_paths.items()
     }
 
-    tokenizer = VQVAE.from_checkpoint(checkpoint_path, device, frozen=True)
+    tokenizer = MultiscaleTokenizer.from_checkpoint(
+        checkpoint_path, device, frozen=True
+    )
     results = evaluate_tokenizer_representations(
         build_parallel_encoder(tokenizer, device_ids),
         tokenizer.embed_dim,

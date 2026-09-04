@@ -10,8 +10,8 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 from nsm_dna.data import encode_sequence
-from nsm_dna.models.next_scale import NSM
-from nsm_dna.models.vqvae import VQVAE
+from nsm_dna.models.next_scale import NSMDNA, NextScaleTransformer
+from nsm_dna.models.next_scale import MultiscaleTokenizer
 from scripts.evaluation.lambda_probe_next_token import (
     LambdaSplit,
     fit_linear_probe,
@@ -25,7 +25,7 @@ from scripts.evaluation.lambda_probe_next_token import (
 class NSMWindowEncoder(nn.Module):
     """Extract the final first-scale memory state for one NSM window."""
 
-    def __init__(self, model: NSM, tokenizer: VQVAE) -> None:
+    def __init__(self, model: NextScaleTransformer, tokenizer: MultiscaleTokenizer) -> None:
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
@@ -200,8 +200,8 @@ def evaluate_representation(
 
 
 def build_parallel_encoder(
-    model: NSM,
-    tokenizer: VQVAE,
+    model: NextScaleTransformer,
+    tokenizer: MultiscaleTokenizer,
     device_ids: list[int],
 ) -> nn.Module:
     """Use every configured GPU for NSM embedding extraction."""
@@ -240,12 +240,12 @@ def main(config: DictConfig) -> None:
         for name, path in split_paths.items()
     }
 
-    tokenizer = VQVAE.from_checkpoint(
+    tokenizer = MultiscaleTokenizer.from_checkpoint(
         tokenizer_checkpoint_path,
         device,
         frozen=True,
     )
-    trained_model, checkpoint_step = NSM.from_checkpoint(
+    trained_model, checkpoint_step = NextScaleTransformer.from_checkpoint(
         checkpoint_path,
         tokenizer,
         device,
@@ -276,7 +276,7 @@ def main(config: DictConfig) -> None:
 
     random_seed = int(config.random_model_seed)
     torch.manual_seed(random_seed)
-    random_model = NSM.from_config(model_config, tokenizer).to(device)
+    random_model = NSMDNA.from_config(model_config).transformer.to(device)
     random_model.eval()
     random_model.requires_grad_(False)
     random_results = evaluate_representation(

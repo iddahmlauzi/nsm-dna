@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,9 +15,37 @@ from torch import Tensor
 from tqdm import tqdm
 
 from nsm_dna.data import encode_sequence
-from nsm_dna.models.next_scale import NSM
-from nsm_dna.models.vqvae import VQVAE
-from scripts.training.train_nsm import BlockPredictionBatch, prepare_block_predictions
+from nsm_dna.models.next_scale import NextScaleTransformer
+from nsm_dna.models.next_scale import MultiscaleTokenizer
+
+
+@dataclass(frozen=True)
+class BlockPredictionBatch:
+    """Tokenizer outputs used to score one target block."""
+
+    target_ids: Int[Tensor, "batch block_length"]
+    prefix: Float[Tensor, "batch prefix_length latent_dim"] | None
+    scale_inputs: list[Float[Tensor, "batch scale_length latent_dim"]]
+    targets_by_scale: list[Int[Tensor, "batch scale_length"]]
+
+
+@torch.no_grad()
+def prepare_block_predictions(
+    tokenizer: MultiscaleTokenizer,
+    input_ids: Int[Tensor, "batch sequence_length"],
+) -> list[BlockPredictionBatch]:
+    """Encode the first block as context and the second as the scored target."""
+    prefix_ids, target_ids = input_ids.split(tokenizer.context_length, dim=1)
+    prefix = tokenizer.encode(prefix_ids)
+    targets_by_scale = tokenizer.encode_indices(target_ids)
+    return [
+        BlockPredictionBatch(
+            target_ids=target_ids,
+            prefix=prefix,
+            scale_inputs=tokenizer.indices_to_next_scale_inputs(targets_by_scale),
+            targets_by_scale=targets_by_scale,
+        )
+    ]
 
 PREDICTION_COLUMNS = (
     "study_id",
@@ -71,14 +100,14 @@ def load_model(
     checkpoint_path: Path,
     tokenizer_checkpoint_path: Path,
     device: torch.device,
-) -> tuple[NSM, VQVAE, int]:
+) -> tuple[NextScaleTransformer, MultiscaleTokenizer, int]:
     """Restore the frozen tokenizer and one trained NSM-DNA checkpoint."""
-    tokenizer = VQVAE.from_checkpoint(
+    tokenizer = MultiscaleTokenizer.from_checkpoint(
         tokenizer_checkpoint_path,
         device,
         frozen=True,
     )
-    model, checkpoint_step = NSM.from_checkpoint(
+    model, checkpoint_step = NextScaleTransformer.from_checkpoint(
         checkpoint_path,
         tokenizer,
         device,
@@ -89,8 +118,8 @@ def load_model(
 
 @torch.inference_mode()
 def score_token_ids(
-    model: NSM,
-    tokenizer: VQVAE,
+    model: NextScaleTransformer,
+    tokenizer: MultiscaleTokenizer,
     input_ids: Int[Tensor, "batch sequence_length"],
 ) -> tuple[
     Float[Tensor, "batch num_scales"],
@@ -161,8 +190,8 @@ def score_token_ids(
 
 def score_sequences(
     sequences: list[str],
-    model: NSM,
-    tokenizer: VQVAE,
+    model: NextScaleTransformer,
+    tokenizer: MultiscaleTokenizer,
     batch_size: int,
     device: torch.device,
 ) -> dict[str, list[float]]:
@@ -240,8 +269,8 @@ def write_csv(
 def evaluate_assay(
     path: Path,
     output_dir: Path,
-    model: NSM,
-    tokenizer: VQVAE,
+    model: NextScaleTransformer,
+    tokenizer: MultiscaleTokenizer,
     batch_size: int,
     device: torch.device,
     prefix_length: int,

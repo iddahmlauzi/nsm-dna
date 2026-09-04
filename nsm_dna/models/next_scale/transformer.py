@@ -1,23 +1,17 @@
 import math
-from pathlib import Path
-from typing import TYPE_CHECKING
 
 import einx
 import torch
 import torch.nn as nn
 from jaxtyping import Bool, Float
-from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
-from .common import (
+from ..common import (
     RMSNorm,
     RotaryEmbeddings,
     TransformerBlock,
     precompute_rope_cosine_and_sine,
 )
-
-if TYPE_CHECKING:
-    from .vqvae import VQVAE
 
 
 class _ResidualOutputHeadBlock(nn.Module):
@@ -99,12 +93,12 @@ class SharedOutputHead(nn.Module):
         return self.codebook_projection(x)
 
 
-class NSM(nn.Module):
-    """Predict a discrete VQ-VAE hierarchy from coarse to fine."""
+class NextScaleTransformer(nn.Module):
+    """Predict a discrete multiscale hierarchy from coarse to fine."""
 
     def __init__(
         self,
-        vq_embed_dim: int,
+        input_dim: int,
         model_dim: int,
         scale_lengths: list[int],
         codebook_size: int,
@@ -125,7 +119,7 @@ class NSM(nn.Module):
         if input_refinement_kernel_size % 2 == 0:
             raise ValueError("input_refinement_kernel_size must be odd.")
 
-        self.vq_embed_dim = vq_embed_dim
+        self.input_dim = input_dim
         self.model_dim = model_dim
         self.scale_lengths = list(scale_lengths)
         self.codebook_size = codebook_size
@@ -141,8 +135,8 @@ class NSM(nn.Module):
         self.scale_input_convs = nn.ModuleList(
             [
                 nn.Conv1d(
-                    self.vq_embed_dim,
-                    self.vq_embed_dim,
+                    self.input_dim,
+                    self.input_dim,
                     kernel_size=self.input_refinement_kernel_size,
                     padding=self.input_refinement_kernel_size // 2,
                     bias=bias,
@@ -159,7 +153,7 @@ class NSM(nn.Module):
                 nn.init.zeros_(conv.bias)
 
         self.input_projection = nn.Linear(
-            self.vq_embed_dim,
+            self.input_dim,
             self.model_dim,
             bias=bias,
         )
@@ -273,59 +267,10 @@ class NSM(nn.Module):
                 std=residual_standard_deviation,
             )
 
-    @classmethod
-    def from_config(cls, config: DictConfig, tokenizer: "VQVAE") -> "NSM":
-        """Build NSM-DNA from an experiment configuration and its tokenizer."""
-        return cls(
-            vq_embed_dim=tokenizer.embed_dim,
-            model_dim=config.model.model_dim,
-            scale_lengths=tokenizer.scale_lengths,
-            codebook_size=tokenizer.codebook_sizes[0],
-            num_layers=config.model.num_layers,
-            num_heads=config.model.num_heads,
-            dropout=config.model.dropout,
-            bias=config.model.bias,
-            use_qk_norm=config.model.use_qk_norm,
-            rope_base=config.model.rope_base,
-            head_num_blocks=config.model.head_num_blocks,
-            head_hidden_multiplier=config.model.head_hidden_multiplier,
-            input_refinement_kernel_size=config.model.input_refinement_kernel_size,
-            max_prefix_length=(
-                config.data.sequence_length - tokenizer.context_length
-            ),
-        )
-
-    @classmethod
-    def from_checkpoint(
-        cls,
-        checkpoint_path: Path,
-        tokenizer: "VQVAE",
-        device: torch.device,
-        *,
-        frozen: bool = False,
-    ) -> tuple["NSM", int]:
-        """Rebuild NSM-DNA and return it with its saved training step."""
-        checkpoint = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=True,
-        )
-        config = OmegaConf.create(checkpoint["config"])
-
-        model = cls.from_config(config, tokenizer)
-        model.load_state_dict(checkpoint["model"])
-        model = model.to(device)
-
-        if frozen:
-            model.eval()
-            model.requires_grad_(False)
-
-        return model, int(checkpoint["step"])
-
     def _refine_scale_inputs(
         self,
-        scale_inputs: list[Float[Tensor, "batch scale_length vq_dim"]],
-    ) -> list[Float[Tensor, "batch scale_length vq_dim"]]:
+        scale_inputs: list[Float[Tensor, "batch scale_length input_dim"]],
+    ) -> list[Float[Tensor, "batch scale_length input_dim"]]:
         """Adapt the tokenizer's resized reconstructions for NSM prediction.
 
         Each target scale after the first receives a cumulative reconstruction
@@ -352,7 +297,7 @@ class NSM(nn.Module):
         self,
         prefix_length: int,
     ) -> Bool[Tensor, "1 1 length length"]:
-        """Route prefix context to later scales through the first scale."""
+        """Let every scale read the prefix while keeping scale sections isolated."""
         if prefix_length == 0:
             return self.scale_attention_mask
 
@@ -366,17 +311,10 @@ class NSM(nn.Module):
         column_section_ids = einx.id("column -> 1 column", section_ids)
 
         same_section = row_section_ids == column_section_ids
-        first_scale_reads_prefix = (row_section_ids == 0) & (
-            column_section_ids == -1
-        )
-        later_scales_read_first_scale = (row_section_ids > 0) & (
-            column_section_ids == 0
-        )
+        target_reads_prefix = (row_section_ids >= 0) & (column_section_ids == -1)
         return einx.id(
             "row column -> 1 1 row column",
-            same_section
-            | first_scale_reads_prefix
-            | later_scales_read_first_scale,
+            same_section | target_reads_prefix,
         )
 
     def _get_rotary_embeddings(self, prefix_length: int) -> RotaryEmbeddings:
@@ -393,9 +331,9 @@ class NSM(nn.Module):
 
     def encode(
         self,
-        scale_inputs: list[Float[Tensor, "batch scale_length vq_dim"]],
+        scale_inputs: list[Float[Tensor, "batch scale_length input_dim"]],
         *,
-        prefix: Float[Tensor, "batch prefix_length vq_dim"] | None = None,
+        prefix: Float[Tensor, "batch prefix_length input_dim"] | None = None,
     ) -> Float[Tensor, "batch length model_dim"]:
         """Return final normalized states for the prefix and target hierarchy."""
         refined_scale_inputs = self._refine_scale_inputs(scale_inputs)
@@ -450,11 +388,12 @@ class NSM(nn.Module):
 
     def forward(
         self,
-        scale_inputs: list[Float[Tensor, "batch scale_length vq_dim"]],
+        scale_inputs: list[Float[Tensor, "batch scale_length input_dim"]],
         *,
-        prefix: Float[Tensor, "batch prefix_length vq_dim"] | None = None,
+        prefix: Float[Tensor, "batch prefix_length input_dim"] | None = None,
     ) -> Float[Tensor, "batch hierarchy_length codebook_size"]:
         hidden_states = self.encode(scale_inputs, prefix=prefix)
         prefix_length = 0 if prefix is None else prefix.shape[1]
         hierarchy_hidden_states = hidden_states[:, prefix_length:]
         return self.output_head(hierarchy_hidden_states)
+

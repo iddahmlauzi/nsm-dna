@@ -1,14 +1,81 @@
-from pathlib import Path
+"""Multiscale residual-quantization tokenizer used by NSM-DNA."""
 
 import einx
 import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
-from omegaconf import OmegaConf
 from torch import Tensor
 
-from .autoencoder import Decoder, Encoder
-from .quantization import MultiscaleResidualVectorQuantizer
+from ..common import LayerNorm, TransformerBlock, precompute_rope_cosine_and_sine
+from .quantization import MultiscaleResidualVectorQuantizer, QuantizerOutput
+
+
+class Encoder(nn.Module):
+    """Embed nucleotides independently without absolute position information."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_dim: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        token_ids: Int[Tensor, "batch length"],
+    ) -> Float[Tensor, "batch length embed_dim"]:
+        return self.drop(self.token_embedding(token_ids))
+
+
+class Decoder(nn.Module):
+    """Decode latent representations into nucleotide logits."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.1,
+        bias: bool = False,
+        rope_base: float = 10000.0,
+    ) -> None:
+        super().__init__()
+
+        positions = torch.arange(context_length)
+        head_dim = embed_dim // num_heads
+        rope_cosine, rope_sine = precompute_rope_cosine_and_sine(
+            positions,
+            head_dim,
+            rope_base,
+        )
+        self.register_buffer("rope_cosine", rope_cosine, persistent=False)
+        self.register_buffer("rope_sine", rope_sine, persistent=False)
+
+        self.block = TransformerBlock(
+            embed_dim,
+            num_heads,
+            dropout=dropout,
+            bias=bias,
+        )
+        self.final_norm = LayerNorm(embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, vocab_size, bias=bias)
+
+    def forward(
+        self,
+        latent: Float[Tensor, "batch length embed_dim"],
+    ) -> Float[Tensor, "batch length vocab_size"]:
+        x = self.block(
+            latent,
+            rotary_embeddings=(self.rope_cosine, self.rope_sine),
+            is_causal=False,
+        )
+        x = self.final_norm(x)
+        return self.out_proj(x)
 
 
 class _ScaleGradient(torch.autograd.Function):
@@ -24,8 +91,8 @@ class _ScaleGradient(torch.autograd.Function):
         return gradient * ctx.scale, None
 
 
-class VQVAE(nn.Module):
-    """VQ-VAE with a multiscale residual quantization bottleneck."""
+class MultiscaleTokenizer(nn.Module):
+    """DNA tokenizer with a multiscale residual quantization bottleneck."""
 
     def __init__(
         self,
@@ -46,6 +113,7 @@ class VQVAE(nn.Module):
         commitment_cost: float = 0.25,
         decay: float = 0.99,
         eps: float = 1e-5,
+        temperature: float = 1.0,
         # Per-scale post-quantization refinement
         refinement_ratio: float = 0.5,
         refinement_kernel_size: int = 3,
@@ -101,6 +169,7 @@ class VQVAE(nn.Module):
             commitment_cost=commitment_cost,
             decay=decay,
             eps=eps,
+            temperature=temperature,
             refinement_ratio=refinement_ratio,
             refinement_kernel_size=refinement_kernel_size,
         )
@@ -114,48 +183,17 @@ class VQVAE(nn.Module):
             rope_base=self.rope_base,
         )
 
-    @classmethod
-    def from_checkpoint(
-        cls,
-        checkpoint_path: Path,
-        device: torch.device,
-        *,
-        frozen: bool = False,
-    ) -> "VQVAE":
-        """Rebuild a VQ-VAE from its saved configuration and weights."""
-        checkpoint = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=True,
-        )
-        config = OmegaConf.create(checkpoint["config"]).model
+    def _normalize(
+        self,
+        latent: Float[Tensor, "batch length embed_dim"],
+    ) -> Float[Tensor, "batch length embed_dim"]:
+        """Normalize one block without mixing its statistics with another block."""
+        if self.pre_quant_norm is None or latent.shape[1] == 0:
+            return latent
 
-        model = cls(
-            vocab_size=config.vocab_size,
-            context_length=config.context_length,
-            embed_dim=config.embed_dim,
-            num_heads=config.num_heads,
-            scale_lengths=list(config.scale_lengths),
-            codebook_sizes=list(config.codebook_sizes),
-            encoder_dropout=config.encoder_dropout,
-            decoder_dropout=config.decoder_dropout,
-            bias=config.bias,
-            rope_base=getattr(config, "rope_base", 10000.0),
-            pre_quant_num_groups=config.pre_quant_num_groups,
-            commitment_cost=config.commitment_cost,
-            decay=config.decay,
-            eps=config.eps,
-            refinement_ratio=config.refinement_ratio,
-            refinement_kernel_size=config.refinement_kernel_size,
-        )
-        model.load_state_dict(checkpoint["model"])
-        model = model.to(device)
-
-        if frozen:
-            model.eval()
-            model.requires_grad_(False)
-
-        return model
+        latent = einx.id("b l d -> b d l", latent)
+        latent = self.pre_quant_norm(latent)
+        return einx.id("b d l -> b l d", latent)
 
     def encode(
         self,
@@ -163,17 +201,47 @@ class VQVAE(nn.Module):
     ) -> Float[Tensor, "batch length embed_dim"]:
         """Encode DNA into the normalized continuous latent space.
 
-        VQ-VAE training quantizes this latent before reconstruction. NSM-DNA
-        uses the same latent directly when a completed block is prefix context.
+        NSM-DNA quantizes target latents but uses completed prefix latents
+        directly as transformer context.
         """
-        latent = self.encoder(token_ids)
+        return self._normalize(self.encoder(token_ids))
 
-        if self.pre_quant_norm is not None:
-            latent = einx.id("b l d -> b d l", latent)
-            latent = self.pre_quant_norm(latent)
-            latent = einx.id("b d l -> b l d", latent)
+    def encode_pair(
+        self,
+        sequence_ids: Int[Tensor, "batch sequence_length"],
+    ) -> tuple[
+        Float[Tensor, "batch prefix_length embed_dim"],
+        Float[Tensor, "batch context_length embed_dim"],
+    ]:
+        """Embed a variable prefix and fixed-length target in one encoder call."""
+        if sequence_ids.shape[1] < self.context_length:
+            raise ValueError(
+                f"Expected at least {self.context_length} target positions."
+            )
 
-        return latent
+        latent = self.encoder(sequence_ids)
+        prefix = latent[:, : -self.context_length]
+        target = latent[:, -self.context_length :]
+        return self._normalize(prefix), self._normalize(target)
+
+    def quantize(
+        self,
+        target_latent: Float[Tensor, "batch context_length embed_dim"],
+        *,
+        corruption_probability: float = 0.0,
+    ) -> QuantizerOutput:
+        """Quantize one target block and prepare differentiable hierarchy inputs."""
+        return self.quantizer(
+            target_latent,
+            corruption_probability=corruption_probability,
+        )
+
+    def decode_latent(
+        self,
+        latent: Float[Tensor, "batch context_length embed_dim"],
+    ) -> Float[Tensor, "batch context_length vocab_size"]:
+        """Decode one full-length cumulative latent into nucleotide logits."""
+        return self.decoder(latent)
 
     def forward(
         self,
@@ -188,30 +256,30 @@ class VQVAE(nn.Module):
         list[Int[Tensor, "batch scale_length"]],
     ]:
         latent = self.encode(token_ids)
-        (
-            quantized_latent,
-            partial_quantized_latent,
-            vq_loss,
-            indices_by_scale,
-        ) = self.quantizer(
+        quantizer_output = self.quantizer(
             latent,
             include_partial_reconstruction=include_partial_reconstruction,
         )
-        logits = self.decoder(quantized_latent)
+        logits = self.decoder(quantizer_output.final_latent)
 
         partial_logits = None
-        if partial_quantized_latent is not None:
+        if quantizer_output.partial_latent is not None:
             # The partial loss uses one decoder pass, but its gradient can have
             # different strengths on the quantizer path and decoder parameters.
             # Scaling at the decoder input affects only the gradient flowing back
             # into the quantizer; the loss coefficient controls the decoder.
             partial_quantized_latent = _ScaleGradient.apply(
-                partial_quantized_latent,
+                quantizer_output.partial_latent,
                 partial_latent_gradient_scale,
             )
             partial_logits = self.decoder(partial_quantized_latent)
 
-        return logits, partial_logits, vq_loss, indices_by_scale
+        return (
+            logits,
+            partial_logits,
+            quantizer_output.vq_loss,
+            quantizer_output.indices_by_scale,
+        )
 
     @torch.no_grad()
     def encode_indices(
@@ -220,15 +288,13 @@ class VQVAE(nn.Module):
     ) -> list[Int[Tensor, "batch scale_length"]]:
         """Encode target blocks into discrete codebook indices at every scale.
 
-        These indices provide both teacher-forced hierarchy inputs and prediction
-        targets for stage-two NSM-DNA training.
+        These indices identify the hard codes selected at every hierarchy scale.
         """
         if self.training:
             raise RuntimeError("Call model.eval() before encoding sequences.")
 
         latent = self.encode(token_ids)
-        _, _, _, indices_by_scale = self.quantizer(latent)
-        return indices_by_scale
+        return self.quantizer(latent).indices_by_scale
 
     @torch.no_grad()
     def indices_to_next_scale_inputs(
@@ -244,9 +310,7 @@ class VQVAE(nn.Module):
         preceding_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
     ) -> Float[Tensor, "batch next_scale_length embed_dim"]:
         """Construct the next input from autoregressively predicted indices."""
-        return self.quantizer.indices_to_next_scale_input(
-            preceding_indices_by_scale
-        )
+        return self.quantizer.indices_to_next_scale_input(preceding_indices_by_scale)
 
     @torch.no_grad()
     def decode(
