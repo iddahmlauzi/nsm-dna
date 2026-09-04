@@ -55,11 +55,12 @@ def evaluate(
     use_mixed_precision: bool,
     max_batches: int | None = None,
     *,
+    autoregressive_reconstruction_loss_weight: float = 0.0,
     next_scale_prediction_loss_weight: float = 1.0,
     entropy_loss_weight: float = 1.0,
     entropy_temperature: float = 1.0,
 ) -> dict[str, float]:
-    """Evaluate all four losses and tokenizer/next-scale diagnostics."""
+    """Evaluate joint losses and tokenizer/next-scale diagnostics."""
     was_training = model.training
     model.eval()
     device = next(model.parameters()).device
@@ -68,7 +69,7 @@ def evaluate(
     # The losses returned by the model are batch means, so they are accumulated
     # by example. Accuracy and codebook statistics are accumulated as raw counts
     # so that short final batches do not receive disproportionate weight.
-    loss_sums = torch.zeros(5, dtype=torch.float64, device=device)
+    loss_sums = torch.zeros(6, dtype=torch.float64, device=device)
     next_scale_prediction_loss_sums = torch.zeros(
         num_scales, dtype=torch.float64, device=device
     )
@@ -94,6 +95,9 @@ def evaluate(
         for codebook_size in model.tokenizer.codebook_sizes
     ]
     nucleotide_reconstruction_correct = torch.zeros(
+        (), dtype=torch.long, device=device
+    )
+    autoregressive_reconstruction_correct = torch.zeros(
         (), dtype=torch.long, device=device
     )
     rollout_nucleotide_loss_sum = torch.zeros(
@@ -126,10 +130,16 @@ def evaluate(
                 sequence_ids,
                 corruption_probability=0.0,
                 return_cumulative_reconstructions=True,
+                return_autoregressive_reconstruction=(
+                    autoregressive_reconstruction_loss_weight != 0
+                ),
             )
             losses = nsm_dna_losses(
                 output,
                 target_ids,
+                autoregressive_reconstruction_loss_weight=(
+                    autoregressive_reconstruction_loss_weight
+                ),
                 next_scale_prediction_loss_weight=(
                     next_scale_prediction_loss_weight
                 ),
@@ -153,6 +163,7 @@ def evaluate(
             [
                 losses.total,
                 losses.nucleotide_reconstruction,
+                losses.autoregressive_reconstruction,
                 losses.vq,
                 losses.next_scale_prediction,
                 losses.entropy,
@@ -174,6 +185,11 @@ def evaluate(
         nucleotide_reconstruction_correct += (
             output.reconstruction_logits.argmax(dim=-1) == target_ids
         ).sum()
+        if output.autoregressive_reconstruction_logits is not None:
+            autoregressive_reconstruction_correct += (
+                output.autoregressive_reconstruction_logits.argmax(dim=-1)
+                == target_ids
+            ).sum()
         rollout_nucleotide_correct += (
             generation.nucleotide_logits.argmax(dim=-1) == target_ids
         ).sum()
@@ -222,14 +238,18 @@ def evaluate(
     metrics = {
         "total_loss": mean_losses[0].item(),
         "nucleotide_reconstruction_loss": mean_losses[1].item(),
-        "vq_loss": mean_losses[2].item(),
-        "next_scale_prediction_loss": mean_losses[3].item(),
-        "entropy_loss": mean_losses[4].item(),
+        "autoregressive_reconstruction_loss": mean_losses[2].item(),
+        "vq_loss": mean_losses[3].item(),
+        "next_scale_prediction_loss": mean_losses[4].item(),
+        "entropy_loss": mean_losses[5].item(),
         "rollout_nucleotide_loss": (
             rollout_nucleotide_loss_sum / example_count
         ).item(),
         "nucleotide_reconstruction_accuracy": (
             nucleotide_reconstruction_correct / target_count
+        ).item(),
+        "autoregressive_reconstruction_accuracy": (
+            autoregressive_reconstruction_correct / target_count
         ).item(),
         "next_scale_prediction_accuracy": (
             next_scale_prediction_correct.sum()
@@ -300,6 +320,7 @@ def _add_training_statistics(
     next_scale_prediction_correct: torch.Tensor,
     next_scale_prediction_count: torch.Tensor,
     nucleotide_reconstruction_correct: torch.Tensor,
+    autoregressive_reconstruction_correct: torch.Tensor,
     target_count: torch.Tensor,
     example_count: torch.Tensor,
 ) -> None:
@@ -311,6 +332,7 @@ def _add_training_statistics(
         [
             losses.total,
             losses.nucleotide_reconstruction,
+            losses.autoregressive_reconstruction,
             losses.vq,
             losses.next_scale_prediction,
             losses.entropy,
@@ -318,6 +340,11 @@ def _add_training_statistics(
     ).detach() * batch_size
     nucleotide_reconstruction_correct += (
         output.reconstruction_logits.detach().argmax(dim=-1) == target_ids
+    ).sum()
+    assert output.autoregressive_reconstruction_logits is not None
+    autoregressive_reconstruction_correct += (
+        output.autoregressive_reconstruction_logits.detach().argmax(dim=-1)
+        == target_ids
     ).sum()
     target_count += target_ids.numel()
     example_count += batch_size
@@ -342,11 +369,13 @@ def _validation_metrics_for_wandb(
     overall_metric_names = (
         "total_loss",
         "nucleotide_reconstruction_loss",
+        "autoregressive_reconstruction_loss",
         "vq_loss",
         "next_scale_prediction_loss",
         "entropy_loss",
         "rollout_nucleotide_loss",
         "nucleotide_reconstruction_accuracy",
+        "autoregressive_reconstruction_accuracy",
         "next_scale_prediction_accuracy",
         "rollout_nucleotide_accuracy",
     )
@@ -554,6 +583,9 @@ def main(config: DictConfig) -> None:
     gradient_accumulation_steps = config.optimizer.gradient_accumulation_steps
     corruption_probability = config.training.input_code_corruption_probability
     entropy_temperature = config.training.entropy_temperature
+    autoregressive_reconstruction_loss_weight = (
+        config.training.autoregressive_reconstruction_loss_weight
+    )
 
     for step in progress_bar:
         generative_loss_weights = loss_schedule.weights_at_step(step)
@@ -570,7 +602,7 @@ def main(config: DictConfig) -> None:
         should_log = step % config.training.log_interval == 0
 
         if should_log:
-            loss_sums = torch.zeros(5, device=device)
+            loss_sums = torch.zeros(6, device=device)
             next_scale_prediction_correct = torch.zeros(
                 (), dtype=torch.long, device=device
             )
@@ -578,6 +610,9 @@ def main(config: DictConfig) -> None:
                 (), dtype=torch.long, device=device
             )
             nucleotide_reconstruction_correct = torch.zeros(
+                (), dtype=torch.long, device=device
+            )
+            autoregressive_reconstruction_correct = torch.zeros(
                 (), dtype=torch.long, device=device
             )
             target_count = torch.zeros((), dtype=torch.long, device=device)
@@ -617,10 +652,14 @@ def main(config: DictConfig) -> None:
                     output = training_model(
                         sequence_ids,
                         corruption_probability=corruption_probability,
+                        return_autoregressive_reconstruction=True,
                     )
                     losses = nsm_dna_losses(
                         output,
                         target_ids,
+                        autoregressive_reconstruction_loss_weight=(
+                            autoregressive_reconstruction_loss_weight
+                        ),
                         next_scale_prediction_loss_weight=(
                             generative_loss_weights.next_scale_prediction
                         ),
@@ -640,6 +679,7 @@ def main(config: DictConfig) -> None:
                         next_scale_prediction_correct,
                         next_scale_prediction_count,
                         nucleotide_reconstruction_correct,
+                        autoregressive_reconstruction_correct,
                         target_count,
                         example_count,
                     )
@@ -670,6 +710,7 @@ def main(config: DictConfig) -> None:
                 next_scale_prediction_correct,
                 next_scale_prediction_count,
                 nucleotide_reconstruction_correct,
+                autoregressive_reconstruction_correct,
                 target_count,
                 example_count,
             ]
@@ -680,11 +721,17 @@ def main(config: DictConfig) -> None:
                 metrics = {
                     "train/total_loss": mean_losses[0].item(),
                     "train/nucleotide_reconstruction_loss": mean_losses[1].item(),
-                    "train/vq_loss": mean_losses[2].item(),
-                    "train/next_scale_prediction_loss": mean_losses[3].item(),
-                    "train/entropy_loss": mean_losses[4].item(),
+                    "train/autoregressive_reconstruction_loss": (
+                        mean_losses[2].item()
+                    ),
+                    "train/vq_loss": mean_losses[3].item(),
+                    "train/next_scale_prediction_loss": mean_losses[4].item(),
+                    "train/entropy_loss": mean_losses[5].item(),
                     "train/nucleotide_reconstruction_accuracy": (
                         nucleotide_reconstruction_correct / target_count
+                    ).item(),
+                    "train/autoregressive_reconstruction_accuracy": (
+                        autoregressive_reconstruction_correct / target_count
                     ).item(),
                     "train/next_scale_prediction_accuracy": (
                         next_scale_prediction_correct
@@ -714,6 +761,9 @@ def main(config: DictConfig) -> None:
                     validation_loader,
                     use_mixed_precision,
                     max_batches=config.evaluation.max_batches,
+                    autoregressive_reconstruction_loss_weight=(
+                        autoregressive_reconstruction_loss_weight
+                    ),
                     next_scale_prediction_loss_weight=(
                         generative_loss_weights.next_scale_prediction
                     ),

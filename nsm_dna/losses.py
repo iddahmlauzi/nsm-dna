@@ -10,10 +10,11 @@ from .models.next_scale import NSMDNAOutput
 
 @dataclass(frozen=True)
 class NSMDNALosses:
-    """The four training objectives and per-scale prediction values."""
+    """Joint training objectives and per-scale prediction values."""
 
     total: Float[Tensor, ""]
     nucleotide_reconstruction: Float[Tensor, ""]
+    autoregressive_reconstruction: Float[Tensor, ""]
     vq: Float[Tensor, ""]
     next_scale_prediction: Float[Tensor, ""]
     next_scale_prediction_by_scale: list[Float[Tensor, ""]]
@@ -88,15 +89,28 @@ def nsm_dna_losses(
     output: NSMDNAOutput,
     target_ids: Int[Tensor, "batch target_length"],
     *,
+    autoregressive_reconstruction_loss_weight: float = 0.0,
     next_scale_prediction_loss_weight: float = 1.0,
     entropy_loss_weight: float = 1.0,
     entropy_temperature: float = 1.0,
 ) -> NSMDNALosses:
-    """Calculate nucleotide, VQ, next-scale, and codebook entropy losses."""
+    """Calculate reconstruction, APR, VQ, prediction, and entropy losses."""
     nucleotide_reconstruction = nucleotide_reconstruction_loss(
         output.reconstruction_logits,
         target_ids,
     )
+    if autoregressive_reconstruction_loss_weight == 0:
+        autoregressive_reconstruction = nucleotide_reconstruction.new_zeros(())
+    else:
+        if output.autoregressive_reconstruction_logits is None:
+            raise ValueError(
+                "APR logits are required when autoregressive reconstruction "
+                "has nonzero weight."
+            )
+        autoregressive_reconstruction = nucleotide_reconstruction_loss(
+            output.autoregressive_reconstruction_logits,
+            target_ids,
+        )
     (
         next_scale_prediction,
         next_scale_prediction_by_scale,
@@ -111,11 +125,14 @@ def nsm_dna_losses(
     return NSMDNALosses(
         total=(
             nucleotide_reconstruction
+            + autoregressive_reconstruction_loss_weight
+            * autoregressive_reconstruction
             + vq
             + next_scale_prediction_loss_weight * next_scale_prediction
             + entropy_loss_weight * entropy
         ),
         nucleotide_reconstruction=nucleotide_reconstruction,
+        autoregressive_reconstruction=autoregressive_reconstruction,
         vq=vq,
         next_scale_prediction=next_scale_prediction,
         next_scale_prediction_by_scale=next_scale_prediction_by_scale,

@@ -139,10 +139,15 @@ def test_total_loss_applies_generative_objective_weights() -> None:
     sequence_ids = _sequence_ids()
     target_ids = target_ids_from_sequence(sequence_ids, target_length=4)
 
-    output = model(sequence_ids, corruption_probability=0.1)
+    output = model(
+        sequence_ids,
+        corruption_probability=0.1,
+        return_autoregressive_reconstruction=True,
+    )
     losses = nsm_dna_losses(
         output,
         target_ids,
+        autoregressive_reconstruction_loss_weight=1.0,
         next_scale_prediction_loss_weight=8.0,
         entropy_loss_weight=2.0,
     )
@@ -159,6 +164,7 @@ def test_total_loss_applies_generative_objective_weights() -> None:
     torch.testing.assert_close(
         losses.total,
         losses.nucleotide_reconstruction
+        + losses.autoregressive_reconstruction
         + losses.vq
         + 8.0 * losses.next_scale_prediction
         + 2.0 * losses.entropy,
@@ -289,11 +295,13 @@ def test_validation_wandb_metrics_are_grouped_by_scale() -> None:
     } == {
         "validation/total_loss",
         "validation/nucleotide_reconstruction_loss",
+        "validation/autoregressive_reconstruction_loss",
         "validation/vq_loss",
         "validation/next_scale_prediction_loss",
         "validation/entropy_loss",
         "validation/rollout_nucleotide_loss",
         "validation/nucleotide_reconstruction_accuracy",
+        "validation/autoregressive_reconstruction_accuracy",
         "validation/next_scale_prediction_accuracy",
         "validation/rollout_nucleotide_accuracy",
         "validation/best_total_loss",
@@ -370,7 +378,7 @@ def test_default_config_matches_the_joint_training_contract() -> None:
 
     assert config.run.resume_from is None
     assert config.wandb.project == "nsm-dna-end-to-end"
-    assert config.wandb.name == "nsm-dna-end-to-end-genfirst"
+    assert config.wandb.name == "nsm-dna-end-to-end-neighbor-corruption-apr"
     assert config.data.subset_directory.endswith("gtdb/500M_subset")
     assert config.data.sequence_length == 256
     assert config.model.tokenizer.context_length == 128
@@ -386,6 +394,7 @@ def test_default_config_matches_the_joint_training_contract() -> None:
     assert config.optimizer.weight_decay == 0.05
     assert config.optimizer.max_gradient_norm == 1.0
     assert config.training.num_epochs == 2
+    assert config.training.autoregressive_reconstruction_loss_weight == 1.0
     assert config.training.entropy_temperature > 1.0
     assert config.training.loss_schedule.generation_first_fraction == 0.8
     assert (

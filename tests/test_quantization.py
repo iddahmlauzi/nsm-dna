@@ -123,6 +123,31 @@ def test_uncorrupted_inputs_match_hard_hierarchy_in_the_forward_pass() -> None:
         torch.testing.assert_close(actual, expected)
 
 
+def test_prediction_logits_use_hard_codes_with_soft_gradients() -> None:
+    quantizer = MultiscaleResidualVectorQuantizer(
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[8, 8, 8],
+        embed_dim=4,
+    ).eval()
+    logits_by_scale = [
+        torch.randn(2, scale_length, 8, requires_grad=True)
+        for scale_length in [1, 2, 4]
+    ]
+
+    predicted_latent = quantizer.prediction_logits_to_final_latent(
+        logits_by_scale
+    )
+    expected_latent = quantizer.indices_to_cumulative_latents(
+        [logits.argmax(dim=-1) for logits in logits_by_scale]
+    )[-1]
+
+    torch.testing.assert_close(predicted_latent, expected_latent)
+    predicted_latent.square().mean().backward()
+    assert all(logits.grad is not None for logits in logits_by_scale)
+    assert all(logits.grad.count_nonzero() > 0 for logits in logits_by_scale)
+    assert all(codebook.codebook.grad is None for codebook in quantizer.codebooks)
+
+
 def test_quantizer_rejects_invalid_corruption_probability() -> None:
     quantizer = MultiscaleResidualVectorQuantizer(
         scale_lengths=[1, 2],

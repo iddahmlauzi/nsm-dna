@@ -8,7 +8,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: nsm-dna-end-to-end
-  name: nsm-dna-end-to-end-genfirst
+  name: nsm-dna-end-to-end-neighbor-corruption-apr
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -71,6 +71,9 @@ mixed_precision:
   enabled: true
 
 training:
+  # APR decodes hard teacher-forced model predictions with straight-through
+  # gradients and applies the same nucleotide CE used for true-code reconstruction.
+  autoregressive_reconstruction_loss_weight: 1.0
   # This softens only the distribution used by the entropy loss. Hard code
   # selection, straight-through quantization, and EMA updates are unchanged.
   entropy_temperature: 16.0

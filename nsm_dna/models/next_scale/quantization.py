@@ -481,6 +481,46 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         scale_contribution = self.refiners[scale_index](scale_contribution)
         return einx.id("b d l -> b l d", scale_contribution)
 
+    def prediction_logits_to_final_latent(
+        self,
+        logits_by_scale: list[
+            Float[Tensor, "batch scale_length codebook_size"]
+        ],
+    ) -> Float[Tensor, "batch length embed_dim"]:
+        """Build a hard predicted hierarchy with soft prediction gradients.
+
+        APR must decode the codes actually selected by the next-scale model while
+        remaining differentiable with respect to its logits. Each scale therefore
+        uses argmax in the forward pass and softmax probabilities in the backward
+        pass, matching the straight-through construction used during quantization.
+        """
+        batch_size = logits_by_scale[0].shape[0]
+        reconstruction = self.codebooks[0].codebook.new_zeros(
+            batch_size,
+            self.scale_lengths[-1],
+            self.embed_dim,
+        )
+
+        for scale_index, (scale_logits, codebook) in enumerate(
+            zip(logits_by_scale, self.codebooks, strict=True)
+        ):
+            probabilities = torch.softmax(scale_logits.float(), dim=-1)
+            hard_indices = probabilities.argmax(dim=-1)
+            hard_assignments = F.one_hot(
+                hard_indices,
+                num_classes=codebook.codebook_size,
+            ).to(probabilities.dtype)
+            assignments = (
+                hard_assignments + probabilities - probabilities.detach()
+            )
+            predicted_codes = assignments @ codebook.codebook.detach().clone()
+            reconstruction = reconstruction + self._prepare_scale_contribution(
+                predicted_codes,
+                scale_index,
+            )
+
+        return reconstruction
+
     def _corrupt_quantized_vectors(
         self,
         quantized: Float[Tensor, "batch scale_length embed_dim"],

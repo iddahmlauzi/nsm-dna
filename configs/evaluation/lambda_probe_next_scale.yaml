@@ -1,7 +1,6 @@
-checkpoint: /workspace/runs/nsm-9scale-scale1-memory/checkpoints/final.pt
-tokenizer_checkpoint: /workspace/runs/vqvae-9scale-500m/checkpoints/final.pt
+checkpoint: /workspace/runs/nsm-dna-end-to-end-genfirst/checkpoints/final.pt
 dataset_directory: /workspace/datasets/lambda/LAMBDA/binary_segments_2k
-output_directory: /workspace/results/nsm-9scale-scale1-memory/lambda-probe-2k-first-scale-memory
+output_directory: /workspace/results/nsm-dna-end-to-end-genfirst/lambda-probe-2k
 
 expected_sequence_length: 2_000
 embedding_batch_size: 16

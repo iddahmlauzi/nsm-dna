@@ -23,7 +23,7 @@ from scripts.evaluation.lambda_probe_next_token import (
 
 
 class NSMWindowEncoder(nn.Module):
-    """Extract the final first-scale memory state for one NSM window."""
+    """Pool the final hidden states equally across NSM scales."""
 
     def __init__(self, model: NextScaleTransformer, tokenizer: MultiscaleTokenizer) -> None:
         super().__init__()
@@ -47,8 +47,20 @@ class NSMWindowEncoder(nn.Module):
             )
             hidden_states = self.model.encode(scale_inputs, prefix=prefix)
 
-        memory_token_index = prefix.shape[1]
-        return hidden_states[:, memory_token_index].float()
+        hierarchy_hidden_states = hidden_states[:, prefix.shape[1] :]
+        hidden_states_by_scale = torch.split(
+            hierarchy_hidden_states,
+            self.tokenizer.scale_lengths,
+            dim=1,
+        )
+        pooled_by_scale = torch.stack(
+            [
+                scale_hidden_states.mean(dim=1)
+                for scale_hidden_states in hidden_states_by_scale
+            ],
+            dim=1,
+        )
+        return pooled_by_scale.mean(dim=1).float()
 
 
 def segment_window_starts(
@@ -226,7 +238,6 @@ def main(config: DictConfig) -> None:
     device = torch.device(f"cuda:{device_ids[0]}")
     dataset_directory = Path(config.dataset_directory)
     checkpoint_path = Path(config.checkpoint)
-    tokenizer_checkpoint_path = Path(config.tokenizer_checkpoint)
     output_directory = Path(config.output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -240,17 +251,13 @@ def main(config: DictConfig) -> None:
         for name, path in split_paths.items()
     }
 
-    tokenizer = MultiscaleTokenizer.from_checkpoint(
-        tokenizer_checkpoint_path,
-        device,
-        frozen=True,
-    )
-    trained_model, checkpoint_step = NextScaleTransformer.from_checkpoint(
+    trained_system, checkpoint_step = NSMDNA.from_checkpoint(
         checkpoint_path,
-        tokenizer,
         device,
         frozen=True,
     )
+    tokenizer = trained_system.tokenizer
+    trained_model = trained_system.transformer
     model_config = OmegaConf.create(
         torch.load(checkpoint_path, map_location="cpu", weights_only=True)["config"]
     )
@@ -271,7 +278,7 @@ def main(config: DictConfig) -> None:
         output_directory,
         device,
     )
-    del trained_model
+    del trained_model, trained_system
     torch.cuda.empty_cache()
 
     random_seed = int(config.random_model_seed)
@@ -316,8 +323,6 @@ def main(config: DictConfig) -> None:
         "checkpoint_sha256": sha256(checkpoint_path),
         "checkpoint_step": checkpoint_step,
         "parameter_count": parameter_count,
-        "tokenizer_checkpoint": str(tokenizer_checkpoint_path),
-        "tokenizer_checkpoint_sha256": sha256(tokenizer_checkpoint_path),
         "dataset": "LAMBDA binary_segments_2k",
         "dataset_files": {
             name: {
@@ -329,9 +334,9 @@ def main(config: DictConfig) -> None:
             for name, path in split_paths.items()
         },
         "representation": (
-            "final normalized first-scale BOS state after the last NSM "
-            "transformer layer for each teacher-forced 128-base prefix and "
-            "128-base target window, then mean across windows"
+            "final normalized NSM hidden states, mean-pooled within each scale "
+            "and then equally across scales for each teacher-forced 128-base "
+            "prefix and 128-base target window, then mean across windows"
         ),
         "window_length": window_length,
         "window_stride": stride,

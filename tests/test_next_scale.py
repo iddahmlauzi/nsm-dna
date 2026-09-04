@@ -355,6 +355,7 @@ def test_forward_runs_the_complete_pipeline_in_one_model_call() -> None:
 
     assert encoder_calls == 1
     assert output.reconstruction_logits.shape == (2, 4, 4)
+    assert output.autoregressive_reconstruction_logits is None
     assert [logits.shape for logits in output.next_scale_logits_by_scale] == [
         (2, 1, 8),
         (2, 2, 8),
@@ -362,6 +363,35 @@ def test_forward_runs_the_complete_pipeline_in_one_model_call() -> None:
     ]
     assert len(output.quantizer.cumulative_latents) == 3
     assert len(output.quantizer.next_scale_inputs) == 2
+
+
+def test_forward_decodes_hard_predictions_with_soft_gradients_for_apr() -> None:
+    model = NSMDNA.from_config(_build_end_to_end_config())
+    output = model(
+        torch.tensor(
+            [
+                [0, 1, 2, 3, 3, 2, 1, 0],
+                [3, 2, 1, 0, 0, 1, 2, 3],
+            ]
+        ),
+        return_autoregressive_reconstruction=True,
+    )
+
+    assert output.autoregressive_reconstruction_logits is not None
+    assert output.autoregressive_reconstruction_logits.shape == (2, 4, 4)
+    output.autoregressive_reconstruction_logits.square().mean().backward()
+    assert any(
+        parameter.grad is not None and parameter.grad.count_nonzero() > 0
+        for parameter in model.transformer.parameters()
+    )
+    assert any(
+        parameter.grad is not None and parameter.grad.count_nonzero() > 0
+        for parameter in model.tokenizer.decoder.parameters()
+    )
+    assert all(
+        codebook.codebook.grad is None
+        for codebook in model.tokenizer.quantizer.codebooks
+    )
 
 
 def test_joint_loss_reaches_every_trainable_submodule() -> None:

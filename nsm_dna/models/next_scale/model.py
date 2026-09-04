@@ -17,6 +17,9 @@ class NSMDNAOutput:
     """Outputs from one joint tokenizer and next-scale forward pass."""
 
     reconstruction_logits: Float[Tensor, "batch target_length vocab_size"]
+    autoregressive_reconstruction_logits: (
+        Float[Tensor, "batch target_length vocab_size"] | None
+    )
     cumulative_reconstruction_logits_by_scale: list[
         Float[Tensor, "batch target_length vocab_size"]
     ] | None
@@ -133,6 +136,7 @@ class NSMDNA(nn.Module):
         corruption_probability: float = 0.0,
         *,
         return_cumulative_reconstructions: bool = False,
+        return_autoregressive_reconstruction: bool = False,
     ) -> NSMDNAOutput:
         prefix_latent, target_latent = self.tokenizer.encode_pair(sequence_ids)
         quantizer_output = self.tokenizer.quantize(
@@ -154,6 +158,16 @@ class NSMDNA(nn.Module):
         reconstruction_logits = self.tokenizer.decode_latent(
             quantizer_output.final_latent
         )
+        autoregressive_reconstruction_logits = None
+        if return_autoregressive_reconstruction:
+            predicted_latent = (
+                self.tokenizer.quantizer.prediction_logits_to_final_latent(
+                    next_scale_logits_by_scale
+                )
+            )
+            autoregressive_reconstruction_logits = self.tokenizer.decode_latent(
+                predicted_latent
+            )
         cumulative_reconstruction_logits_by_scale = None
         if return_cumulative_reconstructions:
             cumulative_reconstruction_logits_by_scale = [
@@ -164,6 +178,9 @@ class NSMDNA(nn.Module):
 
         return NSMDNAOutput(
             reconstruction_logits=reconstruction_logits,
+            autoregressive_reconstruction_logits=(
+                autoregressive_reconstruction_logits
+            ),
             cumulative_reconstruction_logits_by_scale=(
                 cumulative_reconstruction_logits_by_scale
             ),
