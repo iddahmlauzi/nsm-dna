@@ -237,7 +237,44 @@ def test_corruption_considers_only_the_twenty_nearest_alternatives(
     assert 1 <= corrupted.item() <= 20
 
 
-def test_full_corruption_blocks_input_gradients_and_preserves_ema() -> None:
+def test_corruption_exempts_supplied_scale_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quantizer = MultiscaleResidualVectorQuantizer(
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[8, 8, 8],
+        embed_dim=4,
+    ).eval()
+    corrupted_scale_indices = []
+    corrupt_quantized_vectors = quantizer._corrupt_quantized_vectors
+
+    def record_corrupted_scale(
+        quantized: torch.Tensor,
+        indices: torch.Tensor,
+        scale_index: int,
+        probability: float,
+    ) -> torch.Tensor:
+        corrupted_scale_indices.append(scale_index)
+        return corrupt_quantized_vectors(
+            quantized,
+            indices,
+            scale_index,
+            probability,
+        )
+
+    monkeypatch.setattr(
+        quantizer,
+        "_corrupt_quantized_vectors",
+        record_corrupted_scale,
+    )
+    output = quantizer(torch.randn(2, 4, 4), corruption_probability=1.0)
+    clean_inputs = quantizer.indices_to_next_scale_inputs(output.indices_by_scale)
+
+    assert corrupted_scale_indices == [1]
+    torch.testing.assert_close(output.next_scale_inputs[0], clean_inputs[0])
+
+
+def test_full_later_scale_corruption_preserves_scale_one_gradients_and_ema() -> None:
     clean_quantizer = MultiscaleResidualVectorQuantizer(
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
@@ -289,4 +326,5 @@ def test_full_corruption_blocks_input_gradients_and_preserves_ema() -> None:
     sum(
         scale_input.sum() for scale_input in corrupted_output.next_scale_inputs
     ).backward()
-    assert corrupted_latent.grad is None or corrupted_latent.grad.count_nonzero() == 0
+    assert corrupted_latent.grad is not None
+    assert corrupted_latent.grad.count_nonzero() > 0

@@ -101,8 +101,8 @@ training:
   num_epochs: 2
   # Set an integer here for a shorter diagnostic run.
   max_steps: null
-  # Replace 10% of supplied hierarchy codes with nearby codebook neighbors.
-  # Scale 1 remains observed, but this teaches scale 4 to tolerate local errors.
+  # Replace 10% of hierarchy codes from scale 4 onward with nearby neighbors.
+  # The supplied scale-1 code remains clean, matching conditioned rollout.
   input_code_corruption_probability: 0.1
   log_interval: 10
 

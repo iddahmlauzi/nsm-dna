@@ -646,12 +646,17 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             residual = residual - scale_contribution
 
             if scale_index < len(self.scale_lengths) - 1:
-                corrupted_quantized = self._corrupt_quantized_vectors(
-                    quantized_at_scale,
-                    scale_indices,
-                    scale_index,
-                    corruption_probability,
-                )
+                # Scale 1 is supplied exactly during conditioned rollout, so
+                # corrupting it would train scale 4 against an error it never sees.
+                if scale_index == 0:
+                    corrupted_quantized = quantized_at_scale
+                else:
+                    corrupted_quantized = self._corrupt_quantized_vectors(
+                        quantized_at_scale,
+                        scale_indices,
+                        scale_index,
+                        corruption_probability,
+                    )
                 if corrupted_quantized is quantized_at_scale:
                     corrupted_contribution = scale_contribution
                 else:
