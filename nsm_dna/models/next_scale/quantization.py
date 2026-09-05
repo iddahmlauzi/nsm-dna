@@ -22,9 +22,7 @@ class QuantizerOutput:
     assignment_probabilities_by_scale: list[
         Float[Tensor, "batch scale_length codebook_size"]
     ]
-    assignment_logits_by_scale: list[
-        Float[Tensor, "batch scale_length codebook_size"]
-    ]
+    assignment_logits_by_scale: list[Float[Tensor, "batch scale_length codebook_size"]]
     commitment_losses_by_scale: list[Float[Tensor, ""]]
     quantization_losses_by_scale: list[Float[Tensor, ""]]
     partial_latent: Float[Tensor, "batch length embed_dim"] | None = None
@@ -483,26 +481,21 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
 
     def prediction_logits_to_final_latent(
         self,
-        logits_by_scale: list[
-            Float[Tensor, "batch scale_length codebook_size"]
-        ],
+        logits_by_scale: list[Float[Tensor, "batch scale_length codebook_size"]],
+        *,
+        initial_latent: Float[Tensor, "batch length embed_dim"],
     ) -> Float[Tensor, "batch length embed_dim"]:
-        """Build a hard predicted hierarchy with soft prediction gradients.
+        """Add predicted refinement scales to the supplied first-scale latent.
 
-        APR must decode the codes actually selected by the next-scale model while
-        remaining differentiable with respect to its logits. Each scale therefore
-        uses argmax in the forward pass and softmax probabilities in the backward
-        pass, matching the straight-through construction used during quantization.
+        Scale 1 is observed rather than predicted. APR keeps that true coarse
+        contribution, then decodes the hard codes selected for scales 4 onward
+        while using their soft probabilities for transformer gradients.
         """
-        batch_size = logits_by_scale[0].shape[0]
-        reconstruction = self.codebooks[0].codebook.new_zeros(
-            batch_size,
-            self.scale_lengths[-1],
-            self.embed_dim,
-        )
+        reconstruction = initial_latent
 
         for scale_index, (scale_logits, codebook) in enumerate(
-            zip(logits_by_scale, self.codebooks, strict=True)
+            zip(logits_by_scale, self.codebooks[1:], strict=True),
+            start=1,
         ):
             probabilities = torch.softmax(scale_logits.float(), dim=-1)
             hard_indices = probabilities.argmax(dim=-1)
@@ -510,9 +503,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
                 hard_indices,
                 num_classes=codebook.codebook_size,
             ).to(probabilities.dtype)
-            assignments = (
-                hard_assignments + probabilities - probabilities.detach()
-            )
+            assignments = hard_assignments + probabilities - probabilities.detach()
             predicted_codes = assignments @ codebook.codebook.detach().clone()
             reconstruction = reconstruction + self._prepare_scale_contribution(
                 predicted_codes,

@@ -65,14 +65,13 @@ def test_scale_attention_mask_allows_only_the_current_scale() -> None:
 
     expected_mask = torch.tensor(
         [
-            [True, False, False, False, False, False],
-            [False, True, True, False, False, False],
-            [False, True, True, False, False, False],
-            [False, False, False, True, True, True],
-            [False, False, False, True, True, True],
-            [False, False, False, True, True, True],
+            [True, True, False, False, False],
+            [True, True, False, False, False],
+            [False, False, True, True, True],
+            [False, False, True, True, True],
+            [False, False, True, True, True],
         ]
-    ).reshape(1, 1, 6, 6)
+    ).reshape(1, 1, 5, 5)
 
     torch.testing.assert_close(model.scale_attention_mask, expected_mask)
 
@@ -91,13 +90,12 @@ def test_prefix_attention_mask_connects_prefix_directly_to_every_scale() -> None
 
     expected_mask = torch.tensor(
         [
-            [True, True, False, False, False],
-            [True, True, False, False, False],
-            [True, True, True, False, False],
-            [True, True, False, True, True],
-            [True, True, False, True, True],
+            [True, True, False, False],
+            [True, True, False, False],
+            [True, True, True, True],
+            [True, True, True, True],
         ]
-    ).reshape(1, 1, 5, 5)
+    ).reshape(1, 1, 4, 4)
 
     torch.testing.assert_close(model._build_attention_mask(2), expected_mask)
 
@@ -113,7 +111,7 @@ def test_scale_ids_match_hierarchy_sections() -> None:
         dropout=0.0,
     )
 
-    torch.testing.assert_close(model.scale_ids, torch.tensor([0, 1, 1, 2, 2, 2]))
+    torch.testing.assert_close(model.scale_ids, torch.tensor([0, 0, 1, 1, 1]))
 
 
 def test_rope_positions_reset_at_each_scale() -> None:
@@ -127,15 +125,15 @@ def test_rope_positions_reset_at_each_scale() -> None:
         dropout=0.0,
     )
 
-    zero_positions = torch.tensor([0, 1, 3])
+    zero_positions = torch.tensor([0, 2])
 
     torch.testing.assert_close(
         model.rope_cosine[zero_positions],
-        torch.ones(3, 4),
+        torch.ones(2, 4),
     )
     torch.testing.assert_close(
         model.rope_sine[zero_positions],
-        torch.zeros(3, 4),
+        torch.zeros(2, 4),
     )
 
 
@@ -217,7 +215,7 @@ def test_nsm_scales_residual_projection_initialization() -> None:
         )
 
 
-def test_nsm_prepends_learned_bos() -> None:
+def test_nsm_uses_supplied_first_scale_to_predict_later_scales() -> None:
     model = NextScaleTransformer(
         input_dim=3,
         model_dim=8,
@@ -231,18 +229,16 @@ def test_nsm_prepends_learned_bos() -> None:
 
     model_inputs = model(scale_inputs)
 
-    expected_bos = model.bos.expand(2, -1, -1)
     projected_scale_inputs = torch.cat(
         [model.input_projection(scale_input) for scale_input in scale_inputs],
         dim=1,
     )
     expected_hidden_states = model.final_norm(
-        torch.cat([expected_bos, projected_scale_inputs], dim=1)
-        + model.scale_embedding(model.scale_ids)
+        projected_scale_inputs + model.scale_embedding(model.scale_ids)
     )
     expected_logits = model.output_head(expected_hidden_states)
 
-    assert model_inputs.shape == (2, 6, 5)
+    assert model_inputs.shape == (2, 5, 5)
     torch.testing.assert_close(model_inputs, expected_logits)
 
 
@@ -263,8 +259,8 @@ def test_nsm_returns_only_hierarchy_logits_when_prefix_is_present() -> None:
     hidden_states = model.encode(scale_inputs, prefix=prefix)
     logits = model(scale_inputs, prefix=prefix)
 
-    assert hidden_states.shape == (2, 10, 8)
-    assert logits.shape == (2, 6, 5)
+    assert hidden_states.shape == (2, 9, 8)
+    assert logits.shape == (2, 5, 5)
     torch.testing.assert_close(logits, model.output_head(hidden_states[:, 4:]))
 
 
@@ -272,7 +268,7 @@ def test_nsm_transformer_keeps_scale_sections_isolated() -> None:
     model = NextScaleTransformer(
         input_dim=3,
         model_dim=8,
-        scale_lengths=[1, 2],
+        scale_lengths=[1, 2, 3],
         codebook_size=5,
         num_layers=1,
         num_heads=2,
@@ -280,15 +276,15 @@ def test_nsm_transformer_keeps_scale_sections_isolated() -> None:
     )
     model.eval()
 
-    x = [torch.randn(1, 2, 3)]
-    x_with_changed_second_scale = [x[0] + 10.0]
+    x = [torch.randn(1, 2, 3), torch.randn(1, 3, 3)]
+    x_with_changed_second_scale = [x[0], x[1] + 10.0]
 
     output = model(x)
     output_with_changed_second_scale = model(x_with_changed_second_scale)
 
     torch.testing.assert_close(
-        output[:, :1],
-        output_with_changed_second_scale[:, :1],
+        output[:, :2],
+        output_with_changed_second_scale[:, :2],
     )
 
 
@@ -328,7 +324,7 @@ def _build_end_to_end_config():
                     "head_hidden_multiplier": 2.0,
                     "input_refinement_kernel_size": 3,
                 },
-            }
+            },
         }
     )
 
@@ -355,9 +351,9 @@ def test_forward_runs_the_complete_pipeline_in_one_model_call() -> None:
 
     assert encoder_calls == 1
     assert output.reconstruction_logits.shape == (2, 4, 4)
+    assert output.partial_reconstruction_logits is None
     assert output.autoregressive_reconstruction_logits is None
     assert [logits.shape for logits in output.next_scale_logits_by_scale] == [
-        (2, 1, 8),
         (2, 2, 8),
         (2, 4, 8),
     ]
@@ -394,38 +390,33 @@ def test_forward_decodes_hard_predictions_with_soft_gradients_for_apr() -> None:
     )
 
 
-def test_forward_can_condition_on_detached_model_predictions() -> None:
-    model = NSMDNA.from_config(_build_end_to_end_config()).eval()
-    sequence_ids = torch.tensor(
-        [
-            [0, 1, 2, 3, 3, 2, 1, 0],
-            [3, 2, 1, 0, 0, 1, 2, 3],
-        ]
-    )
-    transformer_calls = 0
-
-    def count_transformer_call(_module, _inputs, _output) -> None:
-        nonlocal transformer_calls
-        transformer_calls += 1
-
-    hook = model.transformer.register_forward_hook(count_transformer_call)
-    output = model(sequence_ids, self_conditioning_probability=1.0)
-    hook.remove()
-
-    assert transformer_calls == 2
-    assert [logits.shape for logits in output.next_scale_logits_by_scale] == [
-        (2, 1, 8),
-        (2, 2, 8),
-        (2, 4, 8),
-    ]
-
-
-def test_forward_rejects_invalid_self_conditioning_probability() -> None:
+def test_forward_decodes_one_true_partial_cumulative_latent() -> None:
     model = NSMDNA.from_config(_build_end_to_end_config())
-    sequence_ids = torch.tensor([[0, 1, 2, 3, 3, 2, 1, 0]])
+    output = model(
+        torch.tensor(
+            [
+                [0, 1, 2, 3, 3, 2, 1, 0],
+                [3, 2, 1, 0, 0, 1, 2, 3],
+            ]
+        ),
+        return_partial_reconstruction=True,
+    )
 
-    with pytest.raises(ValueError, match="Self-conditioning probability"):
-        model(sequence_ids, self_conditioning_probability=1.1)
+    assert output.partial_reconstruction_logits is not None
+    assert output.partial_reconstruction_logits.shape == (2, 4, 4)
+    output.partial_reconstruction_logits.square().mean().backward()
+    assert any(
+        parameter.grad is not None and parameter.grad.count_nonzero() > 0
+        for parameter in model.tokenizer.encoder.parameters()
+    )
+    assert any(
+        parameter.grad is not None and parameter.grad.count_nonzero() > 0
+        for parameter in model.tokenizer.quantizer.parameters()
+    )
+    assert any(
+        parameter.grad is not None and parameter.grad.count_nonzero() > 0
+        for parameter in model.tokenizer.decoder.parameters()
+    )
 
 
 def test_joint_loss_reaches_every_trainable_submodule() -> None:
@@ -490,8 +481,12 @@ def test_complete_model_checkpoint_is_restored_and_frozen(tmp_path: Path) -> Non
 
 def test_generate_predicts_and_decodes_a_hard_hierarchy() -> None:
     model = NSMDNA.from_config(_build_end_to_end_config()).eval()
+    first_scale_indices = torch.tensor([[1], [2]])
 
-    generation = model.generate(torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]]))
+    generation = model.generate(
+        torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]]),
+        first_scale_indices,
+    )
 
     assert generation.nucleotide_logits.shape == (2, 4, 4)
     assert [indices.shape for indices in generation.indices_by_scale] == [
@@ -499,6 +494,10 @@ def test_generate_predicts_and_decodes_a_hard_hierarchy() -> None:
         (2, 2),
         (2, 4),
     ]
+    torch.testing.assert_close(
+        generation.indices_by_scale[0],
+        first_scale_indices,
+    )
 
 
 def test_forward_accepts_a_prefix_shorter_than_the_target() -> None:

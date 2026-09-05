@@ -23,9 +23,11 @@ from scripts.evaluation.lambda_probe_next_token import (
 
 
 class NSMWindowEncoder(nn.Module):
-    """Pool the final hidden states equally across NSM scales."""
+    """Preserve the prefix and each scale as separate pooled features."""
 
-    def __init__(self, model: NextScaleTransformer, tokenizer: MultiscaleTokenizer) -> None:
+    def __init__(
+        self, model: NextScaleTransformer, tokenizer: MultiscaleTokenizer
+    ) -> None:
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
@@ -42,25 +44,25 @@ class NSMWindowEncoder(nn.Module):
         ):
             prefix = self.tokenizer.encode(prefix_ids)
             targets_by_scale = self.tokenizer.encode_indices(target_ids)
-            scale_inputs = self.tokenizer.indices_to_next_scale_inputs(
-                targets_by_scale
-            )
+            scale_inputs = self.tokenizer.indices_to_next_scale_inputs(targets_by_scale)
             hidden_states = self.model.encode(scale_inputs, prefix=prefix)
 
+        prefix_hidden_states = hidden_states[:, : prefix.shape[1]]
         hierarchy_hidden_states = hidden_states[:, prefix.shape[1] :]
         hidden_states_by_scale = torch.split(
             hierarchy_hidden_states,
-            self.tokenizer.scale_lengths,
+            self.tokenizer.scale_lengths[1:],
             dim=1,
         )
-        pooled_by_scale = torch.stack(
+        pooled_by_scale = torch.cat(
             [
                 scale_hidden_states.mean(dim=1)
                 for scale_hidden_states in hidden_states_by_scale
             ],
             dim=1,
         )
-        return pooled_by_scale.mean(dim=1).float()
+        pooled_prefix = prefix_hidden_states.mean(dim=1)
+        return torch.cat([pooled_prefix, pooled_by_scale], dim=1).float()
 
 
 def segment_window_starts(
@@ -88,7 +90,7 @@ def extract_segment_embeddings(
     *,
     description: str,
 ) -> np.ndarray:
-    """Average final first-scale memory states across each 2 kb segment."""
+    """Average window representations across each 2 kb segment."""
     embeddings = np.empty((len(sequences), model_dim), dtype=np.float32)
     window_starts = segment_window_starts(
         len(sequences[0]),
@@ -177,25 +179,26 @@ def evaluate_probes(
     return results
 
 
-def evaluate_representation(
+def evaluate_representations(
     name: str,
     encoder: nn.Module,
-    embedding_dim: int,
+    model_dim: int,
+    scale_lengths: list[int],
     window_length: int,
     stride: int,
     splits: dict[str, LambdaSplit],
     config: DictConfig,
     output_directory: Path,
     device: torch.device,
-) -> dict[str, object]:
-    """Extract one NSM representation and run the requested probes."""
+) -> dict[str, dict[str, object]]:
+    """Extract all pooled NSM sections once and probe them separately."""
     split_names = ["train", "test"]
     if bool(config.evaluate_three_layer_probe):
         split_names.insert(1, "validation")
-    embeddings = {
+    combined_embeddings = {
         split_name: extract_segment_embeddings(
             encoder,
-            embedding_dim,
+            (len(scale_lengths) + 1) * model_dim,
             window_length,
             stride,
             splits[split_name].sequences,
@@ -205,14 +208,39 @@ def evaluate_representation(
         )
         for split_name in split_names
     }
-    return evaluate_probes(
-        name,
-        embeddings,
-        splits,
-        config,
-        output_directory,
-        device,
-    )
+
+    representations = {
+        "prefix": {
+            split_name: embeddings[:, :model_dim]
+            for split_name, embeddings in combined_embeddings.items()
+        }
+    }
+    for scale_index, scale_length in enumerate(scale_lengths):
+        section_start = (scale_index + 1) * model_dim
+        section_end = section_start + model_dim
+        representations[f"scale_length_{scale_length}"] = {
+            split_name: embeddings[:, section_start:section_end]
+            for split_name, embeddings in combined_embeddings.items()
+        }
+
+    configured_names = getattr(config, "representation_names", None)
+    if configured_names is not None:
+        representations = {
+            representation_name: representations[representation_name]
+            for representation_name in configured_names
+        }
+
+    return {
+        representation_name: evaluate_probes(
+            f"{name}_{representation_name}",
+            embeddings,
+            splits,
+            config,
+            output_directory,
+            device,
+        )
+        for representation_name, embeddings in representations.items()
+    }
 
 
 def build_parallel_encoder(
@@ -267,14 +295,13 @@ def main(config: DictConfig) -> None:
     )
     window_length = int(model_config.data.sequence_length)
     stride = tokenizer.context_length
-    parameter_count = sum(
-        parameter.numel() for parameter in trained_model.parameters()
-    )
+    parameter_count = sum(parameter.numel() for parameter in trained_model.parameters())
 
-    trained_results = evaluate_representation(
+    trained_results = evaluate_representations(
         "trained",
         build_parallel_encoder(trained_model, tokenizer, device_ids),
         trained_model.model_dim,
+        tokenizer.scale_lengths[1:],
         window_length,
         stride,
         splits,
@@ -294,10 +321,11 @@ def main(config: DictConfig) -> None:
         random_model.eval()
         random_model.requires_grad_(False)
         random_name = f"random_seed_{random_seed}"
-        random_results = evaluate_representation(
+        random_results = evaluate_representations(
             random_name,
             build_parallel_encoder(random_model, tokenizer, device_ids),
             random_model.model_dim,
+            tokenizer.scale_lengths[1:],
             window_length,
             stride,
             splits,
@@ -307,11 +335,14 @@ def main(config: DictConfig) -> None:
         )
         results[random_name] = random_results
         results["delta_mcc"] = {
-            probe_name: (
-                trained_results[probe_name]["mcc"]
-                - random_results[probe_name]["mcc"]
-            )
-            for probe_name in trained_results
+            representation_name: {
+                probe_name: (
+                    trained_results[representation_name][probe_name]["mcc"]
+                    - random_results[representation_name][probe_name]["mcc"]
+                )
+                for probe_name in trained_results[representation_name]
+            }
+            for representation_name in trained_results
         }
     window_starts = segment_window_starts(
         int(config.expected_sequence_length),
@@ -334,11 +365,20 @@ def main(config: DictConfig) -> None:
             }
             for name, path in split_paths.items()
         },
-        "representation": (
-            "final normalized NSM hidden states, mean-pooled within each scale "
-            "and then equally across scales for each teacher-forced 128-base "
-            "prefix and 128-base target window, then mean across windows"
-        ),
+        "representations": {
+            "prefix": (
+                "final normalized NSM prefix hidden states, mean-pooled within "
+                "each window and then across windows"
+            ),
+            **{
+                f"scale_length_{scale_length}": (
+                    "final normalized NSM hidden states for the teacher-forced "
+                    f"length-{scale_length} scale, mean-pooled within each "
+                    "window and then across windows"
+                )
+                for scale_length in tokenizer.scale_lengths[1:]
+            },
+        },
         "window_length": window_length,
         "window_stride": stride,
         "window_starts": window_starts,

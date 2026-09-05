@@ -122,6 +122,7 @@ class NextScaleTransformer(nn.Module):
         self.input_dim = input_dim
         self.model_dim = model_dim
         self.scale_lengths = list(scale_lengths)
+        self.predicted_scale_lengths = self.scale_lengths[1:]
         self.codebook_size = codebook_size
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -141,7 +142,7 @@ class NextScaleTransformer(nn.Module):
                     padding=self.input_refinement_kernel_size // 2,
                     bias=bias,
                 )
-                for _ in self.scale_lengths[1:]
+                for _ in self.predicted_scale_lengths
             ]
         )
 
@@ -158,16 +159,13 @@ class NextScaleTransformer(nn.Module):
             bias=bias,
         )
 
-        # The first scale has no preceding reconstruction to use as input, so
-        # it receives learned BOS embeddings in model space.
-        self.bos = nn.Parameter(
-            torch.empty(1, self.scale_lengths[0], self.model_dim)
+        # Scale 1 is supplied as the cumulative input used to predict scale 4.
+        # The transformer therefore has one section for each predicted scale,
+        # rather than a learned BOS section for scale 1.
+        self.scale_embedding = nn.Embedding(
+            len(self.predicted_scale_lengths),
+            self.model_dim,
         )
-        nn.init.normal_(self.bos, mean=0.0, std=0.02)
-
-        # Reset RoPE positions do not identify the scale, so add one learned
-        # model-space vector per scale to the hierarchy hidden states.
-        self.scale_embedding = nn.Embedding(len(self.scale_lengths), self.model_dim)
         nn.init.normal_(self.scale_embedding.weight, mean=0.0, std=0.02)
 
         # Each scale input already contains the cumulative reconstruction from
@@ -175,7 +173,7 @@ class NextScaleTransformer(nn.Module):
         scale_ids = torch.cat(
             [
                 torch.full((scale_length,), scale_index)
-                for scale_index, scale_length in enumerate(self.scale_lengths)
+                for scale_index, scale_length in enumerate(self.predicted_scale_lengths)
             ]
         )
         self.register_buffer("scale_ids", scale_ids, persistent=False)
@@ -195,7 +193,10 @@ class NextScaleTransformer(nn.Module):
         # Block-diagonal scale sections use independent position ranges, so
         # RoPE restarts from position zero at every scale.
         rope_positions = torch.cat(
-            [torch.arange(scale_length) for scale_length in self.scale_lengths]
+            [
+                torch.arange(scale_length)
+                for scale_length in self.predicted_scale_lengths
+            ]
         )
         head_dim = self.model_dim // self.num_heads
         rope_cosine, rope_sine = precompute_rope_cosine_and_sine(
@@ -353,23 +354,13 @@ class NextScaleTransformer(nn.Module):
 
         projected_inputs = self.input_projection(combined_inputs)
         prefix_hidden_states = projected_inputs[:, :prefix_length]
-        later_scale_hidden_states = projected_inputs[:, prefix_length:]
-
-        first_scale_hidden_states = self.bos.expand(
-            projected_inputs.shape[0],
-            -1,
-            -1,
-        )
-        hierarchy_hidden_states = torch.cat(
-            [first_scale_hidden_states, later_scale_hidden_states],
-            dim=1,
-        )
+        hierarchy_hidden_states = projected_inputs[:, prefix_length:]
         hierarchy_hidden_states = hierarchy_hidden_states + self.scale_embedding(
             self.scale_ids
         )
 
-        # The prefix comes first in the Transformer sequence; BOS begins the
-        # target hierarchy and is followed by the remaining scale inputs.
+        # The prefix comes first. Each following section is the supplied
+        # cumulative hierarchy through the scale preceding its prediction.
         hidden_states = torch.cat(
             [prefix_hidden_states, hierarchy_hidden_states],
             dim=1,
@@ -396,4 +387,3 @@ class NextScaleTransformer(nn.Module):
         prefix_length = 0 if prefix is None else prefix.shape[1]
         hierarchy_hidden_states = hidden_states[:, prefix_length:]
         return self.output_head(hierarchy_hidden_states)
-

@@ -14,6 +14,7 @@ class NSMDNALosses:
 
     total: Float[Tensor, ""]
     nucleotide_reconstruction: Float[Tensor, ""]
+    partial_reconstruction: Float[Tensor, ""]
     autoregressive_reconstruction: Float[Tensor, ""]
     vq: Float[Tensor, ""]
     next_scale_prediction: Float[Tensor, ""]
@@ -30,9 +31,7 @@ def nucleotide_reconstruction_loss(
 
 
 def next_scale_prediction_loss(
-    logits_by_scale: list[
-        Float[Tensor, "batch scale_length codebook_size"]
-    ],
+    logits_by_scale: list[Float[Tensor, "batch scale_length codebook_size"]],
     targets_by_scale: list[Int[Tensor, "batch scale_length"]],
 ) -> tuple[Float[Tensor, ""], list[Float[Tensor, ""]]]:
     """Average token cross-entropy within each scale, then across scales."""
@@ -48,9 +47,7 @@ def next_scale_prediction_loss(
 
 
 def codebook_entropy_loss(
-    assignment_logits_by_scale: list[
-        Float[Tensor, "batch scale_length codebook_size"]
-    ],
+    assignment_logits_by_scale: list[Float[Tensor, "batch scale_length codebook_size"]],
     temperature: float,
 ) -> Float[Tensor, ""]:
     """Favor confident assignments and diverse aggregate code use at every scale."""
@@ -68,14 +65,13 @@ def codebook_entropy_loss(
         )
         flat_probabilities = probabilities.flatten(0, 1)
         log_probabilities = torch.log(flat_probabilities.clamp_min(1e-10))
-        mean_assignment_entropy = -(
-            flat_probabilities * log_probabilities
-        ).sum(dim=-1).mean()
+        mean_assignment_entropy = (
+            -(flat_probabilities * log_probabilities).sum(dim=-1).mean()
+        )
 
         marginal_probabilities = flat_probabilities.mean(dim=0)
         marginal_entropy = -(
-            marginal_probabilities
-            * torch.log(marginal_probabilities.clamp_min(1e-10))
+            marginal_probabilities * torch.log(marginal_probabilities.clamp_min(1e-10))
         ).sum()
 
         # Minimizing the difference keeps each individual assignment sharp while
@@ -89,16 +85,41 @@ def nsm_dna_losses(
     output: NSMDNAOutput,
     target_ids: Int[Tensor, "batch target_length"],
     *,
+    partial_reconstruction_loss_weight: float = 0.0,
     autoregressive_reconstruction_loss_weight: float = 0.0,
     next_scale_prediction_loss_weight: float = 1.0,
     entropy_loss_weight: float = 1.0,
     entropy_temperature: float = 1.0,
 ) -> NSMDNALosses:
-    """Calculate reconstruction, APR, VQ, prediction, and entropy losses."""
+    """Calculate final, partial, APR, VQ, prediction, and entropy losses."""
     nucleotide_reconstruction = nucleotide_reconstruction_loss(
         output.reconstruction_logits,
         target_ids,
     )
+    if partial_reconstruction_loss_weight == 0:
+        partial_reconstruction = nucleotide_reconstruction.new_zeros(())
+    elif output.partial_reconstruction_logits is not None:
+        # Training samples one non-final cumulative latent so this auxiliary
+        # objective costs only one additional decoder pass per batch.
+        partial_reconstruction = nucleotide_reconstruction_loss(
+            output.partial_reconstruction_logits,
+            target_ids,
+        )
+    else:
+        cumulative_logits = output.cumulative_reconstruction_logits_by_scale
+        if cumulative_logits is None or len(cumulative_logits) < 2:
+            raise ValueError(
+                "Partial or cumulative reconstruction logits are required when "
+                "partial reconstruction has nonzero weight."
+            )
+        # Validation already decodes every cumulative latent. Their non-final
+        # mean is the exact expectation of uniform scale sampling in training.
+        partial_reconstruction = torch.stack(
+            [
+                nucleotide_reconstruction_loss(scale_logits, target_ids)
+                for scale_logits in cumulative_logits[:-1]
+            ]
+        ).mean()
     if autoregressive_reconstruction_loss_weight == 0:
         autoregressive_reconstruction = nucleotide_reconstruction.new_zeros(())
     else:
@@ -115,7 +136,8 @@ def nsm_dna_losses(
         next_scale_prediction,
         next_scale_prediction_by_scale,
     ) = next_scale_prediction_loss(
-        output.next_scale_logits_by_scale, output.quantizer.indices_by_scale
+        output.next_scale_logits_by_scale,
+        output.quantizer.indices_by_scale[1:],
     )
     entropy = codebook_entropy_loss(
         output.quantizer.assignment_logits_by_scale,
@@ -125,13 +147,14 @@ def nsm_dna_losses(
     return NSMDNALosses(
         total=(
             nucleotide_reconstruction
-            + autoregressive_reconstruction_loss_weight
-            * autoregressive_reconstruction
+            + partial_reconstruction_loss_weight * partial_reconstruction
+            + autoregressive_reconstruction_loss_weight * autoregressive_reconstruction
             + vq
             + next_scale_prediction_loss_weight * next_scale_prediction
             + entropy_loss_weight * entropy
         ),
         nucleotide_reconstruction=nucleotide_reconstruction,
+        partial_reconstruction=partial_reconstruction,
         autoregressive_reconstruction=autoregressive_reconstruction,
         vq=vq,
         next_scale_prediction=next_scale_prediction,

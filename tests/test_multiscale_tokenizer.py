@@ -10,7 +10,13 @@ from nsm_dna.models.next_scale.tokenizer import Decoder, Encoder
 
 
 def test_encoder_uses_token_embeddings_without_absolute_positions() -> None:
-    encoder = Encoder(vocab_size=4, embed_dim=4, dropout=0.0)
+    encoder = Encoder(
+        vocab_size=4,
+        context_length=4,
+        embed_dim=4,
+        num_heads=1,
+        dropout=0.0,
+    )
     with torch.no_grad():
         encoder.token_embedding.weight.copy_(torch.eye(4))
 
@@ -21,6 +27,26 @@ def test_encoder_uses_token_embeddings_without_absolute_positions() -> None:
     shifted_embeddings = encoder(shifted_sequence)
 
     torch.testing.assert_close(first_embeddings[:, :3], shifted_embeddings[:, 1:])
+
+
+def test_contextual_encoder_mixes_information_within_one_block() -> None:
+    torch.manual_seed(0)
+    encoder = Encoder(
+        vocab_size=4,
+        context_length=4,
+        embed_dim=8,
+        num_heads=2,
+        num_layers=1,
+        dropout=0.0,
+    ).eval()
+
+    first_sequence = torch.tensor([[0, 1, 2, 3]])
+    changed_sequence = torch.tensor([[0, 1, 2, 0]])
+
+    first_latent = encoder(first_sequence)
+    changed_latent = encoder(changed_sequence)
+
+    assert not torch.allclose(first_latent[:, 0], changed_latent[:, 0])
 
 
 def test_decoder_supplies_rope_to_attention() -> None:
@@ -148,6 +174,7 @@ def test_encode_pair_normalizes_prefix_and_target_independently() -> None:
         num_heads=2,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
+        encoder_num_layers=1,
         encoder_dropout=0.0,
         decoder_dropout=0.0,
         pre_quant_num_groups=2,
@@ -236,74 +263,3 @@ def test_partial_reconstruction_uses_differentiable_assignments() -> None:
         parameter.grad is not None and parameter.grad.count_nonzero() > 0
         for parameter in model.decoder.parameters()
     )
-
-
-def test_partial_reconstruction_uses_separate_gradient_scales() -> None:
-    def build_model() -> MultiscaleTokenizer:
-        return MultiscaleTokenizer(
-            vocab_size=4,
-            context_length=4,
-            embed_dim=8,
-            num_heads=2,
-            scale_lengths=[1, 2, 4],
-            codebook_sizes=[8, 8, 8],
-            encoder_dropout=0.0,
-            decoder_dropout=0.0,
-            pre_quant_num_groups=2,
-        ).eval()
-
-    def partial_gradients(
-        model: MultiscaleTokenizer,
-        token_ids: torch.Tensor,
-        *,
-        loss_weight: float,
-        latent_gradient_scale: float,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        torch.manual_seed(0)
-        _, partial_logits, _, _ = model(
-            token_ids,
-            include_partial_reconstruction=True,
-            partial_latent_gradient_scale=latent_gradient_scale,
-        )
-        assert partial_logits is not None
-        partial_loss = F.cross_entropy(
-            partial_logits.flatten(0, 1),
-            token_ids.flatten(),
-        )
-        (loss_weight * partial_loss).backward()
-        quantizer_gradients = [
-            parameter.grad.detach().clone()
-            for parameter in model.quantizer.parameters()
-            if parameter.grad is not None
-        ]
-        decoder_gradients = [
-            parameter.grad.detach().clone()
-            for parameter in model.decoder.parameters()
-            if parameter.grad is not None
-        ]
-        return quantizer_gradients, decoder_gradients
-
-    baseline_model = build_model()
-    split_model = build_model()
-    split_model.load_state_dict(baseline_model.state_dict())
-    token_ids = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
-
-    baseline_quantizer, baseline_decoder = partial_gradients(
-        baseline_model,
-        token_ids,
-        loss_weight=1.0,
-        latent_gradient_scale=1.0,
-    )
-    split_quantizer, split_decoder = partial_gradients(
-        split_model,
-        token_ids,
-        loss_weight=0.01,
-        latent_gradient_scale=20.0,
-    )
-
-    assert len(baseline_quantizer) == len(split_quantizer)
-    assert len(baseline_decoder) == len(split_decoder)
-    for baseline_gradient, split_gradient in zip(baseline_quantizer, split_quantizer):
-        torch.testing.assert_close(split_gradient, 0.2 * baseline_gradient)
-    for baseline_gradient, split_gradient in zip(baseline_decoder, split_decoder):
-        torch.testing.assert_close(split_gradient, 0.01 * baseline_gradient)

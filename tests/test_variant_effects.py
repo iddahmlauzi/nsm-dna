@@ -79,13 +79,13 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
 
     hierarchy_scores, decoder_scores = score_token_ids(model, tokenizer, input_ids)
 
-    expected_hierarchy_scores = torch.zeros(2, 3, dtype=torch.float64)
+    expected_hierarchy_scores = torch.zeros(2, 2, dtype=torch.float64)
     expected_decoder_scores = torch.zeros(2, dtype=torch.float64)
     for prediction in prepare_block_predictions(tokenizer, input_ids):
         logits = model(prediction.scale_inputs, prefix=prediction.prefix)
-        logits_by_scale = torch.split(logits, tokenizer.scale_lengths, dim=1)
+        logits_by_scale = torch.split(logits, tokenizer.scale_lengths[1:], dim=1)
         for scale_index, (scale_logits, scale_targets) in enumerate(
-            zip(logits_by_scale, prediction.targets_by_scale)
+            zip(logits_by_scale, prediction.targets_by_scale[1:], strict=True)
         ):
             scale_losses = F.cross_entropy(
                 scale_logits.flatten(0, 1),
@@ -123,7 +123,7 @@ def test_sequence_score_supports_target_without_prefix() -> None:
 
     hierarchy_scores, decoder_scores = score_token_ids(model, tokenizer, input_ids)
 
-    assert hierarchy_scores.shape == (2, 3)
+    assert hierarchy_scores.shape == (2, 2)
     assert decoder_scores.shape == (2,)
     assert torch.isfinite(hierarchy_scores).all()
     assert torch.isfinite(decoder_scores).all()

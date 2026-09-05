@@ -15,13 +15,14 @@ from nsm_dna.models.next_scale import NSMDNA
 from nsm_dna.training import (
     GenFirstLossSchedule,
     GenerativeLossWeights,
-    LinearSelfConditioningSchedule,
     build_learning_rate_scheduler,
+    load_model_checkpoint,
     load_training_checkpoint,
     save_training_checkpoint,
 )
 from scripts.training.train_nsm import (
     _validation_metrics_for_wandb,
+    configure_training_phase,
     evaluate,
     target_ids_from_sequence,
 )
@@ -143,11 +144,13 @@ def test_total_loss_applies_generative_objective_weights() -> None:
     output = model(
         sequence_ids,
         corruption_probability=0.1,
+        return_partial_reconstruction=True,
         return_autoregressive_reconstruction=True,
     )
     losses = nsm_dna_losses(
         output,
         target_ids,
+        partial_reconstruction_loss_weight=0.1,
         autoregressive_reconstruction_loss_weight=1.0,
         next_scale_prediction_loss_weight=8.0,
         entropy_loss_weight=2.0,
@@ -165,10 +168,37 @@ def test_total_loss_applies_generative_objective_weights() -> None:
     torch.testing.assert_close(
         losses.total,
         losses.nucleotide_reconstruction
+        + 0.1 * losses.partial_reconstruction
         + losses.autoregressive_reconstruction
         + losses.vq
         + 8.0 * losses.next_scale_prediction
         + 2.0 * losses.entropy,
+    )
+
+
+def test_validation_partial_loss_averages_nonfinal_scales() -> None:
+    model = NSMDNA.from_config(_build_config()).eval()
+    sequence_ids = _sequence_ids()
+    target_ids = target_ids_from_sequence(sequence_ids, target_length=4)
+    output = model(sequence_ids, return_cumulative_reconstructions=True)
+
+    losses = nsm_dna_losses(
+        output,
+        target_ids,
+        partial_reconstruction_loss_weight=0.1,
+    )
+
+    cumulative_logits = output.cumulative_reconstruction_logits_by_scale
+    assert cumulative_logits is not None
+    expected_partial_loss = torch.stack(
+        [
+            F.cross_entropy(scale_logits.flatten(0, 1), target_ids.flatten())
+            for scale_logits in cumulative_logits[:-1]
+        ]
+    ).mean()
+    torch.testing.assert_close(
+        losses.partial_reconstruction,
+        expected_partial_loss,
     )
 
 
@@ -205,20 +235,6 @@ def test_genfirst_schedule_rejects_invalid_configuration() -> None:
             generation_first_weights=weights,
             refinement_weights=weights,
         )
-
-
-def test_self_conditioning_schedule_ramps_then_holds() -> None:
-    schedule = LinearSelfConditioningSchedule(
-        total_steps=10,
-        ramp_fraction=0.5,
-        max_probability=0.5,
-    )
-
-    assert schedule.ramp_steps == 5
-    assert schedule.probability_at_step(1) == 0.0
-    assert schedule.probability_at_step(3) == 0.25
-    assert schedule.probability_at_step(5) == 0.5
-    assert schedule.probability_at_step(10) == 0.5
 
 
 def test_one_optimizer_step_updates_the_joint_model() -> None:
@@ -263,6 +279,46 @@ def test_one_optimizer_step_updates_the_joint_model() -> None:
     )
 
 
+def test_frozen_hierarchy_phase_trains_only_the_transformer() -> None:
+    model = NSMDNA.from_config(_build_config())
+    configure_training_phase(model, freeze_tokenizer=True)
+    tokenizer_state_before = {
+        name: value.detach().clone()
+        for name, value in model.tokenizer.state_dict().items()
+    }
+
+    sequence_ids = _sequence_ids()
+    output = model(
+        sequence_ids,
+        return_autoregressive_reconstruction=True,
+    )
+    losses = nsm_dna_losses(
+        output,
+        target_ids_from_sequence(sequence_ids, target_length=4),
+        autoregressive_reconstruction_loss_weight=1.0,
+        next_scale_prediction_loss_weight=8.0,
+        entropy_loss_weight=0.0,
+    )
+    losses.total.backward()
+
+    assert model.training is True
+    assert model.tokenizer.training is False
+    assert all(parameter.grad is None for parameter in model.tokenizer.parameters())
+    assert any(
+        parameter.grad is not None for parameter in model.transformer.parameters()
+    )
+    for name, expected_value in tokenizer_state_before.items():
+        torch.testing.assert_close(model.tokenizer.state_dict()[name], expected_value)
+
+    evaluate(
+        model,
+        data_loader=[{"input_ids": sequence_ids}],
+        use_mixed_precision=False,
+    )
+    assert model.training is True
+    assert model.tokenizer.training is False
+
+
 def test_evaluate_reports_joint_and_per_scale_metrics() -> None:
     model = NSMDNA.from_config(_build_config())
 
@@ -277,11 +333,16 @@ def test_evaluate_reports_joint_and_per_scale_metrics() -> None:
     assert metrics["entropy_loss"] <= 0
     assert 0 <= metrics["nucleotide_reconstruction_accuracy"] <= 1
     assert 0 <= metrics["next_scale_prediction_accuracy"] <= 1
-    assert metrics["rollout_nucleotide_loss"] > 0
-    assert 0 <= metrics["rollout_nucleotide_accuracy"] <= 1
+    assert metrics["conditioned_rollout_nucleotide_loss"] > 0
+    assert 0 <= metrics["conditioned_rollout_nucleotide_accuracy"] <= 1
     for scale_length in model.tokenizer.scale_lengths:
-        assert metrics[f"next_scale_prediction_loss_scale_{scale_length}"] > 0
-        assert 0 <= metrics[f"next_scale_prediction_accuracy_scale_{scale_length}"] <= 1
+        if scale_length != model.tokenizer.scale_lengths[0]:
+            assert metrics[f"next_scale_prediction_loss_scale_{scale_length}"] > 0
+            assert (
+                0
+                <= metrics[f"next_scale_prediction_accuracy_scale_{scale_length}"]
+                <= 1
+            )
         assert metrics[f"quantization_loss_scale_{scale_length}"] >= 0
         assert metrics[f"vq_loss_scale_{scale_length}"] >= 0
         assert 0 <= metrics[f"cumulative_nucleotide_accuracy_scale_{scale_length}"] <= 1
@@ -305,20 +366,19 @@ def test_validation_wandb_metrics_are_grouped_by_scale() -> None:
     )
 
     assert wandb_metrics["validation/best_total_loss"] == 1.5
-    assert {
-        name for name in wandb_metrics if name.startswith("validation/")
-    } == {
+    assert {name for name in wandb_metrics if name.startswith("validation/")} == {
         "validation/total_loss",
         "validation/nucleotide_reconstruction_loss",
+        "validation/partial_reconstruction_loss",
         "validation/autoregressive_reconstruction_loss",
         "validation/vq_loss",
         "validation/next_scale_prediction_loss",
         "validation/entropy_loss",
-        "validation/rollout_nucleotide_loss",
+        "validation/conditioned_rollout_nucleotide_loss",
         "validation/nucleotide_reconstruction_accuracy",
         "validation/autoregressive_reconstruction_accuracy",
         "validation/next_scale_prediction_accuracy",
-        "validation/rollout_nucleotide_accuracy",
+        "validation/conditioned_rollout_nucleotide_accuracy",
         "validation/best_total_loss",
     }
     for scale_number, scale_length in enumerate(
@@ -326,7 +386,10 @@ def test_validation_wandb_metrics_are_grouped_by_scale() -> None:
         start=1,
     ):
         section = f"scale_{scale_number:02d}_length_{scale_length}"
-        assert f"{section}/prediction_loss" in wandb_metrics
+        if scale_number == 1:
+            assert f"{section}/prediction_loss" not in wandb_metrics
+        else:
+            assert f"{section}/prediction_loss" in wandb_metrics
         assert f"{section}/cumulative_nucleotide_accuracy" in wandb_metrics
         assert f"{section}/code_perplexity" in wandb_metrics
 
@@ -387,17 +450,61 @@ def test_unified_checkpoint_restores_model_optimizer_and_scheduler(
         torch.testing.assert_close(restored_model.state_dict()[name], expected_value)
 
 
+def test_model_checkpoint_initialization_does_not_restore_training_state(
+    tmp_path: Path,
+) -> None:
+    config = _build_config()
+    model = NSMDNA.from_config(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = build_learning_rate_scheduler(
+        optimizer,
+        warmup_steps=1,
+        decay_end_step=10,
+        learning_rate=1e-3,
+        min_learning_rate=1e-4,
+    )
+    checkpoint_path = save_training_checkpoint(
+        tmp_path,
+        model,
+        optimizer,
+        scheduler,
+        config,
+        step=7,
+        best_validation_loss=2.5,
+    )
+
+    initialized_model = NSMDNA.from_config(config)
+    source_step = load_model_checkpoint(
+        checkpoint_path,
+        initialized_model,
+        torch.device("cpu"),
+    )
+
+    assert source_step == 7
+    for name, expected_value in model.state_dict().items():
+        torch.testing.assert_close(
+            initialized_model.state_dict()[name],
+            expected_value,
+        )
+
+
 def test_default_config_matches_the_joint_training_contract() -> None:
     config_path = Path(__file__).parents[1] / "configs" / "nsm.yaml"
     config = OmegaConf.load(config_path)
 
     assert config.run.resume_from is None
+    assert config.run.initialize_from is None
+    assert config.run.reset_best_validation_loss is False
     assert config.wandb.project == "nsm-dna-end-to-end"
-    assert config.wandb.name == "nsm-dna-end-to-end-self-conditioning-apr"
+    assert (
+        config.wandb.name
+        == "nsm-dna-end-to-end-contextual-supplied-scale1-neighbor-corruption"
+    )
     assert config.data.subset_directory.endswith("gtdb/500M_subset")
     assert config.data.sequence_length == 256
     assert config.model.tokenizer.context_length == 128
     assert config.model.tokenizer.embed_dim == 384
+    assert config.model.tokenizer.encoder_num_layers == 1
     assert len(config.model.tokenizer.scale_lengths) == 9
     assert config.model.tokenizer.codebook_size == 256
     assert config.model.transformer.model_dim == 640
@@ -409,6 +516,8 @@ def test_default_config_matches_the_joint_training_contract() -> None:
     assert config.optimizer.weight_decay == 0.05
     assert config.optimizer.max_gradient_norm == 1.0
     assert config.training.num_epochs == 2
+    assert config.training.freeze_tokenizer is False
+    assert config.training.partial_reconstruction_loss_weight == 0.1
     assert config.training.autoregressive_reconstruction_loss_weight == 1.0
     assert config.training.entropy_temperature > 1.0
     assert config.training.loss_schedule.generation_first_fraction == 0.8
@@ -425,7 +534,6 @@ def test_default_config_matches_the_joint_training_contract() -> None:
         config.training.loss_schedule.reconstruction_refinement.entropy_loss_weight
         == 0.5
     )
-    assert config.training.self_conditioning.max_probability == 0.5
-    assert config.training.self_conditioning.ramp_fraction == 0.5
-    assert config.training.input_code_corruption_probability == 0.0
+    assert "self_conditioning" not in config.training
+    assert config.training.input_code_corruption_probability == 0.1
     assert "huggingface" not in config.checkpoint

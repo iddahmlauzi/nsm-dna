@@ -3,11 +3,12 @@ import torch.nn as nn
 
 from scripts.evaluation.lambda_probe_next_scale import (
     NSMWindowEncoder,
+    evaluate_representations,
     segment_window_starts,
 )
 
 
-def test_window_encoder_pools_positions_then_scales_equally() -> None:
+def test_window_encoder_preserves_prefix_and_scale_features() -> None:
     class StubTokenizer(nn.Module):
         context_length = 2
         scale_lengths = [1, 2]
@@ -38,7 +39,6 @@ def test_window_encoder_pools_positions_then_scales_equally() -> None:
                         [3.0, 4.0],
                         [5.0, 6.0],
                         [7.0, 8.0],
-                        [9.0, 10.0],
                     ]
                 ]
             )
@@ -47,9 +47,11 @@ def test_window_encoder_pools_positions_then_scales_equally() -> None:
 
     embedding = encoder(torch.tensor([[0, 1, 2, 3]]))
 
-    # Prefix states are excluded. The length-1 scale pools to [5, 6], the
-    # length-2 scale pools to [8, 9], and the two scales are weighted equally.
-    torch.testing.assert_close(embedding, torch.tensor([[6.5, 7.5]]))
+    # The prefix and the section predicting scale 2 are pooled separately.
+    torch.testing.assert_close(
+        embedding,
+        torch.tensor([[2.0, 3.0, 6.0, 7.0]]),
+    )
 
 
 def test_segment_windows_advance_by_one_target_block() -> None:
@@ -61,3 +63,64 @@ def test_segment_windows_advance_by_one_target_block() -> None:
 
 def test_segment_windows_do_not_duplicate_an_aligned_final_window() -> None:
     assert segment_window_starts(512, 256, 128) == [0, 128, 256]
+
+
+def test_evaluate_representations_splits_prefix_and_each_scale(monkeypatch) -> None:
+    combined_embeddings = {
+        "train": torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]).numpy(),
+        "test": torch.tensor([[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]]).numpy(),
+    }
+    observed_embeddings = {}
+
+    def stub_extract(*args, description: str, **kwargs):
+        split_name = description.rsplit(" ", maxsplit=1)[-1]
+        return combined_embeddings[split_name]
+
+    def stub_evaluate(name, embeddings, *args, **kwargs):
+        observed_embeddings[name] = embeddings
+        return {"linear_probe": {"mcc": 0.0}}
+
+    monkeypatch.setattr(
+        "scripts.evaluation.lambda_probe_next_scale.extract_segment_embeddings",
+        stub_extract,
+    )
+    monkeypatch.setattr(
+        "scripts.evaluation.lambda_probe_next_scale.evaluate_probes",
+        stub_evaluate,
+    )
+    config = type(
+        "Config",
+        (),
+        {
+            "evaluate_three_layer_probe": False,
+            "embedding_batch_size": 1,
+            "representation_names": ["prefix", "scale_length_2"],
+        },
+    )()
+
+    evaluate_representations(
+        "trained",
+        nn.Identity(),
+        model_dim=2,
+        scale_lengths=[1, 2],
+        window_length=4,
+        stride=2,
+        splits={
+            "train": type("Split", (), {"sequences": []})(),
+            "test": type("Split", (), {"sequences": []})(),
+        },
+        config=config,
+        output_directory=None,
+        device=torch.device("cpu"),
+    )
+
+    expected = {
+        "trained_prefix": [1.0, 2.0],
+        "trained_scale_length_2": [5.0, 6.0],
+    }
+    assert set(observed_embeddings) == set(expected)
+    for name, expected_values in expected.items():
+        torch.testing.assert_close(
+            torch.from_numpy(observed_embeddings[name]["train"]),
+            torch.tensor([expected_values]),
+        )

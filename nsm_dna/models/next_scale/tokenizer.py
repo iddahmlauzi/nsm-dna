@@ -11,24 +11,78 @@ from .quantization import MultiscaleResidualVectorQuantizer, QuantizerOutput
 
 
 class Encoder(nn.Module):
-    """Embed nucleotides independently without absolute position information."""
+    """Embed nucleotides and optionally contextualize them within each block."""
 
     def __init__(
         self,
         vocab_size: int,
+        context_length: int,
         embed_dim: int,
+        num_heads: int,
+        num_layers: int = 0,
         dropout: float = 0.0,
+        bias: bool = False,
+        rope_base: float = 10000.0,
     ) -> None:
         super().__init__()
 
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         self.drop = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    embed_dim,
+                    num_heads,
+                    dropout=dropout,
+                    bias=bias,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        positions = torch.arange(2 * context_length)
+        head_dim = embed_dim // num_heads
+        rope_cosine, rope_sine = precompute_rope_cosine_and_sine(
+            positions,
+            head_dim,
+            rope_base,
+        )
+        self.register_buffer("rope_cosine", rope_cosine, persistent=False)
+        self.register_buffer("rope_sine", rope_sine, persistent=False)
 
     def forward(
         self,
         token_ids: Int[Tensor, "batch length"],
+        *,
+        split_position: int | None = None,
     ) -> Float[Tensor, "batch length embed_dim"]:
-        return self.drop(self.token_embedding(token_ids))
+        x = self.drop(self.token_embedding(token_ids))
+        if not self.blocks:
+            return x
+
+        sequence_length = token_ids.shape[1]
+        attention_mask = None
+        if split_position is not None:
+            # Prefix and target are separate encoder contexts. In particular,
+            # the prefix must not see target bases that are unavailable during
+            # generation. A block-diagonal mask keeps one batched encoder call
+            # while allowing bidirectional attention within each block.
+            positions = torch.arange(sequence_length, device=token_ids.device)
+            in_prefix = positions < split_position
+            attention_mask = (in_prefix[:, None] == in_prefix[None, :])[None, None]
+
+        rotary_embeddings = (
+            self.rope_cosine[:sequence_length],
+            self.rope_sine[:sequence_length],
+        )
+        for block in self.blocks:
+            x = block(
+                x,
+                attention_mask=attention_mask,
+                rotary_embeddings=rotary_embeddings,
+                is_causal=False,
+            )
+        return x
 
 
 class Decoder(nn.Module):
@@ -78,19 +132,6 @@ class Decoder(nn.Module):
         return self.out_proj(x)
 
 
-class _ScaleGradient(torch.autograd.Function):
-    """Keep a tensor's forward value while scaling its backward gradient."""
-
-    @staticmethod
-    def forward(ctx, tensor: Tensor, scale: float) -> Tensor:
-        ctx.scale = scale
-        return tensor
-
-    @staticmethod
-    def backward(ctx, gradient: Tensor) -> tuple[Tensor, None]:
-        return gradient * ctx.scale, None
-
-
 class MultiscaleTokenizer(nn.Module):
     """DNA tokenizer with a multiscale residual quantization bottleneck."""
 
@@ -104,6 +145,7 @@ class MultiscaleTokenizer(nn.Module):
         codebook_sizes: list[int],
         *,
         # Encoder and decoder
+        encoder_num_layers: int = 0,
         encoder_dropout: float = 0.0,
         decoder_dropout: float = 0.1,
         bias: bool = False,
@@ -137,8 +179,13 @@ class MultiscaleTokenizer(nn.Module):
 
         self.encoder = Encoder(
             self.vocab_size,
+            self.context_length,
             self.embed_dim,
+            self.num_heads,
+            num_layers=encoder_num_layers,
             dropout=encoder_dropout,
+            bias=bias,
+            rope_base=self.rope_base,
         )
 
         # Normalize the encoder output before comparing it with codebook vectors.
@@ -219,20 +266,23 @@ class MultiscaleTokenizer(nn.Module):
                 f"Expected at least {self.context_length} target positions."
             )
 
-        latent = self.encoder(sequence_ids)
-        prefix = latent[:, : -self.context_length]
-        target = latent[:, -self.context_length :]
+        prefix_length = sequence_ids.shape[1] - self.context_length
+        latent = self.encoder(sequence_ids, split_position=prefix_length)
+        prefix = latent[:, :prefix_length]
+        target = latent[:, prefix_length:]
         return self._normalize(prefix), self._normalize(target)
 
     def quantize(
         self,
         target_latent: Float[Tensor, "batch context_length embed_dim"],
         *,
+        include_partial_reconstruction: bool = False,
         corruption_probability: float = 0.0,
     ) -> QuantizerOutput:
         """Quantize one target block and prepare differentiable hierarchy inputs."""
         return self.quantizer(
             target_latent,
+            include_partial_reconstruction=include_partial_reconstruction,
             corruption_probability=corruption_probability,
         )
 
@@ -248,7 +298,6 @@ class MultiscaleTokenizer(nn.Module):
         token_ids: Int[Tensor, "batch length"],
         *,
         include_partial_reconstruction: bool = False,
-        partial_latent_gradient_scale: float = 1.0,
     ) -> tuple[
         Float[Tensor, "batch length vocab_size"],
         Float[Tensor, "batch length vocab_size"] | None,
@@ -264,15 +313,7 @@ class MultiscaleTokenizer(nn.Module):
 
         partial_logits = None
         if quantizer_output.partial_latent is not None:
-            # The partial loss uses one decoder pass, but its gradient can have
-            # different strengths on the quantizer path and decoder parameters.
-            # Scaling at the decoder input affects only the gradient flowing back
-            # into the quantizer; the loss coefficient controls the decoder.
-            partial_quantized_latent = _ScaleGradient.apply(
-                quantizer_output.partial_latent,
-                partial_latent_gradient_scale,
-            )
-            partial_logits = self.decoder(partial_quantized_latent)
+            partial_logits = self.decoder(quantizer_output.partial_latent)
 
         return (
             logits,

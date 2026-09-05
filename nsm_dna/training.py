@@ -78,36 +78,6 @@ class GenFirstLossSchedule:
         return "reconstruction_refinement"
 
 
-@dataclass(frozen=True)
-class LinearSelfConditioningSchedule:
-    """Ramp the fraction of examples conditioned on model-predicted codes."""
-
-    total_steps: int
-    ramp_fraction: float
-    max_probability: float
-
-    def __post_init__(self) -> None:
-        if self.total_steps < 1:
-            raise ValueError("total_steps must be positive.")
-        if not 0 < self.ramp_fraction <= 1:
-            raise ValueError("Self-conditioning ramp fraction must be in (0, 1].")
-        if not 0 <= self.max_probability <= 1:
-            raise ValueError(
-                "Maximum self-conditioning probability must be between zero and one."
-            )
-
-    @property
-    def ramp_steps(self) -> int:
-        return max(1, round(self.total_steps * self.ramp_fraction))
-
-    def probability_at_step(self, step: int) -> float:
-        """Increase linearly from zero at step one, then hold the maximum."""
-        if self.ramp_steps == 1:
-            return self.max_probability
-        progress = (step - 1) / (self.ramp_steps - 1)
-        return self.max_probability * min(max(progress, 0.0), 1.0)
-
-
 def calculate_training_steps(
     config: DictConfig,
     world_size: int,
@@ -162,9 +132,7 @@ def build_learning_rate_scheduler(
             decay_end_step - warmup_steps,
         )
         cosine_factor = 0.5 * (1 + math.cos(math.pi * decay_progress))
-        return min_learning_rate_factor + cosine_factor * (
-            1 - min_learning_rate_factor
-        )
+        return min_learning_rate_factor + cosine_factor * (1 - min_learning_rate_factor)
 
     return LambdaLR(optimizer, learning_rate_factor)
 
@@ -264,3 +232,18 @@ def load_training_checkpoint(
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
     return checkpoint["step"], checkpoint.get("best_validation_loss", float("inf"))
+
+
+def load_model_checkpoint(
+    checkpoint_path: Path,
+    model: nn.Module,
+    device: torch.device,
+) -> int:
+    """Load model weights without carrying optimizer or scheduler state forward."""
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=True,
+    )
+    model.load_state_dict(checkpoint["model"])
+    return int(checkpoint["step"])

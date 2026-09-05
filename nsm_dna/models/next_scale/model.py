@@ -17,15 +17,16 @@ class NSMDNAOutput:
     """Outputs from one joint tokenizer and next-scale forward pass."""
 
     reconstruction_logits: Float[Tensor, "batch target_length vocab_size"]
+    partial_reconstruction_logits: (
+        Float[Tensor, "batch target_length vocab_size"] | None
+    )
     autoregressive_reconstruction_logits: (
         Float[Tensor, "batch target_length vocab_size"] | None
     )
-    cumulative_reconstruction_logits_by_scale: list[
-        Float[Tensor, "batch target_length vocab_size"]
-    ] | None
-    next_scale_logits_by_scale: list[
-        Float[Tensor, "batch scale_length codebook_size"]
-    ]
+    cumulative_reconstruction_logits_by_scale: (
+        list[Float[Tensor, "batch target_length vocab_size"]] | None
+    )
+    next_scale_logits_by_scale: list[Float[Tensor, "batch scale_length codebook_size"]]
     quantizer: QuantizerOutput
 
 
@@ -69,6 +70,7 @@ class NSMDNA(nn.Module):
             num_heads=tokenizer_config.num_heads,
             scale_lengths=scale_lengths,
             codebook_sizes=[tokenizer_config.codebook_size] * len(scale_lengths),
+            encoder_num_layers=getattr(tokenizer_config, "encoder_num_layers", 0),
             encoder_dropout=tokenizer_config.encoder_dropout,
             decoder_dropout=tokenizer_config.decoder_dropout,
             bias=tokenizer_config.bias,
@@ -99,9 +101,7 @@ class NSMDNA(nn.Module):
             input_refinement_kernel_size=(
                 transformer_config.input_refinement_kernel_size
             ),
-            max_prefix_length=(
-                config.data.sequence_length - tokenizer.context_length
-            ),
+            max_prefix_length=(config.data.sequence_length - tokenizer.context_length),
         )
         return cls(tokenizer, transformer)
 
@@ -135,66 +135,18 @@ class NSMDNA(nn.Module):
         sequence_ids: Int[Tensor, "batch sequence_length"],
         corruption_probability: float = 0.0,
         *,
-        self_conditioning_probability: float = 0.0,
+        return_partial_reconstruction: bool = False,
         return_cumulative_reconstructions: bool = False,
         return_autoregressive_reconstruction: bool = False,
     ) -> NSMDNAOutput:
-        if not 0 <= self_conditioning_probability <= 1:
-            raise ValueError(
-                "Self-conditioning probability must be between zero and one."
-            )
-
         prefix_latent, target_latent = self.tokenizer.encode_pair(sequence_ids)
         quantizer_output = self.tokenizer.quantize(
             target_latent,
+            include_partial_reconstruction=return_partial_reconstruction,
             corruption_probability=corruption_probability,
         )
 
         scale_inputs = quantizer_output.next_scale_inputs
-        if self_conditioning_probability == 0:
-            use_model_predictions = torch.zeros(
-                sequence_ids.shape[0],
-                dtype=torch.bool,
-                device=sequence_ids.device,
-            )
-        else:
-            use_model_predictions = (
-                torch.rand(sequence_ids.shape[0], device=sequence_ids.device)
-                < self_conditioning_probability
-            )
-        if use_model_predictions.any():
-            # This first pass chooses realistic mistakes made by the current
-            # model. Its hard predictions are conditioning data for the second
-            # pass, not an additional path for gradient optimization.
-            with torch.no_grad():
-                teacher_forced_logits = self.transformer(
-                    [scale_input.detach() for scale_input in scale_inputs],
-                    prefix=prefix_latent.detach(),
-                )
-                predicted_indices_by_scale = [
-                    scale_logits.argmax(dim=-1)
-                    for scale_logits in torch.split(
-                        teacher_forced_logits,
-                        self.tokenizer.scale_lengths,
-                        dim=1,
-                    )
-                ]
-                predicted_scale_inputs = (
-                    self.tokenizer.indices_to_next_scale_inputs(
-                        predicted_indices_by_scale
-                    )
-                )
-
-            prediction_mask = use_model_predictions[:, None, None]
-            scale_inputs = [
-                torch.where(prediction_mask, predicted_input, teacher_input)
-                for predicted_input, teacher_input in zip(
-                    predicted_scale_inputs,
-                    scale_inputs,
-                    strict=True,
-                )
-            ]
-
         next_scale_logits = self.transformer(
             scale_inputs,
             prefix=prefix_latent,
@@ -202,18 +154,25 @@ class NSMDNA(nn.Module):
         next_scale_logits_by_scale = list(
             torch.split(
                 next_scale_logits,
-                self.tokenizer.scale_lengths,
+                self.tokenizer.scale_lengths[1:],
                 dim=1,
             )
         )
         reconstruction_logits = self.tokenizer.decode_latent(
             quantizer_output.final_latent
         )
+        partial_reconstruction_logits = None
+        if return_partial_reconstruction:
+            partial_latent = quantizer_output.partial_latent
+            if partial_latent is None:
+                raise RuntimeError("Quantizer did not return a partial latent.")
+            partial_reconstruction_logits = self.tokenizer.decode_latent(partial_latent)
         autoregressive_reconstruction_logits = None
         if return_autoregressive_reconstruction:
             predicted_latent = (
                 self.tokenizer.quantizer.prediction_logits_to_final_latent(
-                    next_scale_logits_by_scale
+                    next_scale_logits_by_scale,
+                    initial_latent=quantizer_output.cumulative_latents[0],
                 )
             )
             autoregressive_reconstruction_logits = self.tokenizer.decode_latent(
@@ -229,9 +188,8 @@ class NSMDNA(nn.Module):
 
         return NSMDNAOutput(
             reconstruction_logits=reconstruction_logits,
-            autoregressive_reconstruction_logits=(
-                autoregressive_reconstruction_logits
-            ),
+            partial_reconstruction_logits=partial_reconstruction_logits,
+            autoregressive_reconstruction_logits=(autoregressive_reconstruction_logits),
             cumulative_reconstruction_logits_by_scale=(
                 cumulative_reconstruction_logits_by_scale
             ),
@@ -243,8 +201,9 @@ class NSMDNA(nn.Module):
     def generate(
         self,
         prefix_ids: Int[Tensor, "batch prefix_length"],
+        first_scale_indices: Int[Tensor, "batch first_scale_length"],
     ) -> NSMDNAGeneration:
-        """Greedily predict all scales and decode their final cumulative latent."""
+        """Greedily predict scales 4 onward from a supplied first-scale code."""
         if self.training:
             raise RuntimeError("Call model.eval() before generating sequences.")
         if prefix_ids.shape[1] > self.transformer.max_prefix_length:
@@ -255,21 +214,32 @@ class NSMDNA(nn.Module):
 
         prefix_latent = self.tokenizer.encode(prefix_ids)
         batch_size = prefix_ids.shape[0]
+        if first_scale_indices.shape != (
+            batch_size,
+            self.tokenizer.scale_lengths[0],
+        ):
+            raise ValueError(
+                "First-scale indices must have shape "
+                f"({batch_size}, {self.tokenizer.scale_lengths[0]})."
+            )
         scale_inputs = [
             prefix_latent.new_zeros(batch_size, scale_length, self.tokenizer.embed_dim)
             for scale_length in self.tokenizer.scale_lengths[1:]
         ]
-        predicted_indices_by_scale = []
+        predicted_indices_by_scale = [first_scale_indices]
+        scale_inputs[0] = self.tokenizer.quantizer.indices_to_next_scale_input(
+            predicted_indices_by_scale
+        )
 
-        for scale_index in range(len(self.tokenizer.scale_lengths)):
+        for scale_index in range(1, len(self.tokenizer.scale_lengths)):
             logits = self.transformer(scale_inputs, prefix=prefix_latent)
             scale_logits = torch.split(
                 logits,
-                self.tokenizer.scale_lengths,
+                self.tokenizer.scale_lengths[1:],
                 dim=1,
-            )[scale_index]
+            )[scale_index - 1]
             predicted_indices_by_scale.append(scale_logits.argmax(dim=-1))
-            if scale_index < len(scale_inputs):
+            if scale_index < len(self.tokenizer.scale_lengths) - 1:
                 scale_inputs[scale_index] = (
                     self.tokenizer.quantizer.indices_to_next_scale_input(
                         predicted_indices_by_scale

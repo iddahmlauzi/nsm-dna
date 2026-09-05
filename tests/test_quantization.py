@@ -129,16 +129,18 @@ def test_prediction_logits_use_hard_codes_with_soft_gradients() -> None:
         codebook_sizes=[8, 8, 8],
         embed_dim=4,
     ).eval()
+    first_scale_indices = torch.randint(0, 8, (2, 1))
     logits_by_scale = [
-        torch.randn(2, scale_length, 8, requires_grad=True)
-        for scale_length in [1, 2, 4]
+        torch.randn(2, scale_length, 8, requires_grad=True) for scale_length in [2, 4]
     ]
+    initial_latent = quantizer.indices_to_cumulative_latents([first_scale_indices])[0]
 
     predicted_latent = quantizer.prediction_logits_to_final_latent(
-        logits_by_scale
+        logits_by_scale,
+        initial_latent=initial_latent,
     )
     expected_latent = quantizer.indices_to_cumulative_latents(
-        [logits.argmax(dim=-1) for logits in logits_by_scale]
+        [first_scale_indices] + [logits.argmax(dim=-1) for logits in logits_by_scale]
     )[-1]
 
     torch.testing.assert_close(predicted_latent, expected_latent)

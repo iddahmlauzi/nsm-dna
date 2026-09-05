@@ -8,6 +8,7 @@ device_ids: [0, 1]
 evaluate_three_layer_probe: true
 evaluate_random_model: true
 random_model_seed: 42
+representation_names: null
 
 probe:
   seed: 42
