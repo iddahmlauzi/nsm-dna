@@ -1,13 +1,15 @@
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 
-from nsm_dna.models.next_scale import NextScaleTransformer
+from nsm_dna.models.next_scale import MultiscaleTokenizer, NextScaleTransformer
 from nsm_dna.models.next_token import NextTokenModel
-from nsm_dna.models.next_scale import MultiscaleTokenizer
 from scripts.evaluation.variant_effects_next_scale import (
     prepare_block_predictions,
+    read_assay_windows,
     score_token_ids,
-    target_block_window,
+    sequence_windows,
 )
 from scripts.evaluation.variant_effects_next_token import score_next_token_ids
 
@@ -28,58 +30,46 @@ def _build_tokenizer() -> MultiscaleTokenizer:
     return tokenizer
 
 
-def test_target_block_window_anchors_the_final_edit_at_the_target_end() -> None:
-    reference = "A" * 512
-    expected_windows = (
-        (10, None, None),
-        (150, 0, 150),
-        (290, 35, 255),
+def test_sequence_windows_tile_the_complete_sequence() -> None:
+    windows = sequence_windows("AAAACCCCGGGG", window_length=4, stride=4)
+
+    assert windows == ("AAAA", "CCCC", "GGGG")
+
+
+def test_sequence_windows_add_an_end_aligned_remainder_window() -> None:
+    windows = sequence_windows("AAAACCCCGG", window_length=4, stride=4)
+
+    assert windows == ("AAAA", "CCCC", "CCGG")
+
+
+def test_sequence_windows_support_reference_and_indel_lengths_independently() -> None:
+    reference_windows = sequence_windows("AAAACCCC", window_length=4, stride=4)
+    insertion_windows = sequence_windows("AAAACCCCC", window_length=4, stride=4)
+    deletion_windows = sequence_windows("AAAACCC", window_length=4, stride=4)
+
+    assert reference_windows == ("AAAA", "CCCC")
+    assert insertion_windows == ("AAAA", "CCCC", "CCCC")
+    assert deletion_windows == ("AAAA", "ACCC")
+
+
+def test_read_assay_windows_keeps_indel_variants(tmp_path: Path) -> None:
+    assay_path = tmp_path / "assay.csv"
+    assay_path.write_text(
+        "study_id,assay_id,wt_nt,mutant_nt\n"
+        "study,assay,AAAACCCC,AAAACCCCC\n",
+        encoding="utf-8",
     )
 
-    for mutation_position, expected_start, position_in_window in expected_windows:
-        mutant = (
-            reference[:mutation_position] + "C" + reference[mutation_position + 1 :]
-        )
-        window = target_block_window(reference, mutant, 128, 128)
-        if expected_start is None:
-            assert window is None
-            continue
-        assert window is not None
-        assert window[2] == expected_start
-        assert position_in_window is not None
-        assert window[1][position_in_window] == "C"
+    variants, num_excluded = read_assay_windows(
+        assay_path,
+        prefix_length=0,
+        target_length=4,
+    )
 
-
-def test_target_block_window_excludes_incomplete_target_blocks() -> None:
-    reference = "A" * 200
-    mutant = "A" * 150 + "C" + "A" * 49
-
-    assert target_block_window(reference, mutant, 128, 128) is None
-
-
-def test_target_block_window_without_prefix_covers_sequence_boundaries() -> None:
-    reference = "A" * 200
-
-    for mutation_position, expected_start, position_in_window in (
-        (10, 0, 10),
-        (150, 23, 127),
-        (199, 72, 127),
-    ):
-        mutant = (
-            reference[:mutation_position] + "C" + reference[mutation_position + 1 :]
-        )
-        window = target_block_window(reference, mutant, 0, 128)
-
-        assert window is not None
-        assert window[2] == expected_start
-        assert window[1][position_in_window] == "C"
-
-
-def test_target_block_window_excludes_edits_spanning_more_than_target() -> None:
-    reference = "A" * 256
-    mutant = "C" + reference[1:200] + "C" + reference[201:]
-
-    assert target_block_window(reference, mutant, 0, 128) is None
+    assert num_excluded == 0
+    assert len(variants) == 1
+    assert len(variants[0].reference_windows) == 2
+    assert len(variants[0].mutant_windows) == 3
 
 
 def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:

@@ -32,6 +32,15 @@ class BlockPredictionBatch:
     targets_by_scale: list[Int[Tensor, "batch scale_length"]]
 
 
+@dataclass(frozen=True)
+class VariantWindows:
+    """Source metadata and complete window tilings for one variant."""
+
+    source_row: dict[str, str]
+    reference_windows: tuple[str, ...]
+    mutant_windows: tuple[str, ...]
+
+
 @torch.no_grad()
 def prepare_block_predictions(
     tokenizer: MultiscaleTokenizer,
@@ -58,49 +67,35 @@ PREDICTION_COLUMNS = (
     "nt_edit",
     "experimental_score",
     "directionality",
-    "window_start_0_based",
-    "reference_log_probability",
-    "mutant_log_probability",
+    "num_reference_windows",
+    "num_mutant_windows",
+    "reference_mean_window_log_probability",
+    "mutant_mean_window_log_probability",
     "variant_score",
 )
 
 
-def target_block_window(
-    reference: str,
-    mutant: str,
-    prefix_length: int,
-    target_length: int,
-) -> tuple[str, str, int] | None:
-    """Place the final edit at the target's end when the sequence boundary permits."""
-    reference = reference.upper()
-    mutant = mutant.upper()
-    if len(reference) != len(mutant):
-        return None
+def sequence_windows(
+    sequence: str,
+    window_length: int,
+    stride: int,
+) -> tuple[str, ...]:
+    """Tile one sequence with fixed-stride windows and cover its final remainder."""
+    sequence = sequence.upper()
+    if len(sequence) < window_length:
+        return ()
 
-    changed_positions = [
-        position
-        for position, (reference_base, mutant_base) in enumerate(zip(reference, mutant))
-        if reference_base != mutant_base
-    ]
-    if not changed_positions:
-        return None
+    final_start = len(sequence) - window_length
+    window_starts = list(range(0, final_start + 1, stride))
 
-    first_change = changed_positions[0]
-    last_change = changed_positions[-1]
-    target_start = max(prefix_length, last_change - target_length + 1)
-    window_start = target_start - prefix_length
-    window_end = target_start + target_length
-    if (
-        window_start < 0
-        or window_end > len(reference)
-        or first_change < target_start
-    ):
-        return None
+    # A final end-aligned window covers the remainder when the sequence length
+    # is not an exact multiple of the stride.
+    if window_starts[-1] != final_start:
+        window_starts.append(final_start)
 
-    return (
-        reference[window_start:window_end],
-        mutant[window_start:window_end],
-        window_start,
+    return tuple(
+        sequence[window_start : window_start + window_length]
+        for window_start in window_starts
     )
 
 
@@ -223,28 +218,37 @@ def read_assay_windows(
     path: Path,
     prefix_length: int,
     target_length: int,
-) -> tuple[list[dict[str, str]], int]:
-    """Read rows with a full prefix and all edits inside the target."""
+) -> tuple[list[VariantWindows], int]:
+    """Read variants and tile each complete reference and mutant independently."""
     selected_rows = []
     num_excluded = 0
+    window_length = prefix_length + target_length
 
     with path.open(encoding="utf-8", newline="") as input_file:
         for row in csv.DictReader(input_file):
-            window = target_block_window(
-                row["wt_nt"],
-                row["mutant_nt"],
-                prefix_length,
+            reference = row["wt_nt"].upper()
+            mutant = row["mutant_nt"].upper()
+            reference_windows = sequence_windows(
+                reference,
+                window_length,
                 target_length,
             )
-            if window is None:
+            mutant_windows = sequence_windows(
+                mutant,
+                window_length,
+                target_length,
+            )
+            if not reference_windows or not mutant_windows or reference == mutant:
                 num_excluded += 1
                 continue
 
-            reference, mutant, window_start = window
-            row["reference_window"] = reference
-            row["mutant_window"] = mutant
-            row["window_start_0_based"] = str(window_start)
-            selected_rows.append(row)
+            selected_rows.append(
+                VariantWindows(
+                    source_row=row,
+                    reference_windows=reference_windows,
+                    mutant_windows=mutant_windows,
+                )
+            )
 
     return selected_rows, num_excluded
 
@@ -277,15 +281,16 @@ def evaluate_assay(
     target_length: int,
 ) -> dict[str, str | int | float]:
     """Score one assay and calculate its direction-adjusted Spearman correlation."""
-    rows, num_excluded = read_assay_windows(path, prefix_length, target_length)
+    variants, num_excluded = read_assay_windows(path, prefix_length, target_length)
 
-    # Variants at nearby positions often share a reference window. Score each
-    # distinct sequence once and reuse its result for every matching row.
+    # References, mutants, and separate variants often share complete windows.
+    # Score each distinct sequence once and reuse it wherever it occurs.
     unique_sequences = list(
         dict.fromkeys(
             sequence
-            for row in rows
-            for sequence in (row["reference_window"], row["mutant_window"])
+            for variant in variants
+            for windows in (variant.reference_windows, variant.mutant_windows)
+            for sequence in windows
         )
     )
     scores_by_component = score_sequences(
@@ -301,12 +306,21 @@ def evaluate_assay(
     }
 
     predictions = []
-    for row in rows:
-        reference = row["reference_window"]
-        mutant = row["mutant_window"]
-        variant_scores = {
-            name: scores[mutant] - scores[reference]
+    for variant in variants:
+        row = variant.source_row
+        reference_scores = {
+            name: sum(scores[window] for window in variant.reference_windows)
+            / len(variant.reference_windows)
             for name, scores in sequence_scores.items()
+        }
+        mutant_scores = {
+            name: sum(scores[window] for window in variant.mutant_windows)
+            / len(variant.mutant_windows)
+            for name, scores in sequence_scores.items()
+        }
+        variant_scores = {
+            name: mutant_scores[name] - reference_scores[name]
+            for name in sequence_scores
         }
         predictions.append(
             {
@@ -316,9 +330,10 @@ def evaluate_assay(
                 "nt_edit": row["nt_edit"],
                 "experimental_score": row["experimental_score"],
                 "directionality": row["directionality"],
-                "window_start_0_based": row["window_start_0_based"],
-                "reference_log_probability": sequence_scores["joint"][reference],
-                "mutant_log_probability": sequence_scores["joint"][mutant],
+                "num_reference_windows": len(variant.reference_windows),
+                "num_mutant_windows": len(variant.mutant_windows),
+                "reference_mean_window_log_probability": reference_scores["joint"],
+                "mutant_mean_window_log_probability": mutant_scores["joint"],
                 "variant_score": variant_scores["joint"],
                 **{
                     f"{name}_variant_score": score
@@ -346,11 +361,17 @@ def evaluate_assay(
         output_dir / "predictions" / path.name,
     )
     return {
-        "study_id": rows[0]["study_id"],
-        "assay_id": rows[0]["assay_id"],
-        "num_variants": len(rows),
+        "study_id": variants[0].source_row["study_id"],
+        "assay_id": variants[0].source_row["assay_id"],
+        "num_variants": len(variants),
         "num_excluded": num_excluded,
-        "num_unique_windows": len(unique_sequences),
+        "num_reference_windows": sum(
+            len(variant.reference_windows) for variant in variants
+        ),
+        "num_mutant_windows": sum(
+            len(variant.mutant_windows) for variant in variants
+        ),
+        "num_unique_window_sequences": len(unique_sequences),
         "spearman": correlations["joint"],
         **{f"spearman_{name}": correlations[name] for name in component_names},
     }
@@ -425,7 +446,9 @@ def main(config: DictConfig) -> None:
             "assay_id",
             "num_variants",
             "num_excluded",
-            "num_unique_windows",
+            "num_reference_windows",
+            "num_mutant_windows",
+            "num_unique_window_sequences",
             "spearman",
             *(f"spearman_{name}" for name in component_names),
         ),
@@ -437,12 +460,18 @@ def main(config: DictConfig) -> None:
         "checkpoint_sha256": sha256(checkpoint_path),
         "checkpoint_step": checkpoint_step,
         "score": (
-            "mutant minus reference summed hierarchy and nucleotide log probability"
+            "mutant minus reference mean fixed-window hierarchy and nucleotide "
+            "log probability over each complete sequence"
         ),
         "score_components": ["joint"] + component_names,
         "prefix_length": prefix_length,
         "target_length": target_length,
         "window_length": prefix_length + target_length,
+        "stride": target_length,
+        "window_alignment": (
+            "fixed stride from the sequence start with one end-aligned window "
+            "for a trailing remainder"
+        ),
         "batch_size": config.batch_size,
         "device": str(device),
         "input_files": [

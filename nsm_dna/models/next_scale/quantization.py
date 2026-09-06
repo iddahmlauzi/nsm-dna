@@ -30,9 +30,10 @@ class QuantizerOutput:
     @property
     def vq_loss(self) -> Float[Tensor, ""]:
         """Final encoder commitment plus mean residual quantization loss."""
-        return self.encoder_commitment_loss + torch.stack(
-            self.quantization_losses_by_scale
-        ).mean()
+        return (
+            self.encoder_commitment_loss
+            + torch.stack(self.quantization_losses_by_scale).mean()
+        )
 
 
 class EMACodebook(nn.Module):
@@ -344,23 +345,6 @@ class BlendedConv1d(nn.Module):
         refined = x * (1 - self.refinement_ratio) + convolved * self.refinement_ratio
         return refined
 
-    def forward_with_fixed_parameters(
-        self,
-        x: Float[Tensor, "batch embed_dim length"],
-    ) -> Float[Tensor, "batch embed_dim length"]:
-        """Preserve input gradients without updating this refiner's parameters."""
-        bias = self.conv.bias.detach() if self.conv.bias is not None else None
-        convolved = F.conv1d(
-            x,
-            self.conv.weight.detach(),
-            bias,
-            stride=self.conv.stride,
-            padding=self.conv.padding,
-            dilation=self.conv.dilation,
-            groups=self.conv.groups,
-        )
-        return x * (1 - self.refinement_ratio) + convolved * self.refinement_ratio
-
 
 class MultiscaleResidualVectorQuantizer(nn.Module):
     """Multiscale residual vector quantizer."""
@@ -547,73 +531,6 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             )
 
         return reconstruction
-
-    def predicted_consistency_state(
-        self,
-        prediction_logits: Float[Tensor, "batch scale_length codebook_size"],
-        rollout_cumulative_latent: Float[Tensor, "batch length embed_dim"],
-        predicted_scale_index: int,
-    ) -> Float[Tensor, "batch state_length embed_dim"]:
-        """Build a post-prediction rollout state with soft gradients.
-
-        The codebook and quantizer refiner are fixed for this operation. This
-        lets state consistency train the predictor without allowing the target
-        latent geometry to move toward an erroneous rollout. Intermediate
-        predictions are expressed as the following scale's input; the final
-        prediction is expressed as the complete full-length latent.
-        """
-        if not 1 <= predicted_scale_index < len(self.scale_lengths):
-            raise ValueError(
-                "A predicted consistency state requires a non-first scale index."
-            )
-
-        codebook = self.codebooks[predicted_scale_index]
-        probabilities = torch.softmax(prediction_logits.float(), dim=-1)
-        hard_indices = probabilities.argmax(dim=-1)
-        hard_assignments = F.one_hot(
-            hard_indices,
-            num_classes=codebook.codebook_size,
-        ).to(probabilities.dtype)
-        assignments = hard_assignments + probabilities - probabilities.detach()
-        predicted_codes = assignments @ codebook.codebook.detach()
-
-        predicted_codes = einx.id("b l d -> b d l", predicted_codes)
-        contribution = self._upsample_to_full_length(
-            predicted_codes,
-            predicted_scale_index,
-        )
-        contribution = self.refiners[
-            predicted_scale_index
-        ].forward_with_fixed_parameters(contribution)
-        contribution = einx.id("b d l -> b l d", contribution)
-
-        next_cumulative_latent = rollout_cumulative_latent.detach() + contribution
-        if predicted_scale_index == len(self.scale_lengths) - 1:
-            return next_cumulative_latent
-        return self._resize_to_scale(
-            next_cumulative_latent,
-            predicted_scale_index + 1,
-        )
-
-    @torch.no_grad()
-    def consistency_states_from_cumulative_latents(
-        self,
-        cumulative_latents: list[Float[Tensor, "batch length embed_dim"]],
-    ) -> list[Float[Tensor, "batch state_length embed_dim"]]:
-        """Express each post-prediction cumulative in consistency-loss space."""
-        states = []
-        for scale_index in range(1, len(self.scale_lengths)):
-            cumulative_latent = cumulative_latents[scale_index]
-            if scale_index == len(self.scale_lengths) - 1:
-                states.append(cumulative_latent.detach())
-            else:
-                states.append(
-                    self._resize_to_scale(
-                        cumulative_latent.detach(),
-                        scale_index + 1,
-                    )
-                )
-        return states
 
     def _corrupt_quantized_vectors(
         self,

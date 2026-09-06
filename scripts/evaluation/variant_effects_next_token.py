@@ -75,12 +75,13 @@ def evaluate_assay(
     target_length: int,
 ) -> dict[str, str | int | float]:
     """Score one assay and calculate direction-adjusted Spearman correlation."""
-    rows, num_excluded = read_assay_windows(path, prefix_length, target_length)
+    variants, num_excluded = read_assay_windows(path, prefix_length, target_length)
     unique_sequences = list(
         dict.fromkeys(
             sequence
-            for row in rows
-            for sequence in (row["reference_window"], row["mutant_window"])
+            for variant in variants
+            for windows in (variant.reference_windows, variant.mutant_windows)
+            for sequence in windows
         )
     )
     sequence_scores = dict(
@@ -92,11 +93,14 @@ def evaluate_assay(
     )
 
     predictions = []
-    for row in rows:
-        reference = row["reference_window"]
-        mutant = row["mutant_window"]
-        reference_score = sequence_scores[reference]
-        mutant_score = sequence_scores[mutant]
+    for variant in variants:
+        row = variant.source_row
+        reference_score = sum(
+            sequence_scores[window] for window in variant.reference_windows
+        ) / len(variant.reference_windows)
+        mutant_score = sum(
+            sequence_scores[window] for window in variant.mutant_windows
+        ) / len(variant.mutant_windows)
         predictions.append(
             {
                 "study_id": row["study_id"],
@@ -105,9 +109,10 @@ def evaluate_assay(
                 "nt_edit": row["nt_edit"],
                 "experimental_score": row["experimental_score"],
                 "directionality": row["directionality"],
-                "window_start_0_based": row["window_start_0_based"],
-                "reference_log_probability": reference_score,
-                "mutant_log_probability": mutant_score,
+                "num_reference_windows": len(variant.reference_windows),
+                "num_mutant_windows": len(variant.mutant_windows),
+                "reference_mean_window_log_probability": reference_score,
+                "mutant_mean_window_log_probability": mutant_score,
                 "variant_score": mutant_score - reference_score,
             }
         )
@@ -125,11 +130,17 @@ def evaluate_assay(
         output_directory / "predictions" / path.name,
     )
     return {
-        "study_id": rows[0]["study_id"],
-        "assay_id": rows[0]["assay_id"],
-        "num_variants": len(rows),
+        "study_id": variants[0].source_row["study_id"],
+        "assay_id": variants[0].source_row["assay_id"],
+        "num_variants": len(variants),
         "num_excluded": num_excluded,
-        "num_unique_windows": len(unique_sequences),
+        "num_reference_windows": sum(
+            len(variant.reference_windows) for variant in variants
+        ),
+        "num_mutant_windows": sum(
+            len(variant.mutant_windows) for variant in variants
+        ),
+        "num_unique_window_sequences": len(unique_sequences),
         "spearman": correlation,
     }
 
@@ -174,7 +185,9 @@ def main(config: DictConfig) -> None:
         "assay_id",
         "num_variants",
         "num_excluded",
-        "num_unique_windows",
+        "num_reference_windows",
+        "num_mutant_windows",
+        "num_unique_window_sequences",
         "spearman",
     )
     write_csv(results, result_columns, output_directory / "correlations.csv")
@@ -183,10 +196,18 @@ def main(config: DictConfig) -> None:
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": sha256(checkpoint_path),
         "checkpoint_step": checkpoint_step,
-        "score": "mutant minus reference summed next-nucleotide log probability",
+        "score": (
+            "mutant minus reference mean fixed-window next-nucleotide log "
+            "probability over each complete sequence"
+        ),
         "prefix_length": prefix_length,
         "target_length": target_length,
         "window_length": window_length,
+        "stride": target_length,
+        "window_alignment": (
+            "fixed stride from the sequence start with one end-aligned window "
+            "for a trailing remainder"
+        ),
         "batch_size": config.batch_size,
         "device": str(device),
         "input_files": [

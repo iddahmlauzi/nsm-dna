@@ -159,69 +159,6 @@ def test_prediction_logits_use_hard_codes_with_soft_gradients() -> None:
     assert all(codebook.codebook.grad is None for codebook in quantizer.codebooks)
 
 
-def test_predicted_consistency_state_uses_hard_codes_with_soft_gradients() -> None:
-    quantizer = MultiscaleResidualVectorQuantizer(
-        scale_lengths=[1, 2, 4],
-        codebook_sizes=[8, 8, 8],
-        embed_dim=4,
-    ).eval()
-    rollout_cumulative = torch.randn(2, 4, 4, requires_grad=True)
-    logits = torch.randn(2, 2, 8, requires_grad=True)
-
-    predicted_state = quantizer.predicted_consistency_state(
-        logits,
-        rollout_cumulative,
-        predicted_scale_index=1,
-    )
-    expected_contribution = quantizer.scale_contribution_from_indices(
-        logits.argmax(dim=-1),
-        scale_index=1,
-    )
-
-    torch.testing.assert_close(
-        predicted_state,
-        rollout_cumulative.detach() + expected_contribution,
-    )
-    predicted_state.square().mean().backward()
-
-    assert logits.grad is not None
-    assert logits.grad.count_nonzero() > 0
-    assert rollout_cumulative.grad is None
-    assert all(codebook.codebook.grad is None for codebook in quantizer.codebooks)
-    assert all(
-        parameter.grad is None
-        for parameter in quantizer.refiners[1].parameters()
-    )
-
-
-def test_final_consistency_state_includes_the_last_predicted_scale() -> None:
-    quantizer = MultiscaleResidualVectorQuantizer(
-        scale_lengths=[1, 2, 4],
-        codebook_sizes=[8, 8, 8],
-        embed_dim=4,
-    ).eval()
-    rollout_cumulative = torch.randn(2, 4, 4)
-    final_logits = torch.randn(2, 4, 8, requires_grad=True)
-
-    final_state = quantizer.predicted_consistency_state(
-        final_logits,
-        rollout_cumulative,
-        predicted_scale_index=2,
-    )
-    expected_contribution = quantizer.scale_contribution_from_indices(
-        final_logits.argmax(dim=-1),
-        scale_index=2,
-    )
-
-    torch.testing.assert_close(
-        final_state,
-        rollout_cumulative + expected_contribution,
-    )
-    final_state.square().mean().backward()
-    assert final_logits.grad is not None
-    assert final_logits.grad.count_nonzero() > 0
-
-
 def test_quantizer_rejects_invalid_corruption_probability() -> None:
     quantizer = MultiscaleResidualVectorQuantizer(
         scale_lengths=[1, 2],

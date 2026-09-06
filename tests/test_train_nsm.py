@@ -147,7 +147,6 @@ def test_total_loss_applies_generative_objective_weights() -> None:
         corruption_probability=0.1,
         return_partial_reconstruction=True,
         return_teacher_forced_prediction_reconstruction=True,
-        return_rollout=True,
     )
     losses = nsm_dna_losses(
         output,
@@ -155,7 +154,6 @@ def test_total_loss_applies_generative_objective_weights() -> None:
         partial_reconstruction_loss_weight=0.1,
         teacher_forced_prediction_reconstruction_loss_weight=1.0,
         next_scale_prediction_loss_weight=8.0,
-        rollout_state_consistency_loss_weight=0.5,
         entropy_loss_weight=2.0,
     )
 
@@ -175,71 +173,8 @@ def test_total_loss_applies_generative_objective_weights() -> None:
         + losses.teacher_forced_prediction_reconstruction
         + losses.vq
         + 8.0 * losses.teacher_forced_prediction
-        + 0.5 * losses.rollout_state_consistency
         + 2.0 * losses.entropy,
     )
-
-
-def test_state_consistency_averages_scale_transitions_equally() -> None:
-    model = NSMDNA.from_config(_build_config())
-    sequence_ids = _sequence_ids()
-    output = model(sequence_ids, return_rollout=True)
-
-    losses = nsm_dna_losses(
-        output,
-        target_ids_from_sequence(sequence_ids, target_length=4),
-        rollout_state_consistency_loss_weight=1.0,
-        entropy_loss_weight=0.0,
-    )
-
-    torch.testing.assert_close(
-        losses.rollout_state_consistency,
-        torch.stack(losses.rollout_state_consistency_by_scale).mean(),
-    )
-
-
-def test_state_consistency_trains_only_the_transformer_without_a_prefix() -> None:
-    config = _build_config()
-    config.data.sequence_length = config.model.tokenizer.context_length
-    model = NSMDNA.from_config(config)
-    sequence_ids = _sequence_ids()[:, -4:]
-    output = model(sequence_ids, return_rollout=True)
-    assert output.rollout is not None
-    final_rollout_logits = output.rollout.prediction_logits_by_scale[-1]
-    final_rollout_logits.retain_grad()
-    losses = nsm_dna_losses(
-        output,
-        target_ids_from_sequence(sequence_ids, target_length=4),
-        rollout_state_consistency_loss_weight=1.0,
-        entropy_loss_weight=0.0,
-    )
-
-    losses.rollout_state_consistency.backward()
-
-    assert final_rollout_logits.grad is not None
-    assert final_rollout_logits.grad.count_nonzero() > 0
-    assert any(
-        parameter.grad is not None and parameter.grad.count_nonzero() > 0
-        for parameter in model.transformer.parameters()
-    )
-    assert all(
-        parameter.grad is None or parameter.grad.count_nonzero() == 0
-        for parameter in model.tokenizer.parameters()
-    )
-
-
-def test_state_consistency_requires_rollout_outputs() -> None:
-    model = NSMDNA.from_config(_build_config())
-    sequence_ids = _sequence_ids()
-    output = model(sequence_ids)
-    target_ids = target_ids_from_sequence(sequence_ids, target_length=4)
-
-    with pytest.raises(ValueError, match="Rollout outputs are required"):
-        nsm_dna_losses(
-            output,
-            target_ids,
-            rollout_state_consistency_loss_weight=1.0,
-        )
 
 
 def test_validation_partial_loss_averages_nonfinal_scales() -> None:
@@ -290,12 +225,10 @@ def test_one_optimizer_step_updates_the_joint_model() -> None:
     output = model(
         sequence_ids,
         corruption_probability=0.1,
-        return_rollout=True,
     )
     losses = nsm_dna_losses(
         output,
         target_ids_from_sequence(sequence_ids, target_length=4),
-        rollout_state_consistency_loss_weight=1.0,
     )
     losses.total.backward()
     optimizer.step()
@@ -372,7 +305,6 @@ def test_evaluate_reports_joint_and_per_scale_metrics() -> None:
     assert 0 <= metrics["rollout_prediction_accuracy"] <= 1
     assert metrics["rollout_nucleotide_loss"] > 0
     assert 0 <= metrics["rollout_nucleotide_accuracy"] <= 1
-    assert metrics["rollout_state_consistency_loss"] >= 0
     assert metrics["encoder_commitment_loss"] >= 0
     first_predicted_scale = model.tokenizer.scale_lengths[1]
     assert metrics[
@@ -387,9 +319,7 @@ def test_evaluate_reports_joint_and_per_scale_metrics() -> None:
                 <= 1
             )
             assert (
-                0
-                <= metrics[f"rollout_prediction_accuracy_scale_{scale_length}"]
-                <= 1
+                0 <= metrics[f"rollout_prediction_accuracy_scale_{scale_length}"] <= 1
             )
             assert (
                 0
@@ -406,13 +336,6 @@ def test_evaluate_reports_joint_and_per_scale_metrics() -> None:
         assert 0 <= metrics[f"code_usage_scale_{scale_length}"] <= 1
         assert metrics[f"code_perplexity_scale_{scale_length}"] >= 1
         assert 0 <= metrics[f"soft_confidence_scale_{scale_length}"] <= 1
-        if scale_length != model.tokenizer.scale_lengths[0]:
-            assert (
-                metrics[
-                    f"rollout_state_consistency_loss_after_scale_{scale_length}"
-                ]
-                >= 0
-            )
 
 
 def test_validation_wandb_metrics_are_grouped_by_scale() -> None:
@@ -432,7 +355,6 @@ def test_validation_wandb_metrics_are_grouped_by_scale() -> None:
     assert wandb_metrics["validation/objective/best_total"] == 1.5
     assert {name for name in wandb_metrics if name.startswith("validation/")} == {
         "validation/objective/total",
-        "validation/objective/rollout_state_consistency",
         "validation/objective/best_total",
         "validation/accuracy/nucleotide_reconstruction",
         "validation/accuracy/teacher_forced_prediction_reconstruction",
@@ -463,15 +385,11 @@ def test_tokenizer_stability_metrics_compare_the_same_anchor_states() -> None:
         encoder_latent=torch.zeros(1, 2, 1),
         indices_by_scale=[torch.tensor([[0]]), torch.tensor([[0, 1]])],
         codebooks_by_scale=[torch.zeros(2, 1), torch.zeros(2, 1)],
-        clean_consistency_states_by_scale=[torch.zeros(1, 2, 1)],
-        rollout_consistency_states_by_scale=[torch.zeros(1, 2, 1)],
     )
     current = TokenizerStabilitySnapshot(
         encoder_latent=torch.ones(1, 2, 1),
         indices_by_scale=[torch.tensor([[0]]), torch.tensor([[1, 1]])],
         codebooks_by_scale=[torch.ones(2, 1), torch.full((2, 1), 2.0)],
-        clean_consistency_states_by_scale=[torch.full((1, 2, 1), 2.0)],
-        rollout_consistency_states_by_scale=[torch.full((1, 2, 1), 5.0)],
     )
 
     metrics = tokenizer_stability_metrics(previous, current, [1, 2])
@@ -481,17 +399,11 @@ def test_tokenizer_stability_metrics_compare_the_same_anchor_states() -> None:
     assert metrics["code_retention_scale_2"] == pytest.approx(0.5)
     assert metrics["code_retention"] == pytest.approx(0.75)
     assert metrics["active_codebook_drift"] == pytest.approx(1.5)
-    assert metrics["target_state_drift"] == pytest.approx(2.0)
-    assert metrics["rollout_state_error"] == pytest.approx(3.0)
-    assert metrics["target_drift_relative_to_rollout_error"] == pytest.approx(
-        2.0 / 3.0
-    )
 
 
 def test_wandb_logs_only_aggregate_tokenizer_stability_metrics() -> None:
     validation_metrics = {
         "total_loss": 1.0,
-        "rollout_state_consistency_loss": 0.5,
         "nucleotide_reconstruction_accuracy": 0.9,
         "teacher_forced_prediction_reconstruction_accuracy": 0.8,
         "teacher_forced_prediction_accuracy": 0.7,
@@ -500,9 +412,6 @@ def test_wandb_logs_only_aggregate_tokenizer_stability_metrics() -> None:
         "code_retention": 0.75,
         "encoder_latent_drift": 0.1,
         "active_codebook_drift": 0.2,
-        "target_state_drift": 0.3,
-        "target_drift_relative_to_rollout_error": 0.4,
-        "target_state_drift_after_scale_2": 0.35,
     }
 
     wandb_metrics = _validation_metrics_for_wandb(
@@ -512,7 +421,6 @@ def test_wandb_logs_only_aggregate_tokenizer_stability_metrics() -> None:
     )
 
     assert wandb_metrics["validation/stability/code_retention"] == 0.75
-    assert wandb_metrics["validation/stability/target_state_drift"] == 0.3
     assert not any("after_scale" in name for name in wandb_metrics)
 
 
@@ -662,10 +570,7 @@ def test_default_config_matches_the_joint_training_contract() -> None:
     assert config.training.num_epochs == 2
     assert config.training.freeze_tokenizer is False
     assert config.training.partial_reconstruction_loss_weight == 0.1
-    assert (
-        config.training.teacher_forced_prediction_reconstruction_loss_weight == 1.0
-    )
-    assert config.training.rollout_state_consistency_loss_weight == 0.0
+    assert config.training.teacher_forced_prediction_reconstruction_loss_weight == 1.0
     assert config.training.entropy_temperature > 1.0
     assert config.training.next_scale_prediction_loss_weight == 8.0
     assert config.training.entropy_loss_weight == 2.0

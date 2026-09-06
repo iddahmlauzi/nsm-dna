@@ -62,14 +62,6 @@ def tokenizer_stability_snapshot_to_cpu(
         codebooks_by_scale=[
             codebook.float().cpu() for codebook in snapshot.codebooks_by_scale
         ],
-        clean_consistency_states_by_scale=[
-            state.float().cpu()
-            for state in snapshot.clean_consistency_states_by_scale
-        ],
-        rollout_consistency_states_by_scale=[
-            state.float().cpu()
-            for state in snapshot.rollout_consistency_states_by_scale
-        ],
     )
 
 
@@ -107,8 +99,7 @@ def tokenizer_stability_metrics(
         )
         active_codebook_drift = torch.mean(
             (
-                current_codebook[active_indices]
-                - previous_codebook[active_indices]
+                current_codebook[active_indices] - previous_codebook[active_indices]
             ).square()
         ).sqrt()
 
@@ -119,50 +110,10 @@ def tokenizer_stability_metrics(
         code_retentions.append(code_retention)
         active_codebook_drifts.append(active_codebook_drift)
 
-    target_state_drifts = []
-    rollout_state_errors = []
-    relative_target_drifts = []
-    for scale_length, previous_state, current_state, rollout_state in zip(
-        scale_lengths[1:],
-        previous.clean_consistency_states_by_scale,
-        current.clean_consistency_states_by_scale,
-        current.rollout_consistency_states_by_scale,
-        strict=True,
-    ):
-        target_state_drift = torch.mean(
-            (current_state - previous_state).square()
-        ).sqrt()
-        rollout_state_error = torch.mean(
-            (rollout_state - current_state).square()
-        ).sqrt()
-        relative_target_drift = target_state_drift / rollout_state_error.clamp_min(
-            1e-12
-        )
-
-        metrics[f"target_state_drift_after_scale_{scale_length}"] = (
-            target_state_drift.item()
-        )
-        metrics[f"rollout_state_error_after_scale_{scale_length}"] = (
-            rollout_state_error.item()
-        )
-        metrics[
-            f"target_drift_relative_to_rollout_error_after_scale_{scale_length}"
-        ] = relative_target_drift.item()
-        target_state_drifts.append(target_state_drift)
-        rollout_state_errors.append(rollout_state_error)
-        relative_target_drifts.append(relative_target_drift)
-
     metrics.update(
         {
             "code_retention": torch.stack(code_retentions).mean().item(),
-            "active_codebook_drift": torch.stack(
-                active_codebook_drifts
-            ).mean().item(),
-            "target_state_drift": torch.stack(target_state_drifts).mean().item(),
-            "rollout_state_error": torch.stack(rollout_state_errors).mean().item(),
-            "target_drift_relative_to_rollout_error": torch.stack(
-                relative_target_drifts
-            ).mean().item(),
+            "active_codebook_drift": torch.stack(active_codebook_drifts).mean().item(),
         }
     )
     return metrics
@@ -189,7 +140,6 @@ def evaluate(
     partial_reconstruction_loss_weight: float = 0.0,
     teacher_forced_prediction_reconstruction_loss_weight: float = 0.0,
     next_scale_prediction_loss_weight: float = 1.0,
-    rollout_state_consistency_loss_weight: float = 0.0,
     entropy_loss_weight: float = 1.0,
     entropy_temperature: float = 1.0,
 ) -> dict[str, float]:
@@ -204,11 +154,8 @@ def evaluate(
     # The losses returned by the model are batch means, so they are accumulated
     # by example. Accuracy and codebook statistics are accumulated as raw counts
     # so that short final batches do not receive disproportionate weight.
-    loss_sums = torch.zeros(8, dtype=torch.float64, device=device)
+    loss_sums = torch.zeros(7, dtype=torch.float64, device=device)
     teacher_forced_prediction_loss_sums = torch.zeros(
-        num_predicted_scales, dtype=torch.float64, device=device
-    )
-    rollout_state_consistency_loss_sums = torch.zeros(
         num_predicted_scales, dtype=torch.float64, device=device
     )
     encoder_commitment_loss_sum = torch.zeros((), dtype=torch.float64, device=device)
@@ -241,12 +188,8 @@ def evaluate(
     teacher_forced_prediction_reconstruction_correct = torch.zeros(
         (), dtype=torch.long, device=device
     )
-    rollout_nucleotide_loss_sum = torch.zeros(
-        (), dtype=torch.float64, device=device
-    )
-    rollout_nucleotide_correct = torch.zeros(
-        (), dtype=torch.long, device=device
-    )
+    rollout_nucleotide_loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+    rollout_nucleotide_correct = torch.zeros((), dtype=torch.long, device=device)
     target_count = torch.zeros((), dtype=torch.long, device=device)
     example_count = 0
 
@@ -280,18 +223,11 @@ def evaluate(
             losses = nsm_dna_losses(
                 output,
                 target_ids,
-                partial_reconstruction_loss_weight=(
-                    partial_reconstruction_loss_weight
-                ),
+                partial_reconstruction_loss_weight=(partial_reconstruction_loss_weight),
                 teacher_forced_prediction_reconstruction_loss_weight=(
                     teacher_forced_prediction_reconstruction_loss_weight
                 ),
-                next_scale_prediction_loss_weight=(
-                    next_scale_prediction_loss_weight
-                ),
-                rollout_state_consistency_loss_weight=(
-                    rollout_state_consistency_loss_weight
-                ),
+                next_scale_prediction_loss_weight=(next_scale_prediction_loss_weight),
                 entropy_loss_weight=entropy_loss_weight,
                 entropy_temperature=entropy_temperature,
             )
@@ -315,19 +251,13 @@ def evaluate(
                     losses.teacher_forced_prediction_reconstruction,
                     losses.vq,
                     losses.teacher_forced_prediction,
-                    losses.rollout_state_consistency,
                     losses.entropy,
                 ]
             ).double()
             * batch_size
         )
         teacher_forced_prediction_loss_sums += (
-            torch.stack(losses.teacher_forced_prediction_by_scale).double()
-            * batch_size
-        )
-        rollout_state_consistency_loss_sums += (
-            torch.stack(losses.rollout_state_consistency_by_scale).double()
-            * batch_size
+            torch.stack(losses.teacher_forced_prediction_by_scale).double() * batch_size
         )
         encoder_commitment_loss_sum += (
             output.quantizer.encoder_commitment_loss.double() * batch_size
@@ -336,9 +266,7 @@ def evaluate(
             torch.stack(output.quantizer.quantization_losses_by_scale).double()
             * batch_size
         )
-        rollout_nucleotide_loss_sum += (
-            rollout_nucleotide_loss.double() * batch_size
-        )
+        rollout_nucleotide_loss_sum += rollout_nucleotide_loss.double() * batch_size
 
         nucleotide_reconstruction_correct += (
             output.reconstruction_logits.argmax(dim=-1) == target_ids
@@ -355,9 +283,7 @@ def evaluate(
 
         cumulative_logits = output.cumulative_reconstruction_logits_by_scale
         assert cumulative_logits is not None
-        rollout_cumulative_logits = (
-            rollout.cumulative_reconstruction_logits_by_scale
-        )
+        rollout_cumulative_logits = rollout.cumulative_reconstruction_logits_by_scale
         assert rollout_cumulative_logits is not None
         # Tokenizer diagnostics cover all scales, including the supplied first scale.
         for scale_index, (
@@ -428,11 +354,8 @@ def evaluate(
         "teacher_forced_prediction_reconstruction_loss": mean_losses[3].item(),
         "vq_loss": mean_losses[4].item(),
         "teacher_forced_prediction_loss": mean_losses[5].item(),
-        "rollout_state_consistency_loss": mean_losses[6].item(),
-        "entropy_loss": mean_losses[7].item(),
-        "rollout_nucleotide_loss": (
-            rollout_nucleotide_loss_sum / example_count
-        ).item(),
+        "entropy_loss": mean_losses[6].item(),
+        "rollout_nucleotide_loss": (rollout_nucleotide_loss_sum / example_count).item(),
         "nucleotide_reconstruction_accuracy": (
             nucleotide_reconstruction_correct / target_count
         ).item(),
@@ -448,9 +371,7 @@ def evaluate(
         "rollout_nucleotide_accuracy": (
             rollout_nucleotide_correct / target_count
         ).item(),
-        "encoder_commitment_loss": (
-            encoder_commitment_loss_sum / example_count
-        ).item(),
+        "encoder_commitment_loss": (encoder_commitment_loss_sum / example_count).item(),
     }
 
     for scale_index, scale_length in enumerate(model.tokenizer.scale_lengths):
@@ -478,12 +399,6 @@ def evaluate(
             metrics[f"teacher_forced_rollout_agreement_scale_{scale_length}"] = (
                 teacher_forced_rollout_prediction_agreement[prediction_index]
                 / prediction_counts[prediction_index]
-            ).item()
-            metrics[
-                f"rollout_state_consistency_loss_after_scale_{scale_length}"
-            ] = (
-                rollout_state_consistency_loss_sums[prediction_index]
-                / example_count
             ).item()
         metrics[f"quantization_loss_scale_{scale_length}"] = (
             scale_quantization_loss.item()
@@ -520,7 +435,6 @@ def _add_training_statistics(
     target_ids: torch.Tensor,
     loss_sums: torch.Tensor,
     teacher_forced_prediction_correct: torch.Tensor,
-    rollout_prediction_correct: torch.Tensor,
     prediction_count: torch.Tensor,
     nucleotide_reconstruction_correct: torch.Tensor,
     teacher_forced_prediction_reconstruction_correct: torch.Tensor,
@@ -540,7 +454,6 @@ def _add_training_statistics(
                 losses.teacher_forced_prediction_reconstruction,
                 losses.vq,
                 losses.teacher_forced_prediction,
-                losses.rollout_state_consistency,
                 losses.entropy,
             ]
         ).detach()
@@ -557,24 +470,14 @@ def _add_training_statistics(
     target_count += target_ids.numel()
     example_count += batch_size
 
-    rollout = output.rollout
-    for prediction_index, (teacher_forced_logits, clean_targets) in enumerate(
-        zip(
-            output.next_scale_logits_by_scale,
-            output.quantizer.indices_by_scale[1:],
-            strict=True,
-        )
+    for teacher_forced_logits, clean_targets in zip(
+        output.next_scale_logits_by_scale,
+        output.quantizer.indices_by_scale[1:],
+        strict=True,
     ):
         teacher_forced_prediction_correct += (
             teacher_forced_logits.detach().argmax(dim=-1) == clean_targets
         ).sum()
-        if rollout is not None:
-            rollout_prediction_correct += (
-                rollout.prediction_logits_by_scale[prediction_index]
-                .detach()
-                .argmax(dim=-1)
-                == clean_targets
-            ).sum()
         prediction_count += clean_targets.numel()
 
 
@@ -586,16 +489,11 @@ def _validation_metrics_for_wandb(
     """Keep the W&B dashboard focused on outcomes and codebook health."""
     wandb_metrics = {
         "validation/objective/total": validation_metrics["total_loss"],
-        "validation/objective/rollout_state_consistency": validation_metrics[
-            "rollout_state_consistency_loss"
-        ],
         "validation/accuracy/nucleotide_reconstruction": validation_metrics[
             "nucleotide_reconstruction_accuracy"
         ],
         "validation/accuracy/teacher_forced_prediction_reconstruction": (
-            validation_metrics[
-                "teacher_forced_prediction_reconstruction_accuracy"
-            ]
+            validation_metrics["teacher_forced_prediction_reconstruction_accuracy"]
         ),
         "validation/accuracy/teacher_forced_prediction": validation_metrics[
             "teacher_forced_prediction_accuracy"
@@ -612,23 +510,17 @@ def _validation_metrics_for_wandb(
         "code_retention",
         "encoder_latent_drift",
         "active_codebook_drift",
-        "target_state_drift",
-        "target_drift_relative_to_rollout_error",
     )
     for metric_name in stability_metric_names:
         if metric_name in validation_metrics:
-            wandb_metrics[f"validation/stability/{metric_name}"] = (
-                validation_metrics[metric_name]
-            )
+            wandb_metrics[f"validation/stability/{metric_name}"] = validation_metrics[
+                metric_name
+            ]
 
     scale_metric_names = {
-        "teacher_forced_prediction_accuracy": (
-            "teacher_forced_prediction_accuracy"
-        ),
+        "teacher_forced_prediction_accuracy": ("teacher_forced_prediction_accuracy"),
         "rollout_prediction_accuracy": "rollout_prediction_accuracy",
-        "teacher_forced_rollout_agreement": (
-            "teacher_forced_rollout_agreement"
-        ),
+        "teacher_forced_rollout_agreement": ("teacher_forced_rollout_agreement"),
         "cumulative_nucleotide_accuracy": "cumulative_nucleotide_accuracy",
         "rollout_cumulative_nucleotide_accuracy": (
             "rollout_cumulative_nucleotide_accuracy"
@@ -873,26 +765,16 @@ def main(config: DictConfig) -> None:
     partial_reconstruction_loss_weight = (
         config.training.partial_reconstruction_loss_weight
     )
-    rollout_state_consistency_loss_weight = (
-        config.training.rollout_state_consistency_loss_weight
-    )
-    use_rollout_training = rollout_state_consistency_loss_weight != 0
-
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
         should_log = step % config.training.log_interval == 0
 
         if should_log:
-            loss_sums = torch.zeros(8, device=device)
+            loss_sums = torch.zeros(7, device=device)
             teacher_forced_prediction_correct = torch.zeros(
                 (), dtype=torch.long, device=device
             )
-            rollout_prediction_correct = torch.zeros(
-                (), dtype=torch.long, device=device
-            )
-            prediction_count = torch.zeros(
-                (), dtype=torch.long, device=device
-            )
+            prediction_count = torch.zeros((), dtype=torch.long, device=device)
             nucleotide_reconstruction_correct = torch.zeros(
                 (), dtype=torch.long, device=device
             )
@@ -938,7 +820,6 @@ def main(config: DictConfig) -> None:
                             partial_reconstruction_loss_weight != 0
                         ),
                         return_teacher_forced_prediction_reconstruction=True,
-                        return_rollout=use_rollout_training,
                     )
                     losses = nsm_dna_losses(
                         output,
@@ -951,9 +832,6 @@ def main(config: DictConfig) -> None:
                         ),
                         next_scale_prediction_loss_weight=(
                             next_scale_prediction_loss_weight
-                        ),
-                        rollout_state_consistency_loss_weight=(
-                            rollout_state_consistency_loss_weight
                         ),
                         entropy_loss_weight=entropy_loss_weight,
                         entropy_temperature=entropy_temperature,
@@ -969,7 +847,6 @@ def main(config: DictConfig) -> None:
                         target_ids,
                         loss_sums,
                         teacher_forced_prediction_correct,
-                        rollout_prediction_correct,
                         prediction_count,
                         nucleotide_reconstruction_correct,
                         teacher_forced_prediction_reconstruction_correct,
@@ -1001,7 +878,6 @@ def main(config: DictConfig) -> None:
             statistics = [
                 loss_sums,
                 teacher_forced_prediction_correct,
-                rollout_prediction_correct,
                 prediction_count,
                 nucleotide_reconstruction_correct,
                 teacher_forced_prediction_reconstruction_correct,
@@ -1021,8 +897,7 @@ def main(config: DictConfig) -> None:
                     ),
                     "vq_loss": mean_losses[4].item(),
                     "teacher_forced_prediction_loss": mean_losses[5].item(),
-                    "rollout_state_consistency_loss": mean_losses[6].item(),
-                    "entropy_loss": mean_losses[7].item(),
+                    "entropy_loss": mean_losses[6].item(),
                     "nucleotide_reconstruction_accuracy": (
                         nucleotide_reconstruction_correct / target_count
                     ).item(),
@@ -1030,16 +905,11 @@ def main(config: DictConfig) -> None:
                         teacher_forced_prediction_reconstruction_correct / target_count
                     ).item(),
                     "teacher_forced_prediction_accuracy": (
-                        teacher_forced_prediction_correct
-                        / prediction_count
+                        teacher_forced_prediction_correct / prediction_count
                     ).item(),
                     "gradient_norm": gradient_norm.item(),
                     "learning_rate": learning_rate,
                 }
-                if use_rollout_training:
-                    metrics["rollout_prediction_accuracy"] = (
-                        rollout_prediction_correct / prediction_count
-                    ).item()
                 assert component_gradient_norms is not None
                 for component, norm in component_gradient_norms.items():
                     metrics[f"gradient_norm_{component}"] = norm
@@ -1052,24 +922,17 @@ def main(config: DictConfig) -> None:
 
                 progress_bar.set_postfix(
                     loss=f"{metrics['total_loss']:.4f}",
-                    accuracy=(
-                        f"{metrics['nucleotide_reconstruction_accuracy']:.2%}"
-                    ),
+                    accuracy=(f"{metrics['nucleotide_reconstruction_accuracy']:.2%}"),
                 )
                 if wandb_run is not None:
                     dashboard_metrics = {
                         "train/objective/total": metrics["total_loss"],
                         "train/objective/entropy": metrics["entropy_loss"],
-                        "train/objective/rollout_state_consistency": metrics[
-                            "rollout_state_consistency_loss"
-                        ],
                         "train/accuracy/nucleotide_reconstruction": metrics[
                             "nucleotide_reconstruction_accuracy"
                         ],
                         "train/accuracy/teacher_forced_prediction_reconstruction": (
-                            metrics[
-                                "teacher_forced_prediction_reconstruction_accuracy"
-                            ]
+                            metrics["teacher_forced_prediction_reconstruction_accuracy"]
                         ),
                         "train/accuracy/teacher_forced_prediction": metrics[
                             "teacher_forced_prediction_accuracy"
@@ -1077,10 +940,6 @@ def main(config: DictConfig) -> None:
                         "optimization/gradient_norm": metrics["gradient_norm"],
                         "optimization/learning_rate": metrics["learning_rate"],
                     }
-                    if use_rollout_training:
-                        dashboard_metrics["train/accuracy/rollout_prediction"] = (
-                            metrics["rollout_prediction_accuracy"]
-                        )
                     wandb_run.log(dashboard_metrics, step=step)
 
         if step % config.evaluation.interval == 0:
@@ -1100,18 +959,13 @@ def main(config: DictConfig) -> None:
                     next_scale_prediction_loss_weight=(
                         next_scale_prediction_loss_weight
                     ),
-                    rollout_state_consistency_loss_weight=(
-                        rollout_state_consistency_loss_weight
-                    ),
                     entropy_loss_weight=entropy_loss_weight,
                     entropy_temperature=entropy_temperature,
                 )
                 assert validation_anchor_ids is not None
                 assert previous_stability_snapshot is not None
                 current_stability_snapshot = tokenizer_stability_snapshot_to_cpu(
-                    model.tokenizer_stability_snapshot(
-                        validation_anchor_ids.to(device)
-                    )
+                    model.tokenizer_stability_snapshot(validation_anchor_ids.to(device))
                 )
                 validation_metrics.update(
                     tokenizer_stability_metrics(
@@ -1129,8 +983,7 @@ def main(config: DictConfig) -> None:
                     f"{validation_metrics['nucleotide_reconstruction_accuracy']:.2%}, "
                     "first-scale-conditioned rollout accuracy "
                     f"{rollout_accuracy:.2%}, code retention "
-                    f"{validation_metrics['code_retention']:.2%}, target-state drift "
-                    f"{validation_metrics['target_state_drift']:.4f}"
+                    f"{validation_metrics['code_retention']:.2%}"
                 )
 
                 validation_loss = validation_metrics["total_loss"]

@@ -451,7 +451,7 @@ def test_forward_decodes_teacher_forced_predictions_with_soft_gradients() -> Non
     )
 
 
-def test_forward_collects_detached_rollout_and_replays_it() -> None:
+def test_forward_collects_a_detached_rollout() -> None:
     config = _build_end_to_end_config()
     config.model.transformer.dropout = 0.2
     model = NSMDNA.from_config(config)
@@ -470,24 +470,23 @@ def test_forward_collects_detached_rollout_and_replays_it() -> None:
 
     rollout = output.rollout
     assert rollout is not None
-    assert [
-        logits.shape for logits in rollout.prediction_logits_by_scale
-    ] == [(2, 2, 8), (2, 4, 8)]
-    assert [
-        indices.shape for indices in rollout.indices_by_scale
-    ] == [(2, 1), (2, 2), (2, 4)]
+    assert [logits.shape for logits in rollout.prediction_logits_by_scale] == [
+        (2, 2, 8),
+        (2, 4, 8),
+    ]
+    assert [indices.shape for indices in rollout.indices_by_scale] == [
+        (2, 1),
+        (2, 2),
+        (2, 4),
+    ]
     torch.testing.assert_close(
         rollout.indices_by_scale[0],
         output.quantizer.indices_by_scale[0],
     )
     assert all(
-        logits.requires_grad
-        for logits in rollout.prediction_logits_by_scale
+        not logits.requires_grad for logits in rollout.prediction_logits_by_scale
     )
-    assert all(
-        not indices.requires_grad
-        for indices in rollout.indices_by_scale
-    )
+    assert all(not indices.requires_grad for indices in rollout.indices_by_scale)
     for replay_logits, collected_indices in zip(
         rollout.prediction_logits_by_scale,
         rollout.indices_by_scale[1:],
@@ -497,23 +496,6 @@ def test_forward_collects_detached_rollout_and_replays_it() -> None:
             replay_logits.argmax(dim=-1),
             collected_indices,
         )
-    assert len(rollout.predicted_consistency_states_by_scale) == 2
-    assert [
-        state.shape for state in rollout.predicted_consistency_states_by_scale
-    ] == [(2, 4, 8), (2, 4, 8)]
-    assert all(
-        state.requires_grad
-        for state in rollout.predicted_consistency_states_by_scale
-    )
-    assert len(rollout.target_consistency_states_by_scale) == 2
-    assert all(
-        not state.requires_grad
-        for state in rollout.target_consistency_states_by_scale
-    )
-    torch.testing.assert_close(
-        rollout.target_consistency_states_by_scale[-1],
-        output.quantizer.final_latent.detach(),
-    )
     assert rollout.final_reconstruction_logits is not None
     assert rollout.final_reconstruction_logits.shape == (2, 4, 4)
     assert rollout.cumulative_reconstruction_logits_by_scale is not None
@@ -529,8 +511,7 @@ def test_tokenizer_stability_snapshot_is_detached_and_preserves_training_mode() 
         ]
     )
     ema_counts_before = [
-        codebook.ema_counts.clone()
-        for codebook in model.tokenizer.quantizer.codebooks
+        codebook.ema_counts.clone() for codebook in model.tokenizer.quantizer.codebooks
     ]
 
     snapshot = model.tokenizer_stability_snapshot(sequence_ids)
@@ -541,16 +522,6 @@ def test_tokenizer_stability_snapshot_is_detached_and_preserves_training_mode() 
     assert not snapshot.encoder_latent.requires_grad
     assert len(snapshot.indices_by_scale) == 3
     assert len(snapshot.codebooks_by_scale) == 3
-    assert len(snapshot.clean_consistency_states_by_scale) == 2
-    assert len(snapshot.rollout_consistency_states_by_scale) == 2
-    assert all(
-        not state.requires_grad
-        for state in snapshot.clean_consistency_states_by_scale
-    )
-    assert all(
-        not state.requires_grad
-        for state in snapshot.rollout_consistency_states_by_scale
-    )
     for codebook, expected_counts in zip(
         model.tokenizer.quantizer.codebooks,
         ema_counts_before,
