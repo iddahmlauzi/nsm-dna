@@ -28,12 +28,12 @@ def _build_tokenizer() -> MultiscaleTokenizer:
     return tokenizer
 
 
-def test_target_block_window_uses_fixed_sequence_blocks() -> None:
+def test_target_block_window_anchors_the_final_edit_at_the_target_end() -> None:
     reference = "A" * 512
     expected_windows = (
         (10, None, None),
         (150, 0, 150),
-        (290, 128, 162),
+        (290, 35, 255),
     )
 
     for mutation_position, expected_start, position_in_window in expected_windows:
@@ -51,15 +51,35 @@ def test_target_block_window_uses_fixed_sequence_blocks() -> None:
 
 
 def test_target_block_window_excludes_incomplete_target_blocks() -> None:
-    assert (
-        target_block_window(
-            "A" * 200,
-            "A" * 150 + "C" + "A" * 49,
-            128,
-            128,
+    reference = "A" * 200
+    mutant = "A" * 150 + "C" + "A" * 49
+
+    assert target_block_window(reference, mutant, 128, 128) is None
+
+
+def test_target_block_window_without_prefix_covers_sequence_boundaries() -> None:
+    reference = "A" * 200
+
+    for mutation_position, expected_start, position_in_window in (
+        (10, 0, 10),
+        (150, 23, 127),
+        (199, 72, 127),
+    ):
+        mutant = (
+            reference[:mutation_position] + "C" + reference[mutation_position + 1 :]
         )
-        is None
-    )
+        window = target_block_window(reference, mutant, 0, 128)
+
+        assert window is not None
+        assert window[2] == expected_start
+        assert window[1][position_in_window] == "C"
+
+
+def test_target_block_window_excludes_edits_spanning_more_than_target() -> None:
+    reference = "A" * 256
+    mutant = "C" + reference[1:200] + "C" + reference[201:]
+
+    assert target_block_window(reference, mutant, 0, 128) is None
 
 
 def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:

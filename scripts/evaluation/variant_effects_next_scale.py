@@ -71,7 +71,7 @@ def target_block_window(
     prefix_length: int,
     target_length: int,
 ) -> tuple[str, str, int] | None:
-    """Use the fixed target block containing the edit and its preceding prefix."""
+    """Place the final edit at the target's end when the sequence boundary permits."""
     reference = reference.upper()
     mutant = mutant.upper()
     if len(reference) != len(mutant):
@@ -87,10 +87,14 @@ def target_block_window(
 
     first_change = changed_positions[0]
     last_change = changed_positions[-1]
-    target_start = (first_change // target_length) * target_length
+    target_start = max(prefix_length, last_change - target_length + 1)
     window_start = target_start - prefix_length
     window_end = target_start + target_length
-    if window_start < 0 or window_end > len(reference) or last_change >= window_end:
+    if (
+        window_start < 0
+        or window_end > len(reference)
+        or first_change < target_start
+    ):
         return None
 
     return (
@@ -388,7 +392,7 @@ def main(config: DictConfig) -> None:
             f"the model maximum of {model.max_prefix_length}."
         )
     target_length = int(tokenizer.context_length)
-    component_names = [f"scale_{length}" for length in tokenizer.scale_lengths]
+    component_names = [f"scale_{length}" for length in tokenizer.scale_lengths[1:]]
     component_names.extend(["hierarchy", "decoder"])
 
     results = []

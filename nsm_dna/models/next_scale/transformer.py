@@ -3,7 +3,7 @@ import math
 import einx
 import torch
 import torch.nn as nn
-from jaxtyping import Bool, Float
+from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from ..common import (
@@ -159,9 +159,9 @@ class NextScaleTransformer(nn.Module):
             bias=bias,
         )
 
-        # Scale 1 is supplied as the cumulative input used to predict scale 4.
-        # The transformer therefore has one section for each predicted scale,
-        # rather than a learned BOS section for scale 1.
+        # The first scale is supplied as the cumulative input used to predict the
+        # next scale. The transformer therefore has sections only for predicted
+        # scales rather than a learned BOS section.
         self.scale_embedding = nn.Embedding(
             len(self.predicted_scale_lengths),
             self.model_dim,
@@ -282,32 +282,46 @@ class NextScaleTransformer(nn.Module):
         """
         refined_scale_inputs = []
 
-        for scale_input, refinement_conv in zip(
-            scale_inputs,
-            self.scale_input_convs,
-            strict=True,
-        ):
-            scale_input_channels_first = einx.id("b l d -> b d l", scale_input)
-            correction = refinement_conv(scale_input_channels_first)
-            correction = einx.id("b d l -> b l d", correction)
-            refined_scale_inputs.append(scale_input + correction)
+        if len(scale_inputs) != len(self.scale_input_convs):
+            raise ValueError("Expected one input for every predicted scale.")
+        for prediction_index, scale_input in enumerate(scale_inputs):
+            refined_scale_inputs.append(
+                self._refine_scale_input(scale_input, prediction_index)
+            )
 
         return refined_scale_inputs
+
+    def _refine_scale_input(
+        self,
+        scale_input: Float[Tensor, "batch scale_length input_dim"],
+        prediction_index: int,
+    ) -> Float[Tensor, "batch scale_length input_dim"]:
+        """Apply the input correction belonging to one predicted scale."""
+        scale_input_channels_first = einx.id("b l d -> b d l", scale_input)
+        correction = self.scale_input_convs[prediction_index](
+            scale_input_channels_first
+        )
+        correction = einx.id("b d l -> b l d", correction)
+        return scale_input + correction
 
     def _build_attention_mask(
         self,
         prefix_length: int,
+        scale_ids: Tensor | None = None,
     ) -> Bool[Tensor, "1 1 length length"]:
         """Let every scale read the prefix while keeping scale sections isolated."""
-        if prefix_length == 0:
+        if scale_ids is None and prefix_length == 0:
             return self.scale_attention_mask
+
+        if scale_ids is None:
+            scale_ids = self.scale_ids
 
         prefix_section_ids = torch.full(
             (prefix_length,),
             -1,
-            device=self.scale_ids.device,
+            device=scale_ids.device,
         )
-        section_ids = torch.cat([prefix_section_ids, self.scale_ids])
+        section_ids = torch.cat([prefix_section_ids, scale_ids])
         row_section_ids = einx.id("row -> row 1", section_ids)
         column_section_ids = einx.id("column -> 1 column", section_ids)
 
@@ -318,28 +332,37 @@ class NextScaleTransformer(nn.Module):
             same_section | target_reads_prefix,
         )
 
-    def _get_rotary_embeddings(self, prefix_length: int) -> RotaryEmbeddings:
+    def _get_rotary_embeddings(
+        self,
+        prefix_length: int,
+        scale_cosine: Tensor | None = None,
+        scale_sine: Tensor | None = None,
+    ) -> RotaryEmbeddings:
         """Combine sequential prefix positions with reset per-scale positions."""
+        if scale_cosine is None:
+            scale_cosine = self.rope_cosine
+        if scale_sine is None:
+            scale_sine = self.rope_sine
         cosine = torch.cat(
-            [self.prefix_rope_cosine[:prefix_length], self.rope_cosine],
+            [self.prefix_rope_cosine[:prefix_length], scale_cosine],
             dim=0,
         )
         sine = torch.cat(
-            [self.prefix_rope_sine[:prefix_length], self.rope_sine],
+            [self.prefix_rope_sine[:prefix_length], scale_sine],
             dim=0,
         )
         return cosine, sine
 
-    def encode(
+    def _encode_hierarchy(
         self,
-        scale_inputs: list[Float[Tensor, "batch scale_length input_dim"]],
+        hierarchy_inputs: Float[Tensor, "batch hierarchy_length input_dim"],
+        hierarchy_scale_ids: Int[Tensor, "hierarchy_length"],
+        hierarchy_rope_cosine: Float[Tensor, "hierarchy_length head_dim"],
+        hierarchy_rope_sine: Float[Tensor, "hierarchy_length head_dim"],
         *,
-        prefix: Float[Tensor, "batch prefix_length input_dim"] | None = None,
+        prefix: Float[Tensor, "batch prefix_length input_dim"] | None,
     ) -> Float[Tensor, "batch length model_dim"]:
-        """Return final normalized states for the prefix and target hierarchy."""
-        refined_scale_inputs = self._refine_scale_inputs(scale_inputs)
-        hierarchy_inputs = torch.cat(refined_scale_inputs, dim=1)
-
+        """Encode an arbitrary set of isolated hierarchy sections."""
         prefix_length = 0 if prefix is None else prefix.shape[1]
         if prefix_length > self.max_prefix_length:
             raise ValueError(
@@ -356,18 +379,22 @@ class NextScaleTransformer(nn.Module):
         prefix_hidden_states = projected_inputs[:, :prefix_length]
         hierarchy_hidden_states = projected_inputs[:, prefix_length:]
         hierarchy_hidden_states = hierarchy_hidden_states + self.scale_embedding(
-            self.scale_ids
+            hierarchy_scale_ids
         )
-
-        # The prefix comes first. Each following section is the supplied
-        # cumulative hierarchy through the scale preceding its prediction.
         hidden_states = torch.cat(
             [prefix_hidden_states, hierarchy_hidden_states],
             dim=1,
         )
 
-        attention_mask = self._build_attention_mask(prefix_length)
-        rotary_embeddings = self._get_rotary_embeddings(prefix_length)
+        attention_mask = self._build_attention_mask(
+            prefix_length,
+            hierarchy_scale_ids,
+        )
+        rotary_embeddings = self._get_rotary_embeddings(
+            prefix_length,
+            hierarchy_rope_cosine,
+            hierarchy_rope_sine,
+        )
         for block in self.blocks:
             hidden_states = block(
                 hidden_states,
@@ -376,6 +403,57 @@ class NextScaleTransformer(nn.Module):
             )
 
         return self.final_norm(hidden_states)
+
+    def encode(
+        self,
+        scale_inputs: list[Float[Tensor, "batch scale_length input_dim"]],
+        *,
+        prefix: Float[Tensor, "batch prefix_length input_dim"] | None = None,
+    ) -> Float[Tensor, "batch length model_dim"]:
+        """Return final normalized states for the prefix and target hierarchy."""
+        refined_scale_inputs = self._refine_scale_inputs(scale_inputs)
+        hierarchy_inputs = torch.cat(refined_scale_inputs, dim=1)
+        return self._encode_hierarchy(
+            hierarchy_inputs,
+            self.scale_ids,
+            self.rope_cosine,
+            self.rope_sine,
+            prefix=prefix,
+        )
+
+    def predict_scale(
+        self,
+        scale_input: Float[Tensor, "batch scale_length input_dim"],
+        prediction_index: int,
+        *,
+        prefix: Float[Tensor, "batch prefix_length input_dim"] | None = None,
+    ) -> Float[Tensor, "batch scale_length codebook_size"]:
+        """Predict one scale without evaluating the other isolated sections."""
+        if not 0 <= prediction_index < len(self.predicted_scale_lengths):
+            raise IndexError("prediction_index is outside the predicted scales.")
+
+        expected_length = self.predicted_scale_lengths[prediction_index]
+        if scale_input.shape[1] != expected_length:
+            raise ValueError(
+                f"Prediction index {prediction_index} expects scale length "
+                f"{expected_length}, received {scale_input.shape[1]}."
+            )
+
+        start = sum(self.predicted_scale_lengths[:prediction_index])
+        end = start + expected_length
+        refined_scale_input = self._refine_scale_input(
+            scale_input,
+            prediction_index,
+        )
+        hidden_states = self._encode_hierarchy(
+            refined_scale_input,
+            self.scale_ids[start:end],
+            self.rope_cosine[start:end],
+            self.rope_sine[start:end],
+            prefix=prefix,
+        )
+        prefix_length = 0 if prefix is None else prefix.shape[1]
+        return self.output_head(hidden_states[:, prefix_length:])
 
     def forward(
         self,

@@ -288,6 +288,42 @@ def test_nsm_transformer_keeps_scale_sections_isolated() -> None:
     )
 
 
+def test_single_scale_prediction_matches_parallel_scale_section() -> None:
+    model = NextScaleTransformer(
+        input_dim=6,
+        model_dim=16,
+        scale_lengths=[1, 2, 4],
+        codebook_size=7,
+        num_layers=2,
+        num_heads=4,
+        dropout=0.1,
+        max_prefix_length=3,
+    ).eval()
+    prefix = torch.randn(2, 3, 6)
+    scale_inputs = [torch.randn(2, 2, 6), torch.randn(2, 4, 6)]
+
+    parallel_logits = torch.split(
+        model(scale_inputs, prefix=prefix),
+        model.predicted_scale_lengths,
+        dim=1,
+    )
+    single_scale_logits = [
+        model.predict_scale(
+            scale_input,
+            prediction_index,
+            prefix=prefix,
+        )
+        for prediction_index, scale_input in enumerate(scale_inputs)
+    ]
+
+    for actual, expected in zip(
+        single_scale_logits,
+        parallel_logits,
+        strict=True,
+    ):
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
 def _build_end_to_end_config():
     return OmegaConf.create(
         {
@@ -352,7 +388,31 @@ def test_forward_runs_the_complete_pipeline_in_one_model_call() -> None:
     assert encoder_calls == 1
     assert output.reconstruction_logits.shape == (2, 4, 4)
     assert output.partial_reconstruction_logits is None
-    assert output.autoregressive_reconstruction_logits is None
+    assert output.teacher_forced_prediction_reconstruction_logits is None
+    assert [logits.shape for logits in output.next_scale_logits_by_scale] == [
+        (2, 2, 8),
+        (2, 4, 8),
+    ]
+
+
+def test_forward_runs_without_a_prefix() -> None:
+    config = _build_end_to_end_config()
+    config.data.sequence_length = config.model.tokenizer.context_length
+    model = NSMDNA.from_config(config)
+    sequence_ids = torch.tensor(
+        [
+            [0, 1, 2, 3],
+            [3, 2, 1, 0],
+        ]
+    )
+
+    prefix_latent, target_latent = model.tokenizer.encode_pair(sequence_ids)
+    output = model(sequence_ids)
+
+    assert model.transformer.max_prefix_length == 0
+    assert prefix_latent.shape == (2, 0, model.tokenizer.embed_dim)
+    assert target_latent.shape == (2, 4, model.tokenizer.embed_dim)
+    assert output.reconstruction_logits.shape == (2, 4, 4)
     assert [logits.shape for logits in output.next_scale_logits_by_scale] == [
         (2, 2, 8),
         (2, 4, 8),
@@ -361,7 +421,7 @@ def test_forward_runs_the_complete_pipeline_in_one_model_call() -> None:
     assert len(output.quantizer.next_scale_inputs) == 2
 
 
-def test_forward_decodes_hard_predictions_with_soft_gradients_for_apr() -> None:
+def test_forward_decodes_teacher_forced_predictions_with_soft_gradients() -> None:
     model = NSMDNA.from_config(_build_end_to_end_config())
     output = model(
         torch.tensor(
@@ -370,12 +430,13 @@ def test_forward_decodes_hard_predictions_with_soft_gradients_for_apr() -> None:
                 [3, 2, 1, 0, 0, 1, 2, 3],
             ]
         ),
-        return_autoregressive_reconstruction=True,
+        return_teacher_forced_prediction_reconstruction=True,
     )
 
-    assert output.autoregressive_reconstruction_logits is not None
-    assert output.autoregressive_reconstruction_logits.shape == (2, 4, 4)
-    output.autoregressive_reconstruction_logits.square().mean().backward()
+    reconstruction_logits = output.teacher_forced_prediction_reconstruction_logits
+    assert reconstruction_logits is not None
+    assert reconstruction_logits.shape == (2, 4, 4)
+    reconstruction_logits.square().mean().backward()
     assert any(
         parameter.grad is not None and parameter.grad.count_nonzero() > 0
         for parameter in model.transformer.parameters()
@@ -388,6 +449,211 @@ def test_forward_decodes_hard_predictions_with_soft_gradients_for_apr() -> None:
         codebook.codebook.grad is None
         for codebook in model.tokenizer.quantizer.codebooks
     )
+
+
+def test_forward_collects_detached_rollout_and_replays_it() -> None:
+    config = _build_end_to_end_config()
+    config.model.transformer.dropout = 0.2
+    model = NSMDNA.from_config(config)
+    sequence_ids = torch.tensor(
+        [
+            [0, 1, 2, 3, 3, 2, 1, 0],
+            [3, 2, 1, 0, 0, 1, 2, 3],
+        ]
+    )
+
+    output = model(
+        sequence_ids,
+        return_rollout=True,
+        return_rollout_reconstructions=True,
+    )
+
+    rollout = output.rollout
+    assert rollout is not None
+    assert [
+        logits.shape for logits in rollout.prediction_logits_by_scale
+    ] == [(2, 2, 8), (2, 4, 8)]
+    assert [
+        indices.shape for indices in rollout.indices_by_scale
+    ] == [(2, 1), (2, 2), (2, 4)]
+    torch.testing.assert_close(
+        rollout.indices_by_scale[0],
+        output.quantizer.indices_by_scale[0],
+    )
+    assert all(
+        logits.requires_grad
+        for logits in rollout.prediction_logits_by_scale
+    )
+    assert all(
+        not indices.requires_grad
+        for indices in rollout.indices_by_scale
+    )
+    for replay_logits, collected_indices in zip(
+        rollout.prediction_logits_by_scale,
+        rollout.indices_by_scale[1:],
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            replay_logits.argmax(dim=-1),
+            collected_indices,
+        )
+    assert len(rollout.predicted_consistency_states_by_scale) == 2
+    assert [
+        state.shape for state in rollout.predicted_consistency_states_by_scale
+    ] == [(2, 4, 8), (2, 4, 8)]
+    assert all(
+        state.requires_grad
+        for state in rollout.predicted_consistency_states_by_scale
+    )
+    assert len(rollout.target_consistency_states_by_scale) == 2
+    assert all(
+        not state.requires_grad
+        for state in rollout.target_consistency_states_by_scale
+    )
+    torch.testing.assert_close(
+        rollout.target_consistency_states_by_scale[-1],
+        output.quantizer.final_latent.detach(),
+    )
+    assert rollout.final_reconstruction_logits is not None
+    assert rollout.final_reconstruction_logits.shape == (2, 4, 4)
+    assert rollout.cumulative_reconstruction_logits_by_scale is not None
+    assert len(rollout.cumulative_reconstruction_logits_by_scale) == 3
+
+
+def test_tokenizer_stability_snapshot_is_detached_and_preserves_training_mode() -> None:
+    model = NSMDNA.from_config(_build_end_to_end_config()).train()
+    sequence_ids = torch.tensor(
+        [
+            [0, 1, 2, 3, 3, 2, 1, 0],
+            [3, 2, 1, 0, 0, 1, 2, 3],
+        ]
+    )
+    ema_counts_before = [
+        codebook.ema_counts.clone()
+        for codebook in model.tokenizer.quantizer.codebooks
+    ]
+
+    snapshot = model.tokenizer_stability_snapshot(sequence_ids)
+
+    assert model.training
+    assert model.tokenizer.training
+    assert model.transformer.training
+    assert not snapshot.encoder_latent.requires_grad
+    assert len(snapshot.indices_by_scale) == 3
+    assert len(snapshot.codebooks_by_scale) == 3
+    assert len(snapshot.clean_consistency_states_by_scale) == 2
+    assert len(snapshot.rollout_consistency_states_by_scale) == 2
+    assert all(
+        not state.requires_grad
+        for state in snapshot.clean_consistency_states_by_scale
+    )
+    assert all(
+        not state.requires_grad
+        for state in snapshot.rollout_consistency_states_by_scale
+    )
+    for codebook, expected_counts in zip(
+        model.tokenizer.quantizer.codebooks,
+        ema_counts_before,
+        strict=True,
+    ):
+        torch.testing.assert_close(codebook.ema_counts, expected_counts)
+
+
+def test_rollout_advances_with_its_own_predictions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = NSMDNA.from_config(_build_end_to_end_config())
+    quantizer = model.tokenizer.quantizer
+    predicted_code_by_scale = [1, 2]
+    contribution_indices = []
+    rollout_transformer_modes = []
+    original_scale_contribution = quantizer.scale_contribution_from_indices
+
+    def record_scale_contribution(indices, scale_index):
+        contribution_indices.append(indices.detach().clone())
+        return original_scale_contribution(indices, scale_index)
+
+    def fixed_predictions(scale_input, prediction_index, *, prefix=None):
+        del prefix
+        rollout_transformer_modes.append(model.transformer.training)
+        logits = scale_input.new_zeros(
+            scale_input.shape[0],
+            scale_input.shape[1],
+            model.transformer.codebook_size,
+        )
+        logits[..., predicted_code_by_scale[prediction_index]] = 1
+        return logits
+
+    monkeypatch.setattr(
+        quantizer,
+        "scale_contribution_from_indices",
+        record_scale_contribution,
+    )
+    monkeypatch.setattr(model.transformer, "predict_scale", fixed_predictions)
+
+    model.train()
+    output = model(
+        torch.tensor(
+            [
+                [0, 1, 2, 3, 3, 2, 1, 0],
+                [3, 2, 1, 0, 0, 1, 2, 3],
+            ]
+        ),
+        return_rollout=True,
+    )
+
+    rollout = output.rollout
+    assert rollout is not None
+    assert rollout_transformer_modes == [False, False]
+    assert model.transformer.training is True
+    assert torch.equal(
+        rollout.indices_by_scale[1],
+        torch.full((2, 2), 1),
+    )
+    assert torch.equal(
+        rollout.indices_by_scale[2],
+        torch.full((2, 4), 2),
+    )
+    assert torch.equal(contribution_indices[1], torch.full((2, 2), 1))
+    assert torch.equal(contribution_indices[2], torch.full((2, 4), 2))
+
+
+def test_rollout_does_not_add_an_ema_update() -> None:
+    config = _build_end_to_end_config()
+    teacher_forced_model = NSMDNA.from_config(config)
+    rollout_model = NSMDNA.from_config(config)
+    rollout_model.load_state_dict(teacher_forced_model.state_dict())
+    sequence_ids = torch.tensor(
+        [
+            [0, 1, 2, 3, 3, 2, 1, 0],
+            [3, 2, 1, 0, 0, 1, 2, 3],
+        ]
+    )
+
+    teacher_forced_model(sequence_ids)
+    rollout_model(sequence_ids, return_rollout=True)
+
+    for expected_codebook, actual_codebook in zip(
+        teacher_forced_model.tokenizer.quantizer.codebooks,
+        rollout_model.tokenizer.quantizer.codebooks,
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            actual_codebook.ema_counts,
+            expected_codebook.ema_counts,
+        )
+        torch.testing.assert_close(
+            actual_codebook.ema_vector_sums,
+            expected_codebook.ema_vector_sums,
+        )
+        torch.testing.assert_close(
+            actual_codebook.codebook_hits,
+            expected_codebook.codebook_hits,
+        )
+        torch.testing.assert_close(
+            actual_codebook.codebook,
+            expected_codebook.codebook,
+        )
 
 
 def test_forward_decodes_one_true_partial_cumulative_latent() -> None:

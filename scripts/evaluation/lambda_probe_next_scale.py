@@ -33,22 +33,31 @@ class NSMWindowEncoder(nn.Module):
         self.tokenizer = tokenizer
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        block_length = self.tokenizer.context_length
-        prefix_ids = input_ids[:, :block_length]
-        target_ids = input_ids[:, block_length:]
+        target_length = self.tokenizer.context_length
+        prefix_length = input_ids.shape[1] - target_length
+        if prefix_length < 0:
+            raise ValueError(
+                f"Expected at least {target_length} sequence positions, "
+                f"received {input_ids.shape[1]}."
+            )
+
+        target_ids = input_ids[:, prefix_length:]
 
         with torch.autocast(
             device_type=input_ids.device.type,
             dtype=torch.bfloat16,
             enabled=input_ids.device.type == "cuda",
         ):
-            prefix = self.tokenizer.encode(prefix_ids)
+            prefix = (
+                self.tokenizer.encode(input_ids[:, :prefix_length])
+                if prefix_length > 0
+                else None
+            )
             targets_by_scale = self.tokenizer.encode_indices(target_ids)
             scale_inputs = self.tokenizer.indices_to_next_scale_inputs(targets_by_scale)
             hidden_states = self.model.encode(scale_inputs, prefix=prefix)
 
-        prefix_hidden_states = hidden_states[:, : prefix.shape[1]]
-        hierarchy_hidden_states = hidden_states[:, prefix.shape[1] :]
+        hierarchy_hidden_states = hidden_states[:, prefix_length:]
         hidden_states_by_scale = torch.split(
             hierarchy_hidden_states,
             self.tokenizer.scale_lengths[1:],
@@ -61,7 +70,10 @@ class NSMWindowEncoder(nn.Module):
             ],
             dim=1,
         )
-        pooled_prefix = prefix_hidden_states.mean(dim=1)
+        if prefix is None:
+            return pooled_by_scale.float()
+
+        pooled_prefix = hidden_states[:, :prefix_length].mean(dim=1)
         return torch.cat([pooled_prefix, pooled_by_scale], dim=1).float()
 
 
@@ -190,6 +202,8 @@ def evaluate_representations(
     config: DictConfig,
     output_directory: Path,
     device: torch.device,
+    *,
+    include_prefix: bool,
 ) -> dict[str, dict[str, object]]:
     """Extract all pooled NSM sections once and probe them separately."""
     split_names = ["train", "test"]
@@ -198,7 +212,7 @@ def evaluate_representations(
     combined_embeddings = {
         split_name: extract_segment_embeddings(
             encoder,
-            (len(scale_lengths) + 1) * model_dim,
+            (len(scale_lengths) + int(include_prefix)) * model_dim,
             window_length,
             stride,
             splits[split_name].sequences,
@@ -209,14 +223,15 @@ def evaluate_representations(
         for split_name in split_names
     }
 
-    representations = {
-        "prefix": {
+    representations = {}
+    if include_prefix:
+        representations["prefix"] = {
             split_name: embeddings[:, :model_dim]
             for split_name, embeddings in combined_embeddings.items()
         }
-    }
+    scale_offset = int(include_prefix)
     for scale_index, scale_length in enumerate(scale_lengths):
-        section_start = (scale_index + 1) * model_dim
+        section_start = (scale_index + scale_offset) * model_dim
         section_end = section_start + model_dim
         representations[f"scale_length_{scale_length}"] = {
             split_name: embeddings[:, section_start:section_end]
@@ -295,6 +310,7 @@ def main(config: DictConfig) -> None:
     )
     window_length = int(model_config.data.sequence_length)
     stride = tokenizer.context_length
+    include_prefix = trained_model.max_prefix_length > 0
     parameter_count = sum(parameter.numel() for parameter in trained_model.parameters())
 
     trained_results = evaluate_representations(
@@ -308,6 +324,7 @@ def main(config: DictConfig) -> None:
         config,
         output_directory,
         device,
+        include_prefix=include_prefix,
     )
     results = {"trained": trained_results}
     random_seed = None
@@ -332,6 +349,7 @@ def main(config: DictConfig) -> None:
             config,
             output_directory,
             device,
+            include_prefix=include_prefix,
         )
         results[random_name] = random_results
         results["delta_mcc"] = {
@@ -366,9 +384,15 @@ def main(config: DictConfig) -> None:
             for name, path in split_paths.items()
         },
         "representations": {
-            "prefix": (
-                "final normalized NSM prefix hidden states, mean-pooled within "
-                "each window and then across windows"
+            **(
+                {
+                    "prefix": (
+                        "final normalized NSM prefix hidden states, mean-pooled "
+                        "within each window and then across windows"
+                    )
+                }
+                if include_prefix
+                else {}
             ),
             **{
                 f"scale_length_{scale_length}": (

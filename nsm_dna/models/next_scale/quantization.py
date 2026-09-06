@@ -23,26 +23,16 @@ class QuantizerOutput:
         Float[Tensor, "batch scale_length codebook_size"]
     ]
     assignment_logits_by_scale: list[Float[Tensor, "batch scale_length codebook_size"]]
-    commitment_losses_by_scale: list[Float[Tensor, ""]]
+    encoder_commitment_loss: Float[Tensor, ""]
     quantization_losses_by_scale: list[Float[Tensor, ""]]
     partial_latent: Float[Tensor, "batch length embed_dim"] | None = None
 
     @property
-    def vq_losses_by_scale(self) -> list[Float[Tensor, ""]]:
-        """Combined commitment and quantization loss for every scale."""
-        return [
-            commitment_loss + quantization_loss
-            for commitment_loss, quantization_loss in zip(
-                self.commitment_losses_by_scale,
-                self.quantization_losses_by_scale,
-                strict=True,
-            )
-        ]
-
-    @property
     def vq_loss(self) -> Float[Tensor, ""]:
-        """Mean VQ loss across scales."""
-        return torch.stack(self.vq_losses_by_scale).mean()
+        """Final encoder commitment plus mean residual quantization loss."""
+        return self.encoder_commitment_loss + torch.stack(
+            self.quantization_losses_by_scale
+        ).mean()
 
 
 class EMACodebook(nn.Module):
@@ -84,6 +74,24 @@ class EMACodebook(nn.Module):
         )
         return 1.0 - (1.0 - self.base_decay) / world_size
 
+    def _distances_to_codes(
+        self,
+        x: Float[Tensor, "batch length embed_dim"],
+    ) -> tuple[
+        Float[Tensor, "positions embed_dim"],
+        Float[Tensor, "codebook_size embed_dim"],
+        Float[Tensor, "positions codebook_size"],
+    ]:
+        """Return flattened inputs, fixed code vectors, and squared distances."""
+        flat_input = einx.id("b l d -> (b l) d", x.float())
+        codebook = self.codebook.detach().clone()
+        distances = (
+            torch.sum(flat_input**2, dim=1, keepdim=True)
+            + torch.sum(codebook**2, dim=1)
+            - 2 * einx.dot("n d, k d -> n k", flat_input, codebook)
+        )
+        return flat_input, codebook, distances
+
     def forward(
         self,
         x: Float[Tensor, "batch length embed_dim"],
@@ -93,15 +101,7 @@ class EMACodebook(nn.Module):
         Float[Tensor, "batch length codebook_size"],
         Float[Tensor, "batch length codebook_size"],
     ]:
-        flat_input = einx.id("b l d -> (b l) d", x.float())
-        codebook = self.codebook.detach().clone()
-
-        # Compute the distance from each input to every codebook vector.
-        distances = (
-            torch.sum(flat_input**2, dim=1, keepdim=True)
-            + torch.sum(codebook**2, dim=1)
-            - 2 * einx.dot("n d, k d -> n k", flat_input, codebook)
-        )
+        flat_input, codebook, distances = self._distances_to_codes(x)
         flat_assignment_logits = -distances
         flat_probabilities = torch.softmax(
             flat_assignment_logits / self.temperature,
@@ -344,6 +344,23 @@ class BlendedConv1d(nn.Module):
         refined = x * (1 - self.refinement_ratio) + convolved * self.refinement_ratio
         return refined
 
+    def forward_with_fixed_parameters(
+        self,
+        x: Float[Tensor, "batch embed_dim length"],
+    ) -> Float[Tensor, "batch embed_dim length"]:
+        """Preserve input gradients without updating this refiner's parameters."""
+        bias = self.conv.bias.detach() if self.conv.bias is not None else None
+        convolved = F.conv1d(
+            x,
+            self.conv.weight.detach(),
+            bias,
+            stride=self.conv.stride,
+            padding=self.conv.padding,
+            dilation=self.conv.dilation,
+            groups=self.conv.groups,
+        )
+        return x * (1 - self.refinement_ratio) + convolved * self.refinement_ratio
+
 
 class MultiscaleResidualVectorQuantizer(nn.Module):
     """Multiscale residual vector quantizer."""
@@ -479,7 +496,26 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         scale_contribution = self.refiners[scale_index](scale_contribution)
         return einx.id("b d l -> b l d", scale_contribution)
 
-    def prediction_logits_to_final_latent(
+    @torch.no_grad()
+    def next_scale_input_from_cumulative(
+        self,
+        cumulative_latent: Float[Tensor, "batch length embed_dim"],
+        scale_index: int,
+    ) -> Float[Tensor, "batch scale_length embed_dim"]:
+        """Resize a generated cumulative latent for one next-scale prediction."""
+        return self._resize_to_scale(cumulative_latent.detach(), scale_index)
+
+    @torch.no_grad()
+    def scale_contribution_from_indices(
+        self,
+        indices: Int[Tensor, "batch scale_length"],
+        scale_index: int,
+    ) -> Float[Tensor, "batch length embed_dim"]:
+        """Construct one full-length contribution from fixed hard code indices."""
+        quantized_at_scale = self.codebooks[scale_index].codebook[indices]
+        return self._prepare_scale_contribution(quantized_at_scale, scale_index)
+
+    def teacher_forced_prediction_logits_to_final_latent(
         self,
         logits_by_scale: list[Float[Tensor, "batch scale_length codebook_size"]],
         *,
@@ -487,9 +523,9 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
     ) -> Float[Tensor, "batch length embed_dim"]:
         """Add predicted refinement scales to the supplied first-scale latent.
 
-        Scale 1 is observed rather than predicted. APR keeps that true coarse
-        contribution, then decodes the hard codes selected for scales 4 onward
-        while using their soft probabilities for transformer gradients.
+        The first scale is observed rather than predicted. The teacher-forced
+        reconstruction keeps that true coarse contribution, then decodes hard
+        predictions for the finer scales while retaining soft Transformer gradients.
         """
         reconstruction = initial_latent
 
@@ -511,6 +547,73 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             )
 
         return reconstruction
+
+    def predicted_consistency_state(
+        self,
+        prediction_logits: Float[Tensor, "batch scale_length codebook_size"],
+        rollout_cumulative_latent: Float[Tensor, "batch length embed_dim"],
+        predicted_scale_index: int,
+    ) -> Float[Tensor, "batch state_length embed_dim"]:
+        """Build a post-prediction rollout state with soft gradients.
+
+        The codebook and quantizer refiner are fixed for this operation. This
+        lets state consistency train the predictor without allowing the target
+        latent geometry to move toward an erroneous rollout. Intermediate
+        predictions are expressed as the following scale's input; the final
+        prediction is expressed as the complete full-length latent.
+        """
+        if not 1 <= predicted_scale_index < len(self.scale_lengths):
+            raise ValueError(
+                "A predicted consistency state requires a non-first scale index."
+            )
+
+        codebook = self.codebooks[predicted_scale_index]
+        probabilities = torch.softmax(prediction_logits.float(), dim=-1)
+        hard_indices = probabilities.argmax(dim=-1)
+        hard_assignments = F.one_hot(
+            hard_indices,
+            num_classes=codebook.codebook_size,
+        ).to(probabilities.dtype)
+        assignments = hard_assignments + probabilities - probabilities.detach()
+        predicted_codes = assignments @ codebook.codebook.detach()
+
+        predicted_codes = einx.id("b l d -> b d l", predicted_codes)
+        contribution = self._upsample_to_full_length(
+            predicted_codes,
+            predicted_scale_index,
+        )
+        contribution = self.refiners[
+            predicted_scale_index
+        ].forward_with_fixed_parameters(contribution)
+        contribution = einx.id("b d l -> b l d", contribution)
+
+        next_cumulative_latent = rollout_cumulative_latent.detach() + contribution
+        if predicted_scale_index == len(self.scale_lengths) - 1:
+            return next_cumulative_latent
+        return self._resize_to_scale(
+            next_cumulative_latent,
+            predicted_scale_index + 1,
+        )
+
+    @torch.no_grad()
+    def consistency_states_from_cumulative_latents(
+        self,
+        cumulative_latents: list[Float[Tensor, "batch length embed_dim"]],
+    ) -> list[Float[Tensor, "batch state_length embed_dim"]]:
+        """Express each post-prediction cumulative in consistency-loss space."""
+        states = []
+        for scale_index in range(1, len(self.scale_lengths)):
+            cumulative_latent = cumulative_latents[scale_index]
+            if scale_index == len(self.scale_lengths) - 1:
+                states.append(cumulative_latent.detach())
+            else:
+                states.append(
+                    self._resize_to_scale(
+                        cumulative_latent.detach(),
+                        scale_index + 1,
+                    )
+                )
+        return states
 
     def _corrupt_quantized_vectors(
         self,
@@ -616,7 +719,6 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         ] = []
         cumulative_latents: list[Float[Tensor, "batch length embed_dim"]] = []
         next_scale_inputs: list[Float[Tensor, "batch scale_length embed_dim"]] = []
-        commitment_losses_by_scale: list[Float[Tensor, ""]] = []
         quantization_losses_by_scale: list[Float[Tensor, ""]] = []
         partial_quantized_latent: Tensor | None = None
 
@@ -646,8 +748,9 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             residual = residual - scale_contribution
 
             if scale_index < len(self.scale_lengths) - 1:
-                # Scale 1 is supplied exactly during conditioned rollout, so
-                # corrupting it would train scale 4 against an error it never sees.
+                # The first scale is supplied exactly during conditioned rollout,
+                # so corrupting it would train the next scale against an error it
+                # never sees.
                 if scale_index == 0:
                     corrupted_quantized = quantized_at_scale
                 else:
@@ -674,13 +777,6 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
                     )
                 )
 
-            # Pull the encoder toward the current quantized reconstruction.
-            encoder_commitment_loss = self.commitment_cost * F.mse_loss(
-                reconstruction.detach(),
-                x,
-            )
-            commitment_losses_by_scale.append(encoder_commitment_loss)
-
             # Train the learned samplers and refiners against a fixed encoder target.
             # The codebooks themselves are updated separately through EMA.
             quantization_loss = F.mse_loss(
@@ -692,6 +788,14 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             if scale_index == partial_scale_index:
                 partial_quantized_latent = reconstruction
 
+        # Committing the encoder to every partial cumulative would reward it for
+        # making the complete latent representable by the earliest scales. The
+        # final hierarchy is the tokenizer's actual discrete approximation.
+        encoder_commitment_loss = self.commitment_cost * F.mse_loss(
+            reconstruction.detach(),
+            x,
+        )
+
         return QuantizerOutput(
             final_latent=reconstruction,
             cumulative_latents=cumulative_latents,
@@ -699,7 +803,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             indices_by_scale=indices_by_scale,
             assignment_probabilities_by_scale=probabilities_by_scale,
             assignment_logits_by_scale=assignment_logits_by_scale,
-            commitment_losses_by_scale=commitment_losses_by_scale,
+            encoder_commitment_loss=encoder_commitment_loss,
             quantization_losses_by_scale=quantization_losses_by_scale,
             partial_latent=partial_quantized_latent,
         )
@@ -769,20 +873,6 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             next_scale_inputs.append(next_scale_input)
 
         return next_scale_inputs
-
-    @torch.no_grad()
-    def indices_to_next_scale_input(
-        self,
-        preceding_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
-    ) -> Float[Tensor, "batch next_scale_length embed_dim"]:
-        """Construct the next input from an autoregressively predicted prefix."""
-        cumulative_latent = self.indices_to_cumulative_latents(
-            preceding_indices_by_scale
-        )[-1]
-        return self._resize_to_scale(
-            cumulative_latent,
-            scale_index=len(preceding_indices_by_scale),
-        )
 
     @property
     def utilization_by_scale(self) -> list[Float[Tensor, ""]]:

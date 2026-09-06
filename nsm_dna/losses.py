@@ -15,10 +15,12 @@ class NSMDNALosses:
     total: Float[Tensor, ""]
     nucleotide_reconstruction: Float[Tensor, ""]
     partial_reconstruction: Float[Tensor, ""]
-    autoregressive_reconstruction: Float[Tensor, ""]
+    teacher_forced_prediction_reconstruction: Float[Tensor, ""]
     vq: Float[Tensor, ""]
-    next_scale_prediction: Float[Tensor, ""]
-    next_scale_prediction_by_scale: list[Float[Tensor, ""]]
+    teacher_forced_prediction: Float[Tensor, ""]
+    teacher_forced_prediction_by_scale: list[Float[Tensor, ""]]
+    rollout_state_consistency: Float[Tensor, ""]
+    rollout_state_consistency_by_scale: list[Float[Tensor, ""]]
     entropy: Float[Tensor, ""]
 
 
@@ -81,17 +83,40 @@ def codebook_entropy_loss(
     return torch.stack(losses_by_scale).mean()
 
 
+def rollout_state_consistency_loss(
+    predicted_inputs_by_scale: list[
+        Float[Tensor, "batch next_scale_length embed_dim"]
+    ],
+    target_inputs_by_scale: list[
+        Float[Tensor, "batch next_scale_length embed_dim"]
+    ],
+) -> tuple[Float[Tensor, ""], list[Float[Tensor, ""]]]:
+    """Match rollout states to the clean inputs required by the next scale."""
+    losses_by_scale = [
+        F.mse_loss(predicted.float(), target.detach().float())
+        for predicted, target in zip(
+            predicted_inputs_by_scale,
+            target_inputs_by_scale,
+            strict=True,
+        )
+    ]
+    if not losses_by_scale:
+        raise ValueError("State consistency requires at least one scale transition.")
+    return torch.stack(losses_by_scale).mean(), losses_by_scale
+
+
 def nsm_dna_losses(
     output: NSMDNAOutput,
     target_ids: Int[Tensor, "batch target_length"],
     *,
     partial_reconstruction_loss_weight: float = 0.0,
-    autoregressive_reconstruction_loss_weight: float = 0.0,
+    teacher_forced_prediction_reconstruction_loss_weight: float = 0.0,
     next_scale_prediction_loss_weight: float = 1.0,
+    rollout_state_consistency_loss_weight: float = 0.0,
     entropy_loss_weight: float = 1.0,
     entropy_temperature: float = 1.0,
 ) -> NSMDNALosses:
-    """Calculate final, partial, APR, VQ, prediction, and entropy losses."""
+    """Calculate reconstruction, VQ, prediction, and entropy objectives."""
     nucleotide_reconstruction = nucleotide_reconstruction_loss(
         output.reconstruction_logits,
         target_ids,
@@ -120,25 +145,42 @@ def nsm_dna_losses(
                 for scale_logits in cumulative_logits[:-1]
             ]
         ).mean()
-    if autoregressive_reconstruction_loss_weight == 0:
-        autoregressive_reconstruction = nucleotide_reconstruction.new_zeros(())
+    if teacher_forced_prediction_reconstruction_loss_weight == 0:
+        teacher_forced_prediction_reconstruction = (
+            nucleotide_reconstruction.new_zeros(())
+        )
     else:
-        if output.autoregressive_reconstruction_logits is None:
+        if output.teacher_forced_prediction_reconstruction_logits is None:
             raise ValueError(
-                "APR logits are required when autoregressive reconstruction "
-                "has nonzero weight."
+                "Teacher-forced prediction reconstruction logits are required when "
+                "their loss has nonzero weight."
             )
-        autoregressive_reconstruction = nucleotide_reconstruction_loss(
-            output.autoregressive_reconstruction_logits,
+        teacher_forced_prediction_reconstruction = nucleotide_reconstruction_loss(
+            output.teacher_forced_prediction_reconstruction_logits,
             target_ids,
         )
-    (
-        next_scale_prediction,
-        next_scale_prediction_by_scale,
-    ) = next_scale_prediction_loss(
-        output.next_scale_logits_by_scale,
-        output.quantizer.indices_by_scale[1:],
+    teacher_forced_prediction, teacher_forced_prediction_by_scale = (
+        next_scale_prediction_loss(
+            output.next_scale_logits_by_scale,
+            output.quantizer.indices_by_scale[1:],
+        )
     )
+    if output.rollout is None:
+        if rollout_state_consistency_loss_weight != 0:
+            raise ValueError(
+                "Rollout outputs are required when state consistency has nonzero "
+                "weight."
+            )
+        rollout_state_consistency = teacher_forced_prediction.new_zeros(())
+        rollout_state_consistency_by_scale = []
+    else:
+        (
+            rollout_state_consistency,
+            rollout_state_consistency_by_scale,
+        ) = rollout_state_consistency_loss(
+            output.rollout.predicted_consistency_states_by_scale,
+            output.rollout.target_consistency_states_by_scale,
+        )
     entropy = codebook_entropy_loss(
         output.quantizer.assignment_logits_by_scale,
         temperature=entropy_temperature,
@@ -148,16 +190,22 @@ def nsm_dna_losses(
         total=(
             nucleotide_reconstruction
             + partial_reconstruction_loss_weight * partial_reconstruction
-            + autoregressive_reconstruction_loss_weight * autoregressive_reconstruction
+            + teacher_forced_prediction_reconstruction_loss_weight
+            * teacher_forced_prediction_reconstruction
             + vq
-            + next_scale_prediction_loss_weight * next_scale_prediction
+            + next_scale_prediction_loss_weight * teacher_forced_prediction
+            + rollout_state_consistency_loss_weight * rollout_state_consistency
             + entropy_loss_weight * entropy
         ),
         nucleotide_reconstruction=nucleotide_reconstruction,
         partial_reconstruction=partial_reconstruction,
-        autoregressive_reconstruction=autoregressive_reconstruction,
+        teacher_forced_prediction_reconstruction=(
+            teacher_forced_prediction_reconstruction
+        ),
         vq=vq,
-        next_scale_prediction=next_scale_prediction,
-        next_scale_prediction_by_scale=next_scale_prediction_by_scale,
+        teacher_forced_prediction=teacher_forced_prediction,
+        teacher_forced_prediction_by_scale=teacher_forced_prediction_by_scale,
+        rollout_state_consistency=rollout_state_consistency,
+        rollout_state_consistency_by_scale=rollout_state_consistency_by_scale,
         entropy=entropy,
     )

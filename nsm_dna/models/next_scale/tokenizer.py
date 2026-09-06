@@ -346,14 +346,6 @@ class MultiscaleTokenizer(nn.Module):
         return self.quantizer.indices_to_next_scale_inputs(indices_by_scale)
 
     @torch.no_grad()
-    def indices_to_next_scale_input(
-        self,
-        preceding_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
-    ) -> Float[Tensor, "batch next_scale_length embed_dim"]:
-        """Construct the next input from autoregressively predicted indices."""
-        return self.quantizer.indices_to_next_scale_input(preceding_indices_by_scale)
-
-    @torch.no_grad()
     def decode(
         self,
         indices_by_scale: list[Int[Tensor, "batch scale_length"]],

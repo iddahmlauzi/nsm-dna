@@ -1,3 +1,4 @@
+import json
 import math
 from pathlib import Path
 
@@ -11,10 +12,8 @@ from nsm_dna.losses import (
     next_scale_prediction_loss,
     nsm_dna_losses,
 )
-from nsm_dna.models.next_scale import NSMDNA
+from nsm_dna.models.next_scale import NSMDNA, TokenizerStabilitySnapshot
 from nsm_dna.training import (
-    GenFirstLossSchedule,
-    GenerativeLossWeights,
     build_learning_rate_scheduler,
     load_model_checkpoint,
     load_training_checkpoint,
@@ -22,9 +21,11 @@ from nsm_dna.training import (
 )
 from scripts.training.train_nsm import (
     _validation_metrics_for_wandb,
+    append_metrics,
     configure_training_phase,
     evaluate,
     target_ids_from_sequence,
+    tokenizer_stability_metrics,
 )
 
 
@@ -145,14 +146,16 @@ def test_total_loss_applies_generative_objective_weights() -> None:
         sequence_ids,
         corruption_probability=0.1,
         return_partial_reconstruction=True,
-        return_autoregressive_reconstruction=True,
+        return_teacher_forced_prediction_reconstruction=True,
+        return_rollout=True,
     )
     losses = nsm_dna_losses(
         output,
         target_ids,
         partial_reconstruction_loss_weight=0.1,
-        autoregressive_reconstruction_loss_weight=1.0,
+        teacher_forced_prediction_reconstruction_loss_weight=1.0,
         next_scale_prediction_loss_weight=8.0,
+        rollout_state_consistency_loss_weight=0.5,
         entropy_loss_weight=2.0,
     )
 
@@ -169,11 +172,74 @@ def test_total_loss_applies_generative_objective_weights() -> None:
         losses.total,
         losses.nucleotide_reconstruction
         + 0.1 * losses.partial_reconstruction
-        + losses.autoregressive_reconstruction
+        + losses.teacher_forced_prediction_reconstruction
         + losses.vq
-        + 8.0 * losses.next_scale_prediction
+        + 8.0 * losses.teacher_forced_prediction
+        + 0.5 * losses.rollout_state_consistency
         + 2.0 * losses.entropy,
     )
+
+
+def test_state_consistency_averages_scale_transitions_equally() -> None:
+    model = NSMDNA.from_config(_build_config())
+    sequence_ids = _sequence_ids()
+    output = model(sequence_ids, return_rollout=True)
+
+    losses = nsm_dna_losses(
+        output,
+        target_ids_from_sequence(sequence_ids, target_length=4),
+        rollout_state_consistency_loss_weight=1.0,
+        entropy_loss_weight=0.0,
+    )
+
+    torch.testing.assert_close(
+        losses.rollout_state_consistency,
+        torch.stack(losses.rollout_state_consistency_by_scale).mean(),
+    )
+
+
+def test_state_consistency_trains_only_the_transformer_without_a_prefix() -> None:
+    config = _build_config()
+    config.data.sequence_length = config.model.tokenizer.context_length
+    model = NSMDNA.from_config(config)
+    sequence_ids = _sequence_ids()[:, -4:]
+    output = model(sequence_ids, return_rollout=True)
+    assert output.rollout is not None
+    final_rollout_logits = output.rollout.prediction_logits_by_scale[-1]
+    final_rollout_logits.retain_grad()
+    losses = nsm_dna_losses(
+        output,
+        target_ids_from_sequence(sequence_ids, target_length=4),
+        rollout_state_consistency_loss_weight=1.0,
+        entropy_loss_weight=0.0,
+    )
+
+    losses.rollout_state_consistency.backward()
+
+    assert final_rollout_logits.grad is not None
+    assert final_rollout_logits.grad.count_nonzero() > 0
+    assert any(
+        parameter.grad is not None and parameter.grad.count_nonzero() > 0
+        for parameter in model.transformer.parameters()
+    )
+    assert all(
+        parameter.grad is None or parameter.grad.count_nonzero() == 0
+        for parameter in model.tokenizer.parameters()
+    )
+
+
+def test_state_consistency_requires_rollout_outputs() -> None:
+    model = NSMDNA.from_config(_build_config())
+    sequence_ids = _sequence_ids()
+    output = model(sequence_ids)
+    target_ids = target_ids_from_sequence(sequence_ids, target_length=4)
+
+    with pytest.raises(ValueError, match="Rollout outputs are required"):
+        nsm_dna_losses(
+            output,
+            target_ids,
+            rollout_state_consistency_loss_weight=1.0,
+        )
 
 
 def test_validation_partial_loss_averages_nonfinal_scales() -> None:
@@ -202,41 +268,6 @@ def test_validation_partial_loss_averages_nonfinal_scales() -> None:
     )
 
 
-def test_genfirst_schedule_switches_to_reconstruction_refinement() -> None:
-    generation_first_weights = GenerativeLossWeights(
-        next_scale_prediction=8.0,
-        entropy=2.0,
-    )
-    refinement_weights = GenerativeLossWeights(
-        next_scale_prediction=2.0,
-        entropy=0.5,
-    )
-    schedule = GenFirstLossSchedule(
-        total_steps=10,
-        generation_first_fraction=0.8,
-        generation_first_weights=generation_first_weights,
-        refinement_weights=refinement_weights,
-    )
-
-    assert schedule.generation_first_steps == 8
-    assert schedule.weights_at_step(1) == generation_first_weights
-    assert schedule.weights_at_step(8) == generation_first_weights
-    assert schedule.weights_at_step(9) == refinement_weights
-    assert schedule.phase_at_step(8) == "generation_first"
-    assert schedule.phase_at_step(9) == "reconstruction_refinement"
-
-
-def test_genfirst_schedule_rejects_invalid_configuration() -> None:
-    weights = GenerativeLossWeights(next_scale_prediction=1.0, entropy=1.0)
-    with pytest.raises(ValueError, match="between zero and one"):
-        GenFirstLossSchedule(
-            total_steps=10,
-            generation_first_fraction=1.0,
-            generation_first_weights=weights,
-            refinement_weights=weights,
-        )
-
-
 def test_one_optimizer_step_updates_the_joint_model() -> None:
     model = NSMDNA.from_config(_build_config())
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -256,10 +287,15 @@ def test_one_optimizer_step_updates_the_joint_model() -> None:
     )
 
     sequence_ids = _sequence_ids()
-    output = model(sequence_ids, corruption_probability=0.1)
+    output = model(
+        sequence_ids,
+        corruption_probability=0.1,
+        return_rollout=True,
+    )
     losses = nsm_dna_losses(
         output,
         target_ids_from_sequence(sequence_ids, target_length=4),
+        rollout_state_consistency_loss_weight=1.0,
     )
     losses.total.backward()
     optimizer.step()
@@ -290,12 +326,12 @@ def test_frozen_hierarchy_phase_trains_only_the_transformer() -> None:
     sequence_ids = _sequence_ids()
     output = model(
         sequence_ids,
-        return_autoregressive_reconstruction=True,
+        return_teacher_forced_prediction_reconstruction=True,
     )
     losses = nsm_dna_losses(
         output,
         target_ids_from_sequence(sequence_ids, target_length=4),
-        autoregressive_reconstruction_loss_weight=1.0,
+        teacher_forced_prediction_reconstruction_loss_weight=1.0,
         next_scale_prediction_loss_weight=8.0,
         entropy_loss_weight=0.0,
     )
@@ -332,23 +368,51 @@ def test_evaluate_reports_joint_and_per_scale_metrics() -> None:
     assert metrics["total_loss"] > 0
     assert metrics["entropy_loss"] <= 0
     assert 0 <= metrics["nucleotide_reconstruction_accuracy"] <= 1
-    assert 0 <= metrics["next_scale_prediction_accuracy"] <= 1
-    assert metrics["conditioned_rollout_nucleotide_loss"] > 0
-    assert 0 <= metrics["conditioned_rollout_nucleotide_accuracy"] <= 1
+    assert 0 <= metrics["teacher_forced_prediction_accuracy"] <= 1
+    assert 0 <= metrics["rollout_prediction_accuracy"] <= 1
+    assert metrics["rollout_nucleotide_loss"] > 0
+    assert 0 <= metrics["rollout_nucleotide_accuracy"] <= 1
+    assert metrics["rollout_state_consistency_loss"] >= 0
+    assert metrics["encoder_commitment_loss"] >= 0
+    first_predicted_scale = model.tokenizer.scale_lengths[1]
+    assert metrics[
+        f"teacher_forced_rollout_agreement_scale_{first_predicted_scale}"
+    ] == pytest.approx(1.0)
     for scale_length in model.tokenizer.scale_lengths:
         if scale_length != model.tokenizer.scale_lengths[0]:
-            assert metrics[f"next_scale_prediction_loss_scale_{scale_length}"] > 0
+            assert metrics[f"teacher_forced_prediction_loss_scale_{scale_length}"] > 0
             assert (
                 0
-                <= metrics[f"next_scale_prediction_accuracy_scale_{scale_length}"]
+                <= metrics[f"teacher_forced_prediction_accuracy_scale_{scale_length}"]
+                <= 1
+            )
+            assert (
+                0
+                <= metrics[f"rollout_prediction_accuracy_scale_{scale_length}"]
+                <= 1
+            )
+            assert (
+                0
+                <= metrics[f"teacher_forced_rollout_agreement_scale_{scale_length}"]
                 <= 1
             )
         assert metrics[f"quantization_loss_scale_{scale_length}"] >= 0
-        assert metrics[f"vq_loss_scale_{scale_length}"] >= 0
         assert 0 <= metrics[f"cumulative_nucleotide_accuracy_scale_{scale_length}"] <= 1
+        assert (
+            0
+            <= metrics[f"rollout_cumulative_nucleotide_accuracy_scale_{scale_length}"]
+            <= 1
+        )
         assert 0 <= metrics[f"code_usage_scale_{scale_length}"] <= 1
         assert metrics[f"code_perplexity_scale_{scale_length}"] >= 1
         assert 0 <= metrics[f"soft_confidence_scale_{scale_length}"] <= 1
+        if scale_length != model.tokenizer.scale_lengths[0]:
+            assert (
+                metrics[
+                    f"rollout_state_consistency_loss_after_scale_{scale_length}"
+                ]
+                >= 0
+            )
 
 
 def test_validation_wandb_metrics_are_grouped_by_scale() -> None:
@@ -365,21 +429,16 @@ def test_validation_wandb_metrics_are_grouped_by_scale() -> None:
         best_validation_loss=1.5,
     )
 
-    assert wandb_metrics["validation/best_total_loss"] == 1.5
+    assert wandb_metrics["validation/objective/best_total"] == 1.5
     assert {name for name in wandb_metrics if name.startswith("validation/")} == {
-        "validation/total_loss",
-        "validation/nucleotide_reconstruction_loss",
-        "validation/partial_reconstruction_loss",
-        "validation/autoregressive_reconstruction_loss",
-        "validation/vq_loss",
-        "validation/next_scale_prediction_loss",
-        "validation/entropy_loss",
-        "validation/conditioned_rollout_nucleotide_loss",
-        "validation/nucleotide_reconstruction_accuracy",
-        "validation/autoregressive_reconstruction_accuracy",
-        "validation/next_scale_prediction_accuracy",
-        "validation/conditioned_rollout_nucleotide_accuracy",
-        "validation/best_total_loss",
+        "validation/objective/total",
+        "validation/objective/rollout_state_consistency",
+        "validation/objective/best_total",
+        "validation/accuracy/nucleotide_reconstruction",
+        "validation/accuracy/teacher_forced_prediction_reconstruction",
+        "validation/accuracy/teacher_forced_prediction",
+        "validation/accuracy/rollout_prediction",
+        "validation/accuracy/rollout_nucleotide",
     }
     for scale_number, scale_length in enumerate(
         model.tokenizer.scale_lengths,
@@ -387,11 +446,87 @@ def test_validation_wandb_metrics_are_grouped_by_scale() -> None:
     ):
         section = f"scale_{scale_number:02d}_length_{scale_length}"
         if scale_number == 1:
-            assert f"{section}/prediction_loss" not in wandb_metrics
+            assert f"{section}/teacher_forced_prediction_accuracy" not in wandb_metrics
         else:
-            assert f"{section}/prediction_loss" in wandb_metrics
+            assert f"{section}/teacher_forced_prediction_accuracy" in wandb_metrics
+            assert f"{section}/rollout_prediction_accuracy" in wandb_metrics
+            assert f"{section}/teacher_forced_rollout_agreement" in wandb_metrics
         assert f"{section}/cumulative_nucleotide_accuracy" in wandb_metrics
+        assert f"{section}/rollout_cumulative_nucleotide_accuracy" in wandb_metrics
+        assert f"{section}/quantization_loss" not in wandb_metrics
+        assert f"{section}/soft_assignment_confidence" not in wandb_metrics
         assert f"{section}/code_perplexity" in wandb_metrics
+
+
+def test_tokenizer_stability_metrics_compare_the_same_anchor_states() -> None:
+    previous = TokenizerStabilitySnapshot(
+        encoder_latent=torch.zeros(1, 2, 1),
+        indices_by_scale=[torch.tensor([[0]]), torch.tensor([[0, 1]])],
+        codebooks_by_scale=[torch.zeros(2, 1), torch.zeros(2, 1)],
+        clean_consistency_states_by_scale=[torch.zeros(1, 2, 1)],
+        rollout_consistency_states_by_scale=[torch.zeros(1, 2, 1)],
+    )
+    current = TokenizerStabilitySnapshot(
+        encoder_latent=torch.ones(1, 2, 1),
+        indices_by_scale=[torch.tensor([[0]]), torch.tensor([[1, 1]])],
+        codebooks_by_scale=[torch.ones(2, 1), torch.full((2, 1), 2.0)],
+        clean_consistency_states_by_scale=[torch.full((1, 2, 1), 2.0)],
+        rollout_consistency_states_by_scale=[torch.full((1, 2, 1), 5.0)],
+    )
+
+    metrics = tokenizer_stability_metrics(previous, current, [1, 2])
+
+    assert metrics["encoder_latent_drift"] == pytest.approx(1.0)
+    assert metrics["code_retention_scale_1"] == pytest.approx(1.0)
+    assert metrics["code_retention_scale_2"] == pytest.approx(0.5)
+    assert metrics["code_retention"] == pytest.approx(0.75)
+    assert metrics["active_codebook_drift"] == pytest.approx(1.5)
+    assert metrics["target_state_drift"] == pytest.approx(2.0)
+    assert metrics["rollout_state_error"] == pytest.approx(3.0)
+    assert metrics["target_drift_relative_to_rollout_error"] == pytest.approx(
+        2.0 / 3.0
+    )
+
+
+def test_wandb_logs_only_aggregate_tokenizer_stability_metrics() -> None:
+    validation_metrics = {
+        "total_loss": 1.0,
+        "rollout_state_consistency_loss": 0.5,
+        "nucleotide_reconstruction_accuracy": 0.9,
+        "teacher_forced_prediction_reconstruction_accuracy": 0.8,
+        "teacher_forced_prediction_accuracy": 0.7,
+        "rollout_prediction_accuracy": 0.6,
+        "rollout_nucleotide_accuracy": 0.5,
+        "code_retention": 0.75,
+        "encoder_latent_drift": 0.1,
+        "active_codebook_drift": 0.2,
+        "target_state_drift": 0.3,
+        "target_drift_relative_to_rollout_error": 0.4,
+        "target_state_drift_after_scale_2": 0.35,
+    }
+
+    wandb_metrics = _validation_metrics_for_wandb(
+        validation_metrics,
+        scale_lengths=[1, 2],
+        best_validation_loss=1.0,
+    )
+
+    assert wandb_metrics["validation/stability/code_retention"] == 0.75
+    assert wandb_metrics["validation/stability/target_state_drift"] == 0.3
+    assert not any("after_scale" in name for name in wandb_metrics)
+
+
+def test_complete_metrics_are_appended_to_jsonl(tmp_path: Path) -> None:
+    metrics_path = tmp_path / "validation_metrics.jsonl"
+
+    append_metrics(metrics_path, 1000, {"total_loss": 1.5})
+    append_metrics(metrics_path, 2000, {"total_loss": 1.0})
+
+    records = [json.loads(line) for line in metrics_path.read_text().splitlines()]
+    assert records == [
+        {"step": 1000, "total_loss": 1.5},
+        {"step": 2000, "total_loss": 1.0},
+    ]
 
 
 def test_unified_checkpoint_restores_model_optimizer_and_scheduler(
@@ -498,14 +633,23 @@ def test_default_config_matches_the_joint_training_contract() -> None:
     assert config.wandb.project == "nsm-dna-end-to-end"
     assert (
         config.wandb.name
-        == "nsm-dna-end-to-end-contextual-supplied-scale1-neighbor-corruption"
+        == "nsm-dna-end-to-end-contextual-no-prefix-supplied-scale4"
     )
     assert config.data.subset_directory.endswith("gtdb/500M_subset")
-    assert config.data.sequence_length == 256
+    assert config.data.sequence_length == 128
     assert config.model.tokenizer.context_length == 128
     assert config.model.tokenizer.embed_dim == 384
     assert config.model.tokenizer.encoder_num_layers == 1
-    assert len(config.model.tokenizer.scale_lengths) == 9
+    assert list(config.model.tokenizer.scale_lengths) == [
+        4,
+        9,
+        16,
+        25,
+        36,
+        49,
+        64,
+        128,
+    ]
     assert config.model.tokenizer.codebook_size == 256
     assert config.model.transformer.model_dim == 640
     assert config.optimizer.learning_rate == 1e-4
@@ -518,22 +662,16 @@ def test_default_config_matches_the_joint_training_contract() -> None:
     assert config.training.num_epochs == 2
     assert config.training.freeze_tokenizer is False
     assert config.training.partial_reconstruction_loss_weight == 0.1
-    assert config.training.autoregressive_reconstruction_loss_weight == 1.0
+    assert (
+        config.training.teacher_forced_prediction_reconstruction_loss_weight == 1.0
+    )
+    assert config.training.rollout_state_consistency_loss_weight == 0.0
     assert config.training.entropy_temperature > 1.0
-    assert config.training.loss_schedule.generation_first_fraction == 0.8
-    assert (
-        config.training.loss_schedule.generation_first.next_scale_prediction_loss_weight
-        == 8.0
-    )
-    assert config.training.loss_schedule.generation_first.entropy_loss_weight == 2.0
-    assert (
-        config.training.loss_schedule.reconstruction_refinement.next_scale_prediction_loss_weight
-        == 2.0
-    )
-    assert (
-        config.training.loss_schedule.reconstruction_refinement.entropy_loss_weight
-        == 0.5
-    )
+    assert config.training.next_scale_prediction_loss_weight == 8.0
+    assert config.training.entropy_loss_weight == 2.0
+    assert "loss_schedule" not in config.training
     assert "self_conditioning" not in config.training
-    assert config.training.input_code_corruption_probability == 0.1
+    assert config.training.input_code_corruption_probability == 0.0
+    assert config.evaluation.stability_anchor_size == 32
+    assert config.checkpoint.recovery_interval == 1_000
     assert "huggingface" not in config.checkpoint

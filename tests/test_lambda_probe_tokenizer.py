@@ -15,7 +15,7 @@ class _Quantizer(nn.Module):
             indices_by_scale=[torch.zeros_like(latent[..., 0], dtype=torch.long)],
             assignment_probabilities_by_scale=[latent.new_ones(*latent.shape[:2], 1)],
             assignment_logits_by_scale=[latent.new_zeros(*latent.shape[:2], 1)],
-            commitment_losses_by_scale=[zero],
+            encoder_commitment_loss=zero,
             quantization_losses_by_scale=[zero],
         )
 

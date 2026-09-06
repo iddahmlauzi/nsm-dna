@@ -1,4 +1,4 @@
-# Joint NSM-DNA training over a variable prefix and 128-base target block.
+# Joint NSM-DNA training on complete 128-base sequences without prefix context.
 
 run:
   seed: 0
@@ -10,15 +10,17 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: nsm-dna-end-to-end
-  name: nsm-dna-end-to-end-contextual-supplied-scale1-neighbor-corruption
+  name: nsm-dna-end-to-end-contextual-no-prefix-supplied-scale4
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
   train_split: train
   validation_split: validation
-  sequence_length: 256
-  # Per-GPU batch size. Four GPUs with two accumulation steps produce an
-  # effective batch of 512 sequences per optimizer update.
+  # Match the tokenizer block length so the complete example is quantized. The
+  # four codes at the first scale are supplied to predict the finer hierarchy.
+  sequence_length: 128
+  # Four GPUs with two accumulation steps produce an effective batch of 512
+  # sequences per optimizer update.
   train_batch_size: 64
   validation_batch_size: 128
   num_workers: 1
@@ -30,11 +32,11 @@ model:
     context_length: 128
     embed_dim: 384
     num_heads: 8
-    scale_lengths: [1, 4, 9, 16, 25, 36, 49, 64, 128]
+    scale_lengths: [4, 9, 16, 25, 36, 49, 64, 128]
     codebook_size: 256
 
-    # One bidirectional Transformer block contextualizes nucleotides within the
-    # prefix and target independently before target quantization.
+    # One bidirectional Transformer block contextualizes the complete sequence
+    # before quantization.
     encoder_num_layers: 1
     encoder_dropout: 0.0
     decoder_dropout: 0.1
@@ -82,36 +84,38 @@ training:
   # Decode one uniformly sampled non-final true cumulative latent per batch.
   # A weak weight pressures early scales to retain nucleotide information.
   partial_reconstruction_loss_weight: 0.1
-  # APR decodes the true scale 1 plus hard predictions for scales 4 onward,
-  # with straight-through gradients into the next-scale transformer.
-  autoregressive_reconstruction_loss_weight: 1.0
+  # Decode the true first scale plus teacher-forced hard predictions for all
+  # finer scales, with straight-through gradients into the transformer.
+  teacher_forced_prediction_reconstruction_loss_weight: 1.0
+  # Train each rollout transition to recover the clean continuous input expected
+  # by the following scale, then match the completed scale-128 latent. The target
+  # tokenizer states remain detached.
+  rollout_state_consistency_loss_weight: 0.0
   # This softens only the distribution used by the entropy loss. Hard code
   # selection, straight-through quantization, and EMA updates are unchanged.
   entropy_temperature: 16.0
-  # Reconstruction and VQ retain unit weight throughout. Generation and entropy
-  # shape the latent hierarchy first, then recede so reconstruction can refine it.
-  loss_schedule:
-    generation_first_fraction: 0.8
-    generation_first:
-      next_scale_prediction_loss_weight: 8.0
-      entropy_loss_weight: 2.0
-    reconstruction_refinement:
-      next_scale_prediction_loss_weight: 2.0
-      entropy_loss_weight: 0.5
+  # Keep generation-first pressure constant for both epochs. There is no
+  # reconstruction-refinement phase because reconstruction already converges
+  # before the latent hierarchy stabilizes.
+  next_scale_prediction_loss_weight: 8.0
+  entropy_loss_weight: 2.0
   num_epochs: 2
   # Set an integer here for a shorter diagnostic run.
   max_steps: null
-  # Replace 10% of hierarchy codes from scale 4 onward with nearby neighbors.
-  # The supplied scale-1 code remains clean, matching conditioned rollout.
-  input_code_corruption_probability: 0.1
+  # Keep teacher-forced inputs clean so state consistency is the only rollout
+  # robustness intervention in this experiment.
+  input_code_corruption_probability: 0.0
   log_interval: 10
 
 evaluation:
   interval: 1_000
   max_batches: 10
+  # Re-encode these same validation examples at each evaluation to measure how
+  # quickly the jointly trained tokenizer hierarchy is changing.
+  stability_anchor_size: 32
 
 checkpoint:
-  recovery_interval: 5_000
+  recovery_interval: 1_000
   milestone_interval: 10_000
 
 hydra:
