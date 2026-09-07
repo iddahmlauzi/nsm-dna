@@ -14,7 +14,7 @@ from .transformer import NextScaleTransformer
 
 @dataclass(frozen=True)
 class RolloutOutput:
-    """Predictions from a first-scale-conditioned greedy rollout."""
+    """Predictions from a greedy coarse-to-fine rollout."""
 
     prediction_logits_by_scale: list[Float[Tensor, "batch scale_length codebook_size"]]
     indices_by_scale: list[Int[Tensor, "batch scale_length"]]
@@ -136,6 +136,16 @@ class NSMDNA(nn.Module):
                 transformer_config.input_refinement_kernel_size
             ),
             max_prefix_length=(config.data.sequence_length - tokenizer.context_length),
+            use_prefix_memory=getattr(
+                transformer_config,
+                "use_prefix_memory",
+                False,
+            ),
+            predict_first_scale=getattr(
+                transformer_config,
+                "predict_first_scale",
+                False,
+            ),
         )
         return cls(tokenizer, transformer)
 
@@ -192,7 +202,11 @@ class NSMDNA(nn.Module):
             try:
                 rollout_collection = self._collect_rollout(
                     prefix_latent.detach(),
-                    quantizer_output.indices_by_scale[0],
+                    first_scale_indices=(
+                        None
+                        if self.transformer.predicts_first_scale
+                        else quantizer_output.indices_by_scale[0]
+                    ),
                 )
             finally:
                 self.transformer.train(transformer_was_training)
@@ -204,7 +218,7 @@ class NSMDNA(nn.Module):
         next_scale_logits_by_scale = list(
             torch.split(
                 next_scale_logits,
-                self.tokenizer.scale_lengths[1:],
+                self.transformer.predicted_scale_lengths,
                 dim=1,
             )
         )
@@ -221,7 +235,11 @@ class NSMDNA(nn.Module):
         if return_teacher_forced_prediction_reconstruction:
             predicted_latent = self.tokenizer.quantizer.teacher_forced_prediction_logits_to_final_latent(
                 next_scale_logits_by_scale,
-                initial_latent=quantizer_output.cumulative_latents[0],
+                initial_latent=(
+                    None
+                    if self.transformer.predicts_first_scale
+                    else quantizer_output.cumulative_latents[0]
+                ),
             )
             teacher_forced_prediction_reconstruction_logits = (
                 self.tokenizer.decode_latent(predicted_latent)
@@ -303,15 +321,24 @@ class NSMDNA(nn.Module):
     def _collect_rollout(
         self,
         prefix_latent: Float[Tensor, "batch prefix_length embed_dim"],
-        first_scale_indices: Int[Tensor, "batch first_scale_length"],
+        first_scale_indices: Int[Tensor, "batch first_scale_length"] | None,
     ) -> _RolloutCollection:
         """Collect the detached states visited by greedy scale prediction."""
         quantizer = self.tokenizer.quantizer
+        prediction_logits_by_scale = []
+        if self.transformer.predicts_first_scale:
+            if first_scale_indices is not None:
+                raise ValueError("Do not supply scale 1 when it is predicted from BOS.")
+            first_scale_logits = self.transformer.predict_first_scale(prefix_latent)
+            first_scale_indices = first_scale_logits.argmax(dim=-1)
+            prediction_logits_by_scale.append(first_scale_logits)
+        elif first_scale_indices is None:
+            raise ValueError("First-scale indices are required in supplied mode.")
+
         cumulative_latent = quantizer.scale_contribution_from_indices(
             first_scale_indices,
             scale_index=0,
         )
-        prediction_logits_by_scale = []
         indices_by_scale = [first_scale_indices.detach()]
         cumulative_latents = [cumulative_latent]
 
@@ -322,7 +349,11 @@ class NSMDNA(nn.Module):
             )
             prediction_logits = self.transformer.predict_scale(
                 scale_input,
-                prediction_index=scale_index - 1,
+                prediction_index=(
+                    scale_index
+                    if self.transformer.predicts_first_scale
+                    else scale_index - 1
+                ),
                 prefix=prefix_latent,
             )
             predicted_indices = prediction_logits.argmax(dim=-1)
@@ -349,9 +380,9 @@ class NSMDNA(nn.Module):
     def generate(
         self,
         prefix_ids: Int[Tensor, "batch prefix_length"],
-        first_scale_indices: Int[Tensor, "batch first_scale_length"],
+        first_scale_indices: Int[Tensor, "batch first_scale_length"] | None = None,
     ) -> NSMDNAGeneration:
-        """Greedily predict scales 4 onward from a supplied first-scale code."""
+        """Greedily predict a hierarchy, optionally from supplied coarse codes."""
         if self.training:
             raise RuntimeError("Call model.eval() before generating sequences.")
         if prefix_ids.shape[1] > self.transformer.max_prefix_length:
@@ -362,7 +393,10 @@ class NSMDNA(nn.Module):
 
         prefix_latent = self.tokenizer.encode(prefix_ids)
         batch_size = prefix_ids.shape[0]
-        if first_scale_indices.shape != (
+        if self.transformer.predicts_first_scale:
+            if first_scale_indices is not None:
+                raise ValueError("Do not supply scale 1 when it is predicted from BOS.")
+        elif first_scale_indices is None or first_scale_indices.shape != (
             batch_size,
             self.tokenizer.scale_lengths[0],
         ):

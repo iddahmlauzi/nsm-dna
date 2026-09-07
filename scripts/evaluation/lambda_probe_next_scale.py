@@ -57,10 +57,19 @@ class NSMWindowEncoder(nn.Module):
             scale_inputs = self.tokenizer.indices_to_next_scale_inputs(targets_by_scale)
             hidden_states = self.model.encode(scale_inputs, prefix=prefix)
 
-        hierarchy_hidden_states = hidden_states[:, prefix_length:]
+        prefix_context_length = (
+            self.model.prefix_context_length(prefix_length)
+            if hasattr(self.model, "prefix_context_length")
+            else prefix_length
+        )
+        hierarchy_hidden_states = hidden_states[:, prefix_context_length:]
         hidden_states_by_scale = torch.split(
             hierarchy_hidden_states,
-            self.tokenizer.scale_lengths[1:],
+            getattr(
+                self.model,
+                "predicted_scale_lengths",
+                self.tokenizer.scale_lengths[1:],
+            ),
             dim=1,
         )
         pooled_by_scale = torch.cat(
@@ -74,7 +83,14 @@ class NSMWindowEncoder(nn.Module):
             return pooled_by_scale.float()
 
         pooled_prefix = hidden_states[:, :prefix_length].mean(dim=1)
-        return torch.cat([pooled_prefix, pooled_by_scale], dim=1).float()
+        pooled_sections = [pooled_prefix]
+        if getattr(self.model, "use_prefix_memory", False):
+            pooled_memory = hidden_states[
+                :, prefix_length:prefix_context_length
+            ].mean(dim=1)
+            pooled_sections.append(pooled_memory)
+        pooled_sections.append(pooled_by_scale)
+        return torch.cat(pooled_sections, dim=1).float()
 
 
 def segment_window_starts(
@@ -204,6 +220,7 @@ def evaluate_representations(
     device: torch.device,
     *,
     include_prefix: bool,
+    include_memory: bool = False,
 ) -> dict[str, dict[str, object]]:
     """Extract all pooled NSM sections once and probe them separately."""
     split_names = ["train", "test"]
@@ -212,7 +229,12 @@ def evaluate_representations(
     combined_embeddings = {
         split_name: extract_segment_embeddings(
             encoder,
-            (len(scale_lengths) + int(include_prefix)) * model_dim,
+            (
+                len(scale_lengths)
+                + int(include_prefix)
+                + int(include_memory)
+            )
+            * model_dim,
             window_length,
             stride,
             splits[split_name].sequences,
@@ -229,7 +251,15 @@ def evaluate_representations(
             split_name: embeddings[:, :model_dim]
             for split_name, embeddings in combined_embeddings.items()
         }
-    scale_offset = int(include_prefix)
+    memory_offset = int(include_prefix)
+    if include_memory:
+        section_start = memory_offset * model_dim
+        section_end = section_start + model_dim
+        representations["memory"] = {
+            split_name: embeddings[:, section_start:section_end]
+            for split_name, embeddings in combined_embeddings.items()
+        }
+    scale_offset = int(include_prefix) + int(include_memory)
     for scale_index, scale_length in enumerate(scale_lengths):
         section_start = (scale_index + scale_offset) * model_dim
         section_end = section_start + model_dim
@@ -311,13 +341,14 @@ def main(config: DictConfig) -> None:
     window_length = int(model_config.data.sequence_length)
     stride = tokenizer.context_length
     include_prefix = trained_model.max_prefix_length > 0
+    include_memory = trained_model.use_prefix_memory and include_prefix
     parameter_count = sum(parameter.numel() for parameter in trained_model.parameters())
 
     trained_results = evaluate_representations(
         "trained",
         build_parallel_encoder(trained_model, tokenizer, device_ids),
         trained_model.model_dim,
-        tokenizer.scale_lengths[1:],
+        trained_model.predicted_scale_lengths,
         window_length,
         stride,
         splits,
@@ -325,6 +356,7 @@ def main(config: DictConfig) -> None:
         output_directory,
         device,
         include_prefix=include_prefix,
+        include_memory=include_memory,
     )
     results = {"trained": trained_results}
     random_seed = None
@@ -342,7 +374,7 @@ def main(config: DictConfig) -> None:
             random_name,
             build_parallel_encoder(random_model, tokenizer, device_ids),
             random_model.model_dim,
-            tokenizer.scale_lengths[1:],
+            random_model.predicted_scale_lengths,
             window_length,
             stride,
             splits,
@@ -350,6 +382,7 @@ def main(config: DictConfig) -> None:
             output_directory,
             device,
             include_prefix=include_prefix,
+            include_memory=include_memory,
         )
         results[random_name] = random_results
         results["delta_mcc"] = {
@@ -394,13 +427,31 @@ def main(config: DictConfig) -> None:
                 if include_prefix
                 else {}
             ),
+            **(
+                {
+                    "memory": (
+                        "final normalized learned memory-token state after "
+                        "reading the prefix, mean-pooled across windows"
+                    )
+                }
+                if include_memory
+                else {}
+            ),
             **{
                 f"scale_length_{scale_length}": (
-                    "final normalized NSM hidden states for the teacher-forced "
-                    f"length-{scale_length} scale, mean-pooled within each "
-                    "window and then across windows"
+                    (
+                        "final normalized prefix-facing scale-1 BOS hidden state "
+                        "within each window, then mean-pooled across windows"
+                    )
+                    if trained_model.predicts_first_scale
+                    and scale_length == tokenizer.scale_lengths[0]
+                    else (
+                        "final normalized NSM hidden states for the teacher-forced "
+                        f"length-{scale_length} scale, mean-pooled within each "
+                        "window and then across windows"
+                    )
                 )
-                for scale_length in tokenizer.scale_lengths[1:]
+                for scale_length in trained_model.predicted_scale_lengths
             },
         },
         "window_length": window_length,

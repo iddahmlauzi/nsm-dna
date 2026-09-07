@@ -1,4 +1,5 @@
-# Joint NSM-DNA training on complete 128-base sequences without prefix context.
+# Joint NSM-DNA training through a one-position scale-1 BOS memory state,
+# with the non-contextual tokenizer architecture used by the two-stage model.
 
 run:
   seed: 0
@@ -10,15 +11,15 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: nsm-dna-end-to-end
-  name: nsm-dna-end-to-end-contextual-no-prefix-supplied-scale4
+  name: prefix128-target128-scale1-bos-memory-no-tokenizer-encoder-2epochs
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
   train_split: train
   validation_split: validation
-  # Match the tokenizer block length so the complete example is quantized. The
-  # four codes at the first scale are supplied to predict the finer hierarchy.
-  sequence_length: 128
+  # The first 128 bases are read only by the scale-1 BOS state. The final 128
+  # bases are quantized and predicted from scale 1 through scale 128.
+  sequence_length: 256
   # Four GPUs with two accumulation steps produce an effective batch of 512
   # sequences per optimizer update.
   train_batch_size: 64
@@ -31,13 +32,13 @@ model:
     vocab_size: 4
     context_length: 128
     embed_dim: 384
-    num_heads: 8
-    scale_lengths: [4, 9, 16, 25, 36, 49, 64, 128]
+    num_heads: 6
+    scale_lengths: [1, 4, 9, 16, 25, 36, 49, 64, 128]
     codebook_size: 256
 
-    # One bidirectional Transformer block contextualizes the complete sequence
-    # before quantization.
-    encoder_num_layers: 1
+    # Match the two-stage tokenizer: normalize and quantize nucleotide
+    # embeddings directly, without contextualization before the hierarchy.
+    encoder_num_layers: 0
     encoder_dropout: 0.0
     decoder_dropout: 0.1
     bias: false
@@ -56,6 +57,10 @@ model:
     model_dim: 640
     num_layers: 8
     num_heads: 10
+    # Predict one scale-1 code from a BOS state that alone reads the raw prefix.
+    # Later scales receive prefix context only through that continuous state.
+    use_prefix_memory: false
+    predict_first_scale: true
     dropout: 0.1
     bias: false
     use_qk_norm: true

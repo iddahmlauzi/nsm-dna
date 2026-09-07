@@ -149,7 +149,8 @@ def evaluate(
     model.eval()
     device = next(model.parameters()).device
     num_scales = len(model.tokenizer.scale_lengths)
-    num_predicted_scales = num_scales - 1
+    num_predicted_scales = len(model.transformer.predicted_scale_lengths)
+    prediction_scale_offset = num_scales - num_predicted_scales
 
     # The losses returned by the model are batch means, so they are accumulated
     # by example. Accuracy and codebook statistics are accumulated as raw counts
@@ -285,7 +286,7 @@ def evaluate(
         assert cumulative_logits is not None
         rollout_cumulative_logits = rollout.cumulative_reconstruction_logits_by_scale
         assert rollout_cumulative_logits is not None
-        # Tokenizer diagnostics cover all scales, including the supplied first scale.
+        # Tokenizer diagnostics cover every quantization scale.
         for scale_index, (
             scale_targets,
             probabilities,
@@ -313,7 +314,8 @@ def evaluate(
                 minlength=model.tokenizer.codebook_sizes[scale_index],
             )
 
-        # Prediction diagnostics begin after the supplied first scale.
+        # Prediction diagnostics cover either all scales or every scale after
+        # the supplied coarse scale, depending on the configured rollout.
         for prediction_index, (
             teacher_forced_logits,
             clean_targets,
@@ -322,9 +324,9 @@ def evaluate(
         ) in enumerate(
             zip(
                 output.next_scale_logits_by_scale,
-                output.quantizer.indices_by_scale[1:],
+                output.quantizer.indices_by_scale[prediction_scale_offset:],
                 rollout.prediction_logits_by_scale,
-                rollout.indices_by_scale[1:],
+                rollout.indices_by_scale[prediction_scale_offset:],
                 strict=True,
             )
         ):
@@ -383,8 +385,8 @@ def evaluate(
         # assignment distribution; usage alone only says whether a code appeared.
         perplexity = torch.exp(-(code_probabilities * code_probabilities.log()).sum())
 
-        if scale_index > 0:
-            prediction_index = scale_index - 1
+        if scale_index >= prediction_scale_offset:
+            prediction_index = scale_index - prediction_scale_offset
             metrics[f"teacher_forced_prediction_loss_scale_{scale_length}"] = (
                 teacher_forced_prediction_loss_sums[prediction_index] / example_count
             ).item()
@@ -472,7 +474,10 @@ def _add_training_statistics(
 
     for teacher_forced_logits, clean_targets in zip(
         output.next_scale_logits_by_scale,
-        output.quantizer.indices_by_scale[1:],
+        output.quantizer.indices_by_scale[
+            len(output.quantizer.indices_by_scale)
+            - len(output.next_scale_logits_by_scale) :
+        ],
         strict=True,
     ):
         teacher_forced_prediction_correct += (
@@ -981,7 +986,7 @@ def main(config: DictConfig) -> None:
                     f"{validation_metrics['total_loss']:.4f}, reconstruction "
                     "accuracy "
                     f"{validation_metrics['nucleotide_reconstruction_accuracy']:.2%}, "
-                    "first-scale-conditioned rollout accuracy "
+                    "sequential rollout accuracy "
                     f"{rollout_accuracy:.2%}, code retention "
                     f"{validation_metrics['code_retention']:.2%}"
                 )

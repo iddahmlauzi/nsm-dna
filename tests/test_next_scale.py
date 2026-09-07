@@ -100,6 +100,167 @@ def test_prefix_attention_mask_connects_prefix_directly_to_every_scale() -> None
     torch.testing.assert_close(model._build_attention_mask(2), expected_mask)
 
 
+def test_prefix_memory_mask_makes_memory_the_only_prefix_to_scale_route() -> None:
+    model = NextScaleTransformer(
+        input_dim=3,
+        model_dim=8,
+        scale_lengths=[1, 2],
+        codebook_size=5,
+        num_layers=1,
+        num_heads=2,
+        dropout=0.0,
+        max_prefix_length=2,
+        use_prefix_memory=True,
+    )
+
+    expected_mask = torch.tensor(
+        [
+            [True, True, False, False, False],
+            [True, True, False, False, False],
+            [True, True, True, False, False],
+            [False, False, True, True, True],
+            [False, False, True, True, True],
+        ]
+    ).reshape(1, 1, 5, 5)
+
+    torch.testing.assert_close(model._build_attention_mask(2), expected_mask)
+
+
+def test_prefix_memory_is_included_in_hidden_states_but_not_logits() -> None:
+    model = NextScaleTransformer(
+        input_dim=3,
+        model_dim=8,
+        scale_lengths=[1, 2, 3],
+        codebook_size=5,
+        num_layers=0,
+        num_heads=2,
+        dropout=0.0,
+        max_prefix_length=2,
+        use_prefix_memory=True,
+    )
+    prefix = torch.randn(2, 2, 3)
+    scale_inputs = [torch.randn(2, 2, 3), torch.randn(2, 3, 3)]
+
+    hidden_states = model.encode(scale_inputs, prefix=prefix)
+    logits = model(scale_inputs, prefix=prefix)
+
+    assert model.prefix_context_length(prefix.shape[1]) == 3
+    assert hidden_states.shape == (2, 8, 8)
+    assert logits.shape == (2, 5, 5)
+    torch.testing.assert_close(logits, model.output_head(hidden_states[:, 3:]))
+
+
+def test_prefix_memory_carries_prefix_gradients_to_target_scales() -> None:
+    model = NextScaleTransformer(
+        input_dim=3,
+        model_dim=8,
+        scale_lengths=[1, 2],
+        codebook_size=5,
+        num_layers=2,
+        num_heads=2,
+        dropout=0.0,
+        max_prefix_length=2,
+        use_prefix_memory=True,
+    )
+    prefix = torch.randn(2, 2, 3, requires_grad=True)
+    scale_inputs = [torch.randn(2, 2, 3)]
+
+    model(scale_inputs, prefix=prefix).square().mean().backward()
+
+    assert model.prefix_memory_token is not None
+    assert model.prefix_memory_token.grad is not None
+    assert model.prefix_memory_token.grad.count_nonzero() > 0
+    assert prefix.grad is not None
+    assert prefix.grad.count_nonzero() > 0
+
+
+def test_scale_one_bos_memory_routes_prefix_to_later_scales() -> None:
+    model = NextScaleTransformer(
+        input_dim=3,
+        model_dim=8,
+        scale_lengths=[1, 2],
+        codebook_size=5,
+        num_layers=2,
+        num_heads=2,
+        dropout=0.0,
+        max_prefix_length=2,
+        predict_first_scale=True,
+    )
+    prefix = torch.randn(2, 2, 3, requires_grad=True)
+    scale_inputs = [torch.randn(2, 2, 3)]
+
+    expected_mask = torch.tensor(
+        [
+            [True, True, False, False, False],
+            [True, True, False, False, False],
+            [True, True, True, False, False],
+            [False, False, True, True, True],
+            [False, False, True, True, True],
+        ]
+    ).reshape(1, 1, 5, 5)
+    torch.testing.assert_close(model._build_attention_mask(2), expected_mask)
+
+    logits = model(scale_inputs, prefix=prefix)
+    assert logits.shape == (2, 3, 5)
+    logits[:, 1:].square().mean().backward()
+
+    assert model.first_scale_bos is not None
+    assert model.first_scale_bos.grad is not None
+    assert model.first_scale_bos.grad.count_nonzero() > 0
+    assert prefix.grad is not None
+    assert prefix.grad.count_nonzero() > 0
+
+
+def test_scale_one_bos_predictions_match_parallel_hierarchy() -> None:
+    model = NextScaleTransformer(
+        input_dim=6,
+        model_dim=16,
+        scale_lengths=[1, 2, 4],
+        codebook_size=7,
+        num_layers=2,
+        num_heads=4,
+        dropout=0.1,
+        max_prefix_length=3,
+        predict_first_scale=True,
+    ).eval()
+    prefix = torch.randn(2, 3, 6)
+    scale_inputs = [torch.randn(2, 2, 6), torch.randn(2, 4, 6)]
+
+    parallel_logits = torch.split(
+        model(scale_inputs, prefix=prefix),
+        model.predicted_scale_lengths,
+        dim=1,
+    )
+    isolated_logits = [
+        model.predict_first_scale(prefix),
+        *[
+            model.predict_scale(
+                scale_input,
+                prediction_index=prediction_index,
+                prefix=prefix,
+            )
+            for prediction_index, scale_input in enumerate(scale_inputs, start=1)
+        ],
+    ]
+
+    for actual, expected in zip(isolated_logits, parallel_logits, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_prefix_memory_modes_are_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        NextScaleTransformer(
+            input_dim=3,
+            model_dim=8,
+            scale_lengths=[1, 2],
+            codebook_size=5,
+            num_layers=1,
+            num_heads=2,
+            use_prefix_memory=True,
+            predict_first_scale=True,
+        )
+
+
 def test_scale_ids_match_hierarchy_sections() -> None:
     model = NextScaleTransformer(
         input_dim=3,
@@ -392,6 +553,52 @@ def test_forward_runs_the_complete_pipeline_in_one_model_call() -> None:
     assert [logits.shape for logits in output.next_scale_logits_by_scale] == [
         (2, 2, 8),
         (2, 4, 8),
+    ]
+
+
+def test_scale_one_bos_model_predicts_and_rolls_out_every_scale() -> None:
+    config = _build_end_to_end_config()
+    config.model.transformer.predict_first_scale = True
+    model = NSMDNA.from_config(config)
+    sequence_ids = torch.tensor(
+        [
+            [0, 1, 2, 3, 3, 2, 1, 0],
+            [3, 2, 1, 0, 0, 1, 2, 3],
+        ]
+    )
+
+    output = model(
+        sequence_ids,
+        return_teacher_forced_prediction_reconstruction=True,
+        return_rollout=True,
+        return_rollout_reconstructions=True,
+    )
+
+    assert model.transformer.predicted_scale_lengths == [1, 2, 4]
+    assert [logits.shape for logits in output.next_scale_logits_by_scale] == [
+        (2, 1, 8),
+        (2, 2, 8),
+        (2, 4, 8),
+    ]
+    assert output.teacher_forced_prediction_reconstruction_logits is not None
+    assert output.teacher_forced_prediction_reconstruction_logits.shape == (2, 4, 4)
+    assert output.rollout is not None
+    assert [logits.shape for logits in output.rollout.prediction_logits_by_scale] == [
+        (2, 1, 8),
+        (2, 2, 8),
+        (2, 4, 8),
+    ]
+    assert [indices.shape for indices in output.rollout.indices_by_scale] == [
+        (2, 1),
+        (2, 2),
+        (2, 4),
+    ]
+
+    generation = model.eval().generate(sequence_ids[:, :4])
+    assert [indices.shape for indices in generation.indices_by_scale] == [
+        (2, 1),
+        (2, 2),
+        (2, 4),
     ]
 
 

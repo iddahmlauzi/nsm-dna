@@ -137,7 +137,10 @@ def nsm_dna_losses(
     teacher_forced_prediction, teacher_forced_prediction_by_scale = (
         next_scale_prediction_loss(
             output.next_scale_logits_by_scale,
-            output.quantizer.indices_by_scale[1:],
+            output.quantizer.indices_by_scale[
+                len(output.quantizer.indices_by_scale)
+                - len(output.next_scale_logits_by_scale) :
+            ],
         )
     )
     entropy = codebook_entropy_loss(

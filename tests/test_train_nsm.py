@@ -338,6 +338,23 @@ def test_evaluate_reports_joint_and_per_scale_metrics() -> None:
         assert 0 <= metrics[f"soft_confidence_scale_{scale_length}"] <= 1
 
 
+def test_evaluate_reports_predicted_scale_one_metrics() -> None:
+    config = _build_config()
+    config.model.transformer.predict_first_scale = True
+    model = NSMDNA.from_config(config)
+
+    metrics = evaluate(
+        model,
+        data_loader=[{"input_ids": _sequence_ids()}],
+        use_mixed_precision=False,
+    )
+
+    assert metrics["teacher_forced_prediction_loss_scale_1"] > 0
+    assert 0 <= metrics["teacher_forced_prediction_accuracy_scale_1"] <= 1
+    assert 0 <= metrics["rollout_prediction_accuracy_scale_1"] <= 1
+    assert 0 <= metrics["teacher_forced_rollout_agreement_scale_1"] <= 1
+
+
 def test_validation_wandb_metrics_are_grouped_by_scale() -> None:
     model = NSMDNA.from_config(_build_config())
     validation_metrics = evaluate(
@@ -541,14 +558,16 @@ def test_default_config_matches_the_joint_training_contract() -> None:
     assert config.wandb.project == "nsm-dna-end-to-end"
     assert (
         config.wandb.name
-        == "nsm-dna-end-to-end-contextual-no-prefix-supplied-scale4"
+        == "prefix128-target128-scale1-bos-memory-no-tokenizer-encoder-2epochs"
     )
     assert config.data.subset_directory.endswith("gtdb/500M_subset")
-    assert config.data.sequence_length == 128
+    assert config.data.sequence_length == 256
     assert config.model.tokenizer.context_length == 128
     assert config.model.tokenizer.embed_dim == 384
-    assert config.model.tokenizer.encoder_num_layers == 1
+    assert config.model.tokenizer.num_heads == 6
+    assert config.model.tokenizer.encoder_num_layers == 0
     assert list(config.model.tokenizer.scale_lengths) == [
+        1,
         4,
         9,
         16,
@@ -560,6 +579,8 @@ def test_default_config_matches_the_joint_training_contract() -> None:
     ]
     assert config.model.tokenizer.codebook_size == 256
     assert config.model.transformer.model_dim == 640
+    assert config.model.transformer.use_prefix_memory is False
+    assert config.model.transformer.predict_first_scale is True
     assert config.optimizer.learning_rate == 1e-4
     assert config.optimizer.min_learning_rate == 1e-5
     assert config.optimizer.warmup_fraction == 0.05

@@ -113,6 +113,8 @@ class NextScaleTransformer(nn.Module):
         head_hidden_multiplier: float = 2.0,
         input_refinement_kernel_size: int = 3,
         max_prefix_length: int = 0,
+        use_prefix_memory: bool = False,
+        predict_first_scale: bool = False,
     ) -> None:
         super().__init__()
 
@@ -122,7 +124,10 @@ class NextScaleTransformer(nn.Module):
         self.input_dim = input_dim
         self.model_dim = model_dim
         self.scale_lengths = list(scale_lengths)
-        self.predicted_scale_lengths = self.scale_lengths[1:]
+        self.predicts_first_scale = predict_first_scale
+        self.predicted_scale_lengths = (
+            self.scale_lengths if self.predicts_first_scale else self.scale_lengths[1:]
+        )
         self.codebook_size = codebook_size
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -130,6 +135,29 @@ class NextScaleTransformer(nn.Module):
         self.rope_base = rope_base
         self.input_refinement_kernel_size = input_refinement_kernel_size
         self.max_prefix_length = max_prefix_length
+        self.use_prefix_memory = use_prefix_memory
+
+        if self.use_prefix_memory and self.predicts_first_scale:
+            raise ValueError(
+                "Use either a dedicated prefix memory token or first-scale BOS "
+                "memory, not both."
+            )
+
+        if self.use_prefix_memory:
+            self.prefix_memory_token = nn.Parameter(
+                torch.empty(1, 1, self.input_dim)
+            )
+            nn.init.normal_(self.prefix_memory_token, mean=0.0, std=0.02)
+        else:
+            self.register_parameter("prefix_memory_token", None)
+
+        if self.predicts_first_scale:
+            self.first_scale_bos = nn.Parameter(
+                torch.empty(1, self.scale_lengths[0], self.model_dim)
+            )
+            nn.init.normal_(self.first_scale_bos, mean=0.0, std=0.02)
+        else:
+            self.register_parameter("first_scale_bos", None)
 
         # Each resized scale input receives its own local residual correction
         # before all scales share the model-space input projection.
@@ -142,7 +170,7 @@ class NextScaleTransformer(nn.Module):
                     padding=self.input_refinement_kernel_size // 2,
                     bias=bias,
                 )
-                for _ in self.predicted_scale_lengths
+                for _ in self.scale_lengths[1:]
             ]
         )
 
@@ -159,9 +187,8 @@ class NextScaleTransformer(nn.Module):
             bias=bias,
         )
 
-        # The first scale is supplied as the cumulative input used to predict the
-        # next scale. The transformer therefore has sections only for predicted
-        # scales rather than a learned BOS section.
+        # Scale identity is required because RoPE restarts from zero in every
+        # isolated hierarchy section.
         self.scale_embedding = nn.Embedding(
             len(self.predicted_scale_lengths),
             self.model_dim,
@@ -207,8 +234,12 @@ class NextScaleTransformer(nn.Module):
         self.register_buffer("rope_cosine", rope_cosine, persistent=False)
         self.register_buffer("rope_sine", rope_sine, persistent=False)
 
-        # Prefix positions run sequentially across all preceding DNA blocks.
-        prefix_positions = torch.arange(self.max_prefix_length)
+        # The memory token follows the raw prefix, so it receives the next
+        # sequential position without shifting any nucleotide positions.
+        max_prefix_context_length = self.prefix_context_length(
+            self.max_prefix_length
+        )
+        prefix_positions = torch.arange(max_prefix_context_length)
         prefix_rope_cosine, prefix_rope_sine = precompute_rope_cosine_and_sine(
             prefix_positions,
             head_dim,
@@ -309,15 +340,16 @@ class NextScaleTransformer(nn.Module):
         prefix_length: int,
         scale_ids: Tensor | None = None,
     ) -> Bool[Tensor, "1 1 length length"]:
-        """Let every scale read the prefix while keeping scale sections isolated."""
+        """Connect prefix context while keeping scale sections isolated."""
         if scale_ids is None and prefix_length == 0:
             return self.scale_attention_mask
 
         if scale_ids is None:
             scale_ids = self.scale_ids
 
+        prefix_context_length = self.prefix_context_length(prefix_length)
         prefix_section_ids = torch.full(
-            (prefix_length,),
+            (prefix_context_length,),
             -1,
             device=scale_ids.device,
         )
@@ -327,10 +359,42 @@ class NextScaleTransformer(nn.Module):
 
         same_section = row_section_ids == column_section_ids
         target_reads_prefix = (row_section_ids >= 0) & (column_section_ids == -1)
+        attention_mask = same_section | target_reads_prefix
+
+        if self.use_prefix_memory and prefix_length > 0:
+            memory_index = prefix_length
+            # Raw prefix positions contextualize only one another. The learned
+            # memory token reads the complete prefix, and target scales read only
+            # that token. This makes memory the sole prefix-to-target route.
+            attention_mask[:prefix_length, memory_index] = False
+            attention_mask[memory_index, :prefix_context_length] = True
+            attention_mask[prefix_context_length:, :prefix_length] = False
+            attention_mask[prefix_context_length:, memory_index] = True
+        elif self.predicts_first_scale and prefix_length > 0:
+            # The one-position first-scale BOS state is the sole route from the
+            # raw prefix into the hierarchy. Later scales read that continuous
+            # state rather than attending to raw prefix positions.
+            first_scale_reads_prefix = (row_section_ids == 0) & (
+                column_section_ids == -1
+            )
+            later_scales_read_first_scale = (row_section_ids > 0) & (
+                column_section_ids == 0
+            )
+            attention_mask = (
+                same_section
+                | first_scale_reads_prefix
+                | later_scales_read_first_scale
+            )
+
         return einx.id(
             "row column -> 1 1 row column",
-            same_section | target_reads_prefix,
+            attention_mask,
         )
+
+    def prefix_context_length(self, prefix_length: int) -> int:
+        """Include one memory position only when a raw prefix is present."""
+        has_memory = self.use_prefix_memory and prefix_length > 0
+        return prefix_length + int(has_memory)
 
     def _get_rotary_embeddings(
         self,
@@ -343,12 +407,13 @@ class NextScaleTransformer(nn.Module):
             scale_cosine = self.rope_cosine
         if scale_sine is None:
             scale_sine = self.rope_sine
+        prefix_context_length = self.prefix_context_length(prefix_length)
         cosine = torch.cat(
-            [self.prefix_rope_cosine[:prefix_length], scale_cosine],
+            [self.prefix_rope_cosine[:prefix_context_length], scale_cosine],
             dim=0,
         )
         sine = torch.cat(
-            [self.prefix_rope_sine[:prefix_length], scale_sine],
+            [self.prefix_rope_sine[:prefix_context_length], scale_sine],
             dim=0,
         )
         return cosine, sine
@@ -370,14 +435,37 @@ class NextScaleTransformer(nn.Module):
                 f"of {self.max_prefix_length}."
             )
 
-        if prefix is None:
+        if prefix is None or prefix_length == 0:
             combined_inputs = hierarchy_inputs
+        elif self.use_prefix_memory:
+            assert self.prefix_memory_token is not None
+            memory_token = self.prefix_memory_token.expand(
+                prefix.shape[0],
+                -1,
+                -1,
+            )
+            combined_inputs = torch.cat(
+                [prefix, memory_token, hierarchy_inputs],
+                dim=1,
+            )
         else:
             combined_inputs = torch.cat([prefix, hierarchy_inputs], dim=1)
 
         projected_inputs = self.input_projection(combined_inputs)
-        prefix_hidden_states = projected_inputs[:, :prefix_length]
-        hierarchy_hidden_states = projected_inputs[:, prefix_length:]
+        prefix_context_length = self.prefix_context_length(prefix_length)
+        prefix_hidden_states = projected_inputs[:, :prefix_context_length]
+        hierarchy_hidden_states = projected_inputs[:, prefix_context_length:]
+        if self.predicts_first_scale:
+            assert self.first_scale_bos is not None
+            first_scale_hidden_states = self.first_scale_bos.expand(
+                projected_inputs.shape[0],
+                -1,
+                -1,
+            )
+            hierarchy_hidden_states = torch.cat(
+                [first_scale_hidden_states, hierarchy_hidden_states],
+                dim=1,
+            )
         hierarchy_hidden_states = hierarchy_hidden_states + self.scale_embedding(
             hierarchy_scale_ids
         )
@@ -421,6 +509,25 @@ class NextScaleTransformer(nn.Module):
             prefix=prefix,
         )
 
+    def predict_first_scale(
+        self,
+        prefix: Float[Tensor, "batch prefix_length input_dim"],
+    ) -> Float[Tensor, "batch first_scale_length codebook_size"]:
+        """Predict scale 1 from the prefix-facing BOS state."""
+        if not self.predicts_first_scale:
+            raise RuntimeError("The first scale is configured as supplied context.")
+
+        first_scale_length = self.scale_lengths[0]
+        empty_input = prefix.new_empty(prefix.shape[0], 0, self.input_dim)
+        hidden_states = self._encode_hierarchy(
+            empty_input,
+            self.scale_ids[:first_scale_length],
+            self.rope_cosine[:first_scale_length],
+            self.rope_sine[:first_scale_length],
+            prefix=prefix,
+        )
+        return self.output_head(hidden_states[:, -first_scale_length:])
+
     def predict_scale(
         self,
         scale_input: Float[Tensor, "batch scale_length input_dim"],
@@ -432,6 +539,9 @@ class NextScaleTransformer(nn.Module):
         if not 0 <= prediction_index < len(self.predicted_scale_lengths):
             raise IndexError("prediction_index is outside the predicted scales.")
 
+        if self.predicts_first_scale and prediction_index == 0:
+            raise ValueError("Use predict_first_scale for the BOS prediction.")
+
         expected_length = self.predicted_scale_lengths[prediction_index]
         if scale_input.shape[1] != expected_length:
             raise ValueError(
@@ -441,19 +551,35 @@ class NextScaleTransformer(nn.Module):
 
         start = sum(self.predicted_scale_lengths[:prediction_index])
         end = start + expected_length
+        refinement_index = (
+            prediction_index - 1 if self.predicts_first_scale else prediction_index
+        )
         refined_scale_input = self._refine_scale_input(
             scale_input,
-            prediction_index,
+            refinement_index,
         )
+        hierarchy_scale_ids = self.scale_ids[start:end]
+        hierarchy_rope_cosine = self.rope_cosine[start:end]
+        hierarchy_rope_sine = self.rope_sine[start:end]
+        if self.predicts_first_scale:
+            first_scale_length = self.scale_lengths[0]
+            hierarchy_scale_ids = torch.cat(
+                [self.scale_ids[:first_scale_length], hierarchy_scale_ids]
+            )
+            hierarchy_rope_cosine = torch.cat(
+                [self.rope_cosine[:first_scale_length], hierarchy_rope_cosine]
+            )
+            hierarchy_rope_sine = torch.cat(
+                [self.rope_sine[:first_scale_length], hierarchy_rope_sine]
+            )
         hidden_states = self._encode_hierarchy(
             refined_scale_input,
-            self.scale_ids[start:end],
-            self.rope_cosine[start:end],
-            self.rope_sine[start:end],
+            hierarchy_scale_ids,
+            hierarchy_rope_cosine,
+            hierarchy_rope_sine,
             prefix=prefix,
         )
-        prefix_length = 0 if prefix is None else prefix.shape[1]
-        return self.output_head(hidden_states[:, prefix_length:])
+        return self.output_head(hidden_states[:, -expected_length:])
 
     def forward(
         self,
@@ -463,5 +589,6 @@ class NextScaleTransformer(nn.Module):
     ) -> Float[Tensor, "batch hierarchy_length codebook_size"]:
         hidden_states = self.encode(scale_inputs, prefix=prefix)
         prefix_length = 0 if prefix is None else prefix.shape[1]
-        hierarchy_hidden_states = hidden_states[:, prefix_length:]
+        prefix_context_length = self.prefix_context_length(prefix_length)
+        hierarchy_hidden_states = hidden_states[:, prefix_context_length:]
         return self.output_head(hierarchy_hidden_states)

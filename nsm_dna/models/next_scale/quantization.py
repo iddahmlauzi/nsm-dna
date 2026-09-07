@@ -503,19 +503,22 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         self,
         logits_by_scale: list[Float[Tensor, "batch scale_length codebook_size"]],
         *,
-        initial_latent: Float[Tensor, "batch length embed_dim"],
+        initial_latent: Float[Tensor, "batch length embed_dim"] | None,
     ) -> Float[Tensor, "batch length embed_dim"]:
-        """Add predicted refinement scales to the supplied first-scale latent.
-
-        The first scale is observed rather than predicted. The teacher-forced
-        reconstruction keeps that true coarse contribution, then decodes hard
-        predictions for the finer scales while retaining soft Transformer gradients.
-        """
-        reconstruction = initial_latent
+        """Decode hard scale predictions while retaining soft gradients."""
+        codebook_offset = int(initial_latent is not None)
+        if initial_latent is None:
+            reconstruction = logits_by_scale[0].new_zeros(
+                logits_by_scale[0].shape[0],
+                self.scale_lengths[-1],
+                self.embed_dim,
+            )
+        else:
+            reconstruction = initial_latent
 
         for scale_index, (scale_logits, codebook) in enumerate(
-            zip(logits_by_scale, self.codebooks[1:], strict=True),
-            start=1,
+            zip(logits_by_scale, self.codebooks[codebook_offset:], strict=True),
+            start=codebook_offset,
         ):
             probabilities = torch.softmax(scale_logits.float(), dim=-1)
             hard_indices = probabilities.argmax(dim=-1)
