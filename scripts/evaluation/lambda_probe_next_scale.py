@@ -221,7 +221,7 @@ def build_parallel_encoder(
     config_name="lambda_probe_next_scale",
 )
 def main(config: DictConfig) -> None:
-    """Compare trained and random NSM-DNA final embeddings on LAMBDA."""
+    """Evaluate trained NSM-DNA final embeddings on LAMBDA."""
     device_ids = [int(device_id) for device_id in config.device_ids]
     device = torch.device(f"cuda:{device_ids[0]}")
     dataset_directory = Path(config.dataset_directory)
@@ -274,27 +274,27 @@ def main(config: DictConfig) -> None:
     del trained_model
     torch.cuda.empty_cache()
 
+    evaluate_random_model = bool(config.evaluate_random_model)
     random_seed = int(config.random_model_seed)
-    torch.manual_seed(random_seed)
-    random_model = NSM.from_config(model_config, tokenizer).to(device)
-    random_model.eval()
-    random_model.requires_grad_(False)
-    random_results = evaluate_representation(
-        f"random_seed_{random_seed}",
-        build_parallel_encoder(random_model, tokenizer, device_ids),
-        random_model.model_dim,
-        window_length,
-        stride,
-        splits,
-        config,
-        output_directory,
-        device,
-    )
-
-    results = {
-        "trained": trained_results,
-        f"random_seed_{random_seed}": random_results,
-        "delta_mcc": {
+    results = {"trained": trained_results}
+    if evaluate_random_model:
+        torch.manual_seed(random_seed)
+        random_model = NSM.from_config(model_config, tokenizer).to(device)
+        random_model.eval()
+        random_model.requires_grad_(False)
+        random_results = evaluate_representation(
+            f"random_seed_{random_seed}",
+            build_parallel_encoder(random_model, tokenizer, device_ids),
+            random_model.model_dim,
+            window_length,
+            stride,
+            splits,
+            config,
+            output_directory,
+            device,
+        )
+        results[f"random_seed_{random_seed}"] = random_results
+        results["delta_mcc"] = {
             "linear_probe": (
                 trained_results["linear_probe"]["mcc"]
                 - random_results["linear_probe"]["mcc"]
@@ -303,8 +303,7 @@ def main(config: DictConfig) -> None:
                 trained_results["three_layer_probe"]["mcc"]
                 - random_results["three_layer_probe"]["mcc"]
             ),
-        },
-    }
+        }
     window_starts = segment_window_starts(
         int(config.expected_sequence_length),
         window_length,
@@ -338,7 +337,8 @@ def main(config: DictConfig) -> None:
         "window_starts": window_starts,
         "embedding_batch_size": int(config.embedding_batch_size),
         "device_ids": device_ids,
-        "random_model_seed": random_seed,
+        "evaluate_random_model": evaluate_random_model,
+        "random_model_seed": random_seed if evaluate_random_model else None,
         "probe_config": OmegaConf.to_container(config.probe, resolve=True),
         "results": results,
     }

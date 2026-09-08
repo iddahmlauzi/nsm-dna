@@ -22,8 +22,8 @@ data:
 model:
   vocab_size: 4
   context_length: 128
-  embed_dim: 256
-  num_heads: 8
+  embed_dim: 384
+  num_heads: 6
   rope_base: 10_000
   scale_lengths: [1, 4, 9, 16, 25, 36, 49, 64, 128]
   codebook_sizes: [256, 256, 256, 256, 256, 256, 256, 256, 256]
@@ -73,10 +73,6 @@ evaluation:
 
 checkpoint:
   interval: 3_000
-  huggingface:
-    enabled: false
-    repository_id: Iddah/nsm-dna-checkpoints
-    repository_directory: vqvae-128-block
 
 hydra:
   run:

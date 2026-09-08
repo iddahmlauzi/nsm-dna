@@ -6,6 +6,7 @@ output_directory: /workspace/results/nsm-9scale-scale1-memory/lambda-probe-2k-fi
 expected_sequence_length: 2_000
 embedding_batch_size: 16
 device_ids: [0, 1]
+evaluate_random_model: true
 random_model_seed: 42
 
 probe:
