@@ -4,12 +4,11 @@ import torch
 from omegaconf import OmegaConf
 
 from nsm_dna.models.next_token import NextTokenModel
-from scripts.training import train_next_token
+from nsm_dna.training import save_training_checkpoint
 from scripts.training.train_next_token import (
     compute_next_token_loss,
     evaluate,
     prepare_next_token_batch,
-    save_and_upload_checkpoint,
 )
 
 
@@ -61,32 +60,13 @@ def test_evaluate_reports_metrics_and_restores_training_mode() -> None:
     assert 0 <= metrics["accuracy"] <= 1
 
 
-def test_checkpoint_is_uploaded_immediately_after_it_is_saved(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
+def test_checkpoint_is_saved_locally(tmp_path: Path) -> None:
     model = _build_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-    config = OmegaConf.create(
-        {
-            "checkpoint": {
-                "huggingface": {
-                    "enabled": True,
-                    "repository_id": "owner/checkpoints",
-                    "repository_directory": "next-token-256",
-                }
-            }
-        }
-    )
-    uploaded_paths = []
-    monkeypatch.setattr(
-        train_next_token,
-        "upload_checkpoint_to_hugging_face",
-        lambda checkpoint_path, _: uploaded_paths.append(checkpoint_path),
-    )
+    config = OmegaConf.create({})
 
-    checkpoint_path = save_and_upload_checkpoint(
+    checkpoint_path = save_training_checkpoint(
         tmp_path,
         model,
         optimizer,
@@ -98,21 +78,16 @@ def test_checkpoint_is_uploaded_immediately_after_it_is_saved(
     )
 
     assert checkpoint_path.exists()
-    assert uploaded_paths == [checkpoint_path]
     checkpoint = torch.load(checkpoint_path, weights_only=True)
     assert checkpoint["step"] == 1000
 
 
-def test_default_config_enables_hugging_face_recovery() -> None:
+def test_default_config_uses_local_checkpoint_recovery() -> None:
     config_path = Path(__file__).parents[1] / "configs" / "next_token.yaml"
     config = OmegaConf.load(config_path)
 
-    assert config.checkpoint.huggingface.enabled is True
+    assert "huggingface" not in config.checkpoint
     assert config.checkpoint.recovery_interval == 5000
-    assert (
-        config.checkpoint.huggingface.repository_directory
-        == "transformer-plus-plus-256-40m"
-    )
     assert config.wandb.run_id is None
 
 

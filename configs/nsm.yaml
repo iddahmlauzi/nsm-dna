@@ -78,10 +78,6 @@ checkpoint:
   # history for comparing or restarting from earlier training stages.
   recovery_interval: 5_000
   milestone_interval: 10_000
-  huggingface:
-    enabled: false
-    repository_id: Iddah/nsm-dna-checkpoints
-    repository_directory: nsm-9scale-scale1-memory
 
 hydra:
   run:

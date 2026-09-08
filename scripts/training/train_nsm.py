@@ -26,7 +26,6 @@ from nsm_dna.training import (
     initialize_distributed_training,
     load_training_checkpoint,
     save_training_checkpoint,
-    upload_checkpoint_to_hugging_face,
 )
 
 
@@ -602,10 +601,6 @@ def main(config: DictConfig) -> None:
                         checkpoint_name="best.pt",
                     )
                     tqdm.write(f"saved best checkpoint: {best_checkpoint_path}")
-                    upload_checkpoint_to_hugging_face(
-                        best_checkpoint_path,
-                        config.checkpoint.huggingface,
-                    )
 
                 if wandb_run is not None:
                     wandb_metrics = {
@@ -653,10 +648,6 @@ def main(config: DictConfig) -> None:
                     tqdm.write(
                         f"saved {checkpoint_type} checkpoint: {checkpoint_path}"
                     )
-                    upload_checkpoint_to_hugging_face(
-                        checkpoint_path,
-                        config.checkpoint.huggingface,
-                    )
 
             if distributed_environment.is_distributed:
                 dist.barrier()
@@ -673,10 +664,6 @@ def main(config: DictConfig) -> None:
             checkpoint_name="final.pt",
         )
         tqdm.write(f"saved final checkpoint: {final_checkpoint_path}")
-        upload_checkpoint_to_hugging_face(
-            final_checkpoint_path,
-            config.checkpoint.huggingface,
-        )
 
     if wandb_run is not None:
         wandb_run.finish()

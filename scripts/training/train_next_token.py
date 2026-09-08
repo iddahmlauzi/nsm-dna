@@ -23,7 +23,6 @@ from nsm_dna.training import (
     initialize_distributed_training,
     load_training_checkpoint,
     save_training_checkpoint,
-    upload_checkpoint_to_hugging_face,
 )
 
 
@@ -88,34 +87,6 @@ def evaluate(
         "loss": loss_sum / num_tokens,
         "accuracy": num_correct / num_tokens,
     }
-
-
-def save_and_upload_checkpoint(
-    run_directory: Path,
-    model: NextTokenModel,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
-    config: DictConfig,
-    step: int,
-    best_validation_loss: float,
-    checkpoint_name: str | None = None,
-) -> Path:
-    """Save a checkpoint locally and immediately copy it to Hugging Face."""
-    checkpoint_path = save_training_checkpoint(
-        run_directory,
-        model,
-        optimizer,
-        scheduler,
-        config,
-        step,
-        best_validation_loss,
-        checkpoint_name=checkpoint_name,
-    )
-    upload_checkpoint_to_hugging_face(
-        checkpoint_path,
-        config.checkpoint.huggingface,
-    )
-    return checkpoint_path
 
 
 @hydra.main(
@@ -208,8 +179,6 @@ def main(config: DictConfig) -> None:
 
     start_step = 0
     best_validation_loss = float("inf")
-    best_checkpoint_path: Path | None = None
-    best_checkpoint_needs_upload = False
     if config.run.resume_from is not None:
         checkpoint_path = Path(config.run.resume_from)
         start_step, best_validation_loss = load_training_checkpoint(
@@ -348,7 +317,6 @@ def main(config: DictConfig) -> None:
                         best_validation_loss,
                         checkpoint_name="best.pt",
                     )
-                    best_checkpoint_needs_upload = True
                     tqdm.write(f"saved best checkpoint: {best_checkpoint_path}")
 
                 if wandb_run is not None:
@@ -364,9 +332,8 @@ def main(config: DictConfig) -> None:
             if distributed_environment.is_distributed:
                 dist.barrier()
 
-        is_recovery_step = step % config.checkpoint.recovery_interval == 0
         checkpoints_to_save: list[tuple[str, str | None]] = []
-        if is_recovery_step:
+        if step % config.checkpoint.recovery_interval == 0:
             checkpoints_to_save.append(("recovery", "latest.pt"))
         if step % config.checkpoint.milestone_interval == 0:
             checkpoints_to_save.append(("milestone", None))
@@ -374,7 +341,7 @@ def main(config: DictConfig) -> None:
         if checkpoints_to_save:
             if distributed_environment.is_main_process:
                 for checkpoint_type, checkpoint_name in checkpoints_to_save:
-                    checkpoint_path = save_and_upload_checkpoint(
+                    checkpoint_path = save_training_checkpoint(
                         run_directory,
                         model,
                         optimizer,
@@ -388,22 +355,11 @@ def main(config: DictConfig) -> None:
                         f"saved {checkpoint_type} checkpoint: {checkpoint_path}"
                     )
 
-                if is_recovery_step and best_checkpoint_needs_upload:
-                    assert best_checkpoint_path is not None
-                    upload_checkpoint_to_hugging_face(
-                        best_checkpoint_path,
-                        config.checkpoint.huggingface,
-                    )
-                    best_checkpoint_needs_upload = False
-                    tqdm.write(
-                        f"uploaded best checkpoint: {best_checkpoint_path}"
-                    )
-
             if distributed_environment.is_distributed:
                 dist.barrier()
 
     if distributed_environment.is_main_process:
-        final_checkpoint_path = save_and_upload_checkpoint(
+        final_checkpoint_path = save_training_checkpoint(
             run_directory,
             model,
             optimizer,
@@ -414,13 +370,6 @@ def main(config: DictConfig) -> None:
             checkpoint_name="final.pt",
         )
         tqdm.write(f"saved final checkpoint: {final_checkpoint_path}")
-        if best_checkpoint_needs_upload:
-            assert best_checkpoint_path is not None
-            upload_checkpoint_to_hugging_face(
-                best_checkpoint_path,
-                config.checkpoint.huggingface,
-            )
-            tqdm.write(f"uploaded best checkpoint: {best_checkpoint_path}")
 
     if wandb_run is not None:
         wandb_run.finish()

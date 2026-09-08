@@ -6,7 +6,6 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from huggingface_hub import HfApi
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from torch.optim import Optimizer
@@ -152,22 +151,6 @@ def save_training_checkpoint(
         checkpoint_path,
     )
     return checkpoint_path
-
-
-def upload_checkpoint_to_hugging_face(
-    checkpoint_path: Path,
-    config: DictConfig,
-) -> None:
-    """Upload a saved checkpoint when Hugging Face syncing is enabled."""
-    if not config.enabled:
-        return
-
-    HfApi().upload_file(
-        path_or_fileobj=checkpoint_path,
-        path_in_repo=f"{config.repository_directory}/{checkpoint_path.name}",
-        repo_id=config.repository_id,
-        repo_type="model",
-    )
 
 
 def load_training_checkpoint(

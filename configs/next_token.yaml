@@ -57,14 +57,10 @@ evaluation:
   max_batches: 10
 
 checkpoint:
-  # Upload latest.pt and any improved best.pt at this cadence so an interrupted
-  # Vast instance loses at most 5,000 completed optimizer steps.
+  # Save latest.pt at this cadence so an interrupted run loses at most 5,000
+  # completed optimizer steps.
   recovery_interval: 5_000
   milestone_interval: 10_000
-  huggingface:
-    enabled: true
-    repository_id: Iddah/nsm-dna-checkpoints
-    repository_directory: transformer-plus-plus-256-40m
 
 hydra:
   run:
