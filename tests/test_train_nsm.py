@@ -294,16 +294,18 @@ def test_corruption_changes_inputs_without_changing_targets() -> None:
     torch.testing.assert_close(targets_by_scale[1], torch.tensor([[2, 4]]))
 
 
-def test_default_config_matches_next_token_transformer_recipe() -> None:
+def test_default_config_matches_long_context_recipe() -> None:
     config_path = Path(__file__).parents[1] / "configs" / "nsm.yaml"
     config = OmegaConf.load(config_path)
 
     assert config.run.resume_from is None
     assert config.tokenizer_checkpoint.endswith(
-        "vqvae-9scale-500m/checkpoints/final.pt"
+        "vqvae-512-8scale-500m-batch16/checkpoints/final.pt"
     )
     assert config.data.subset_directory.endswith("gtdb/500M_subset")
-    assert config.data.train_batch_size == 64
+    assert config.data.sequence_length == 1024
+    assert config.data.train_batch_size == 4
+    assert config.data.validation_batch_size == 8
     assert config.model.model_dim == 640
     assert config.model.num_layers == 8
     assert config.model.num_heads == 10
@@ -314,7 +316,14 @@ def test_default_config_matches_next_token_transformer_recipe() -> None:
     assert config.optimizer.beta_1 == 0.9
     assert config.optimizer.beta_2 == 0.95
     assert config.optimizer.weight_decay == 0.05
-    assert config.optimizer.gradient_accumulation_steps == 2
+    assert config.optimizer.gradient_accumulation_steps == 8
+    assert (
+        config.data.sequence_length
+        * config.data.train_batch_size
+        * 4
+        * config.optimizer.gradient_accumulation_steps
+        == 131_072
+    )
     assert config.training.num_epochs == 10
     assert config.training.input_code_corruption_probability == 0.1
 

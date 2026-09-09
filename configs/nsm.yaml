@@ -1,4 +1,4 @@
-# Transformer++ NSM-DNA over a 128-base prefix and 128-base target block.
+# Transformer++ NSM-DNA over a 512-base prefix and 512-base target block.
 
 run:
   seed: 0
@@ -6,29 +6,29 @@ run:
 
 # The checkpoint's stored model configuration is the source of truth for the
 # tokenizer architecture, scale lengths, and codebook sizes.
-tokenizer_checkpoint: ../runs/vqvae-9scale-500m/checkpoints/final.pt
+tokenizer_checkpoint: ../runs/vqvae-512-8scale-500m-batch16/checkpoints/final.pt
 
 wandb:
   enabled: true
   entity: nsm-dna
   project: nsm
-  name: nsm-9scale-scale1-memory
+  name: nsm-prefix512-target512-8scale-direct-prefix
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
   train_split: train
   validation_split: validation
-  sequence_length: 256
-  # Four GPUs at batch 64 with two accumulation steps match the NTP effective
-  # batch of 512 sequences per optimizer update.
-  train_batch_size: 64
-  validation_batch_size: 128
+  sequence_length: 1_024
+  # Four GPUs at batch 4 with eight accumulation steps process 131,072 bases
+  # per optimizer update, matching the previous NSM configuration.
+  train_batch_size: 4
+  validation_batch_size: 8
   num_workers: 3
   shuffle_buffer_size: 10_000
 
 model:
   # Match the 39.30M-parameter NTP Transformer backbone exactly. NSM-specific
-  # scale refiners and the output head bring the stage-two total to 46.52M.
+  # scale refiners and the output head bring the stage-two total to 46.08M.
   model_dim: 640
   num_layers: 8
   num_heads: 10
@@ -51,7 +51,7 @@ optimizer:
   beta_2: 0.95
   weight_decay: 0.05
   max_gradient_norm: 1.0
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 8
 
   # A scale's loss share is proportional to length ** (1 - alpha).
   scale_loss_alpha: 1
