@@ -193,6 +193,13 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
                 "The latent length must be divisible by the first scale length."
             )
 
+        for scale_length in self.scale_lengths:
+            if self.latent_length % scale_length != 0:
+                raise ValueError(
+                    "Every reference scale length must divide the reference "
+                    "latent length."
+                )
+
         # Factor the large first-scale stride into small learned stages so its
         # parameter count grows with the number of stages, not the full kernel.
         first_scale_stride = self.latent_length // first_scale_length
@@ -218,18 +225,38 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             for _ in scale_lengths
         )
 
+    def scale_lengths_for_latent_length(self, latent_length: int) -> list[int]:
+        """Scale the reference hierarchy to a runtime latent length."""
+        runtime_scale_lengths = []
+
+        for reference_scale_length in self.scale_lengths:
+            scaled_length = reference_scale_length * latent_length
+            if scaled_length % self.latent_length != 0:
+                raise ValueError(
+                    f"Latent length {latent_length} is incompatible with the "
+                    "configured relative scale hierarchy."
+                )
+            runtime_scale_lengths.append(scaled_length // self.latent_length)
+
+        if runtime_scale_lengths[0] <= 0:
+            raise ValueError("The runtime first scale must contain at least one code.")
+
+        return runtime_scale_lengths
+
     def _resize_to_scale(
         self,
         latent: Float[Tensor, "batch length embed_dim"],
         scale_index: int,
+        scale_lengths: list[int],
     ) -> Float[Tensor, "batch scale_length embed_dim"]:
         """Resize a full-length latent tensor to the selected scale.
 
         The first scale uses cascaded learned strided convolutions. Other scales
         use area interpolation unless a scale matches the full latent length.
         """
-        scale_length = self.scale_lengths[scale_index]
-        if scale_length == self.latent_length:
+        latent_length = latent.shape[1]
+        scale_length = scale_lengths[scale_index]
+        if scale_length == latent_length:
             return latent
 
         # Conv1d and one-dimensional interpolation expect channels first.
@@ -249,6 +276,8 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         self,
         quantized: Float[Tensor, "batch embed_dim scale_length"],
         scale_index: int,
+        scale_lengths: list[int],
+        latent_length: int,
     ) -> Float[Tensor, "batch embed_dim length"]:
         """Upsample a quantized contribution to the full latent length.
 
@@ -256,7 +285,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         linear interpolation unless a scale matches the full latent length.
         The channels-first layout can pass directly into BlendedConv1d afterward.
         """
-        if self.scale_lengths[scale_index] == self.latent_length:
+        if scale_lengths[scale_index] == latent_length:
             return quantized
 
         if scale_index == 0:
@@ -264,7 +293,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
 
         return F.interpolate(
             quantized,
-            size=self.latent_length,
+            size=latent_length,
             mode="linear",
             align_corners=False,
         )
@@ -273,12 +302,16 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         self,
         quantized_at_scale: Float[Tensor, "batch scale_length embed_dim"],
         scale_index: int,
+        scale_lengths: list[int],
+        latent_length: int,
     ) -> Float[Tensor, "batch length embed_dim"]:
         """Upsample and refine one scale's quantized vectors."""
         quantized_at_scale = einx.id("b l d -> b d l", quantized_at_scale)
         scale_contribution = self._upsample_to_full_length(
             quantized_at_scale,
             scale_index,
+            scale_lengths,
+            latent_length,
         )
         scale_contribution = self.refiners[scale_index](scale_contribution)
         return einx.id("b d l -> b l d", scale_contribution)
@@ -308,6 +341,8 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         detached_x = x.detach()
         residual = detached_x.clone()
         reconstruction = torch.zeros_like(residual)
+        latent_length = x.shape[1]
+        scale_lengths = self.scale_lengths_for_latent_length(latent_length)
 
         partial_scale_index = None
         if include_partial_reconstruction:
@@ -325,7 +360,11 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         partial_quantized_latent: Tensor | None = None
 
         for scale_index, codebook in enumerate(self.codebooks):
-            scaled_residual = self._resize_to_scale(residual, scale_index)
+            scaled_residual = self._resize_to_scale(
+                residual,
+                scale_index,
+                scale_lengths,
+            )
             quantized_at_scale, scale_indices = codebook(scaled_residual)
             indices_by_scale.append(scale_indices)
 
@@ -340,6 +379,8 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             scale_contribution = self._prepare_scale_contribution(
                 quantized_at_scale,
                 scale_index,
+                scale_lengths,
+                latent_length,
             )
 
             reconstruction = reconstruction + scale_contribution
@@ -375,7 +416,17 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
     ) -> list[Float[Tensor, "batch length embed_dim"]]:
         """Reconstruct the latent after successively adding each scale."""
         batch_size = indices_by_scale[0].shape[0]
-        full_length = self.latent_length
+        observed_scale_lengths = [indices.shape[1] for indices in indices_by_scale]
+        first_scale_length = observed_scale_lengths[0]
+        full_length_numerator = first_scale_length * self.latent_length
+        if full_length_numerator % self.scale_lengths[0] != 0:
+            raise ValueError("The first index length does not define a valid hierarchy.")
+        full_length = full_length_numerator // self.scale_lengths[0]
+        scale_lengths = self.scale_lengths_for_latent_length(full_length)
+        if observed_scale_lengths != scale_lengths[: len(indices_by_scale)]:
+            raise ValueError(
+                "Index lengths do not match the configured relative scale hierarchy."
+            )
         reconstruction = self.codebooks[0].codebook.new_zeros(
             batch_size,
             full_length,
@@ -390,6 +441,8 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             scale_contribution = self._prepare_scale_contribution(
                 quantized_at_scale,
                 scale_index,
+                scale_lengths,
+                full_length,
             )
             reconstruction = reconstruction + scale_contribution
             cumulative_latents.append(reconstruction)
@@ -407,7 +460,17 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         preceding scale, resized to the length of the scale to be predicted.
         """
         batch_size = indices_by_scale[0].shape[0]
-        full_length = self.latent_length
+        observed_scale_lengths = [indices.shape[1] for indices in indices_by_scale]
+        first_scale_length = observed_scale_lengths[0]
+        full_length_numerator = first_scale_length * self.latent_length
+        if full_length_numerator % self.scale_lengths[0] != 0:
+            raise ValueError("The first index length does not define a valid hierarchy.")
+        full_length = full_length_numerator // self.scale_lengths[0]
+        scale_lengths = self.scale_lengths_for_latent_length(full_length)
+        if observed_scale_lengths != scale_lengths:
+            raise ValueError(
+                "Index lengths do not match the configured relative scale hierarchy."
+            )
         reconstruction = self.codebooks[0].codebook.new_zeros(
             batch_size,
             full_length,
@@ -421,12 +484,15 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             scale_contribution = self._prepare_scale_contribution(
                 quantized_at_scale,
                 scale_index,
+                scale_lengths,
+                full_length,
             )
             reconstruction = reconstruction + scale_contribution
 
             next_scale_input = self._resize_to_scale(
                 reconstruction,
                 scale_index=scale_index + 1,
+                scale_lengths=scale_lengths,
             )
             next_scale_inputs.append(next_scale_input)
 
@@ -441,9 +507,14 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         cumulative_latent = self.indices_to_cumulative_latents(
             preceding_indices_by_scale
         )[-1]
+        next_scale_index = len(preceding_indices_by_scale)
+        scale_lengths = self.scale_lengths_for_latent_length(
+            cumulative_latent.shape[1]
+        )
         return self._resize_to_scale(
             cumulative_latent,
-            scale_index=len(preceding_indices_by_scale),
+            scale_index=next_scale_index,
+            scale_lengths=scale_lengths,
         )
 
     @property

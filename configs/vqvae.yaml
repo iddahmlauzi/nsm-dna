@@ -1,4 +1,4 @@
-# Information-bottleneck VQ-VAE for 512-base NSM target blocks.
+# Multi-resolution information-bottleneck VQ-VAE.
 
 run:
   seed: 0
@@ -8,20 +8,25 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: vqvae
-  name: vqvae-512-latent128-vqdim32-k256-nocontext-decoder4-finalvq
+  name: vqvae-multires-128to1024-4x-vqdim32-k256-nocontext-decoder4-finalvq
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
   train_split: train
   validation_split: validation
-  train_batch_size: 16
-  validation_batch_size: 256
-  num_workers: 3
+  # Every training batch contains 8,192 bases per GPU. A step selects one
+  # sequence length, and all ranks use that same length for balanced DDP work.
+  sequence_lengths: [128, 256, 512, 1024]
+  train_batch_sizes: [64, 32, 16, 8]
+  validation_batch_sizes: [128, 64, 32, 16]
+  # One worker per resolution gives each rank four concurrent data workers.
+  num_workers: 1
   shuffle_buffer_size: 10_000
 
 model:
   vocab_size: 4
   context_length: 512
+  max_context_length: 1024
   # The learned encoder reduces 512 bases to this continuous latent length
   # before any multiscale quantization. The decoder learns the inverse expansion.
   latent_length: 128
@@ -31,8 +36,9 @@ model:
   quantization_dim: 32
   num_heads: 6
   rope_base: 10_000
-  # 252 total code positions with 256 choices each give a nominal capacity of
-  # 252 * log2(256) = 2,016 bits for each 1,024-bit input block.
+  # This is the reference schedule at 512 bases. At runtime, the six position
+  # counts scale in proportion to the input length while these six codebooks
+  # and their 256-entry vocabularies remain shared.
   scale_lengths: [4, 8, 16, 32, 64, 128]
   codebook_sizes: [256, 256, 256, 256, 256, 256]
 

@@ -38,6 +38,7 @@ class VQVAE(nn.Module):
         scale_lengths: list[int],
         codebook_sizes: list[int],
         *,
+        max_context_length: int | None = None,
         # Encoder and decoder
         encoder_dropout: float = 0.0,
         decoder_dropout: float = 0.1,
@@ -67,6 +68,7 @@ class VQVAE(nn.Module):
 
         self.vocab_size = vocab_size
         self.context_length = context_length
+        self.max_context_length = max_context_length or context_length
         self.latent_length = latent_length
         self.embed_dim = embed_dim
         self.quantization_dim = quantization_dim
@@ -125,6 +127,7 @@ class VQVAE(nn.Module):
             self.embed_dim,
             self.quantization_dim,
             self.num_heads,
+            max_context_length=self.max_context_length,
             num_layers=self.decoder_num_layers,
             dropout=decoder_dropout,
             bias=bias,
@@ -157,6 +160,11 @@ class VQVAE(nn.Module):
             decoder_num_layers=getattr(config, "decoder_num_layers", 1),
             scale_lengths=list(config.scale_lengths),
             codebook_sizes=list(config.codebook_sizes),
+            max_context_length=getattr(
+                config,
+                "max_context_length",
+                config.context_length,
+            ),
             encoder_dropout=config.encoder_dropout,
             decoder_dropout=config.decoder_dropout,
             bias=config.bias,
@@ -186,7 +194,27 @@ class VQVAE(nn.Module):
         VQ-VAE training quantizes this latent before reconstruction. NSM-DNA
         uses the same latent directly when a completed block is prefix context.
         """
+        input_length = token_ids.shape[1]
+        if input_length > self.max_context_length:
+            raise ValueError(
+                f"Input length {input_length} exceeds the configured maximum "
+                f"of {self.max_context_length}."
+            )
+        if input_length * self.latent_length % self.context_length != 0:
+            raise ValueError(
+                f"Input length {input_length} is incompatible with the configured "
+                "input-to-latent reduction ratio."
+            )
+
+        expected_latent_length = (
+            input_length * self.latent_length // self.context_length
+        )
         latent = self.encoder(token_ids)
+        if latent.shape[1] != expected_latent_length:
+            raise RuntimeError(
+                f"Encoder produced length {latent.shape[1]}, expected "
+                f"{expected_latent_length}."
+            )
 
         if self.pre_quant_norm is not None:
             latent = einx.id("b l d -> b d l", latent)
@@ -194,6 +222,16 @@ class VQVAE(nn.Module):
             latent = einx.id("b d l -> b l d", latent)
 
         return latent
+
+    def scale_lengths_for_input_length(self, input_length: int) -> list[int]:
+        """Return the runtime scale lengths for an input sequence length."""
+        if input_length * self.latent_length % self.context_length != 0:
+            raise ValueError(
+                f"Input length {input_length} is incompatible with the configured "
+                "input-to-latent reduction ratio."
+            )
+        latent_length = input_length * self.latent_length // self.context_length
+        return self.quantizer.scale_lengths_for_latent_length(latent_length)
 
     def forward(
         self,

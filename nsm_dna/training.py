@@ -34,6 +34,7 @@ def calculate_training_steps(
     config: DictConfig,
     world_size: int,
     sequence_length: int,
+    batch_size: int | None = None,
 ) -> int:
     """Use max_steps when set; otherwise derive the run length from num_epochs."""
     if config.training.max_steps is not None:
@@ -47,9 +48,10 @@ def calculate_training_steps(
         split_stats["chunks"] * subset_stats["selection"]["chunk_length"]
     )
 
+    batch_size = batch_size or int(config.data.train_batch_size)
     bases_per_step = (
         sequence_length
-        * config.data.train_batch_size
+        * batch_size
         * world_size
         * config.optimizer.gradient_accumulation_steps
     )

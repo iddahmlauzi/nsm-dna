@@ -99,6 +99,7 @@ def test_first_scale_sampler_uses_a_cascade() -> None:
     normalized = quantizer._resize_to_scale(
         channels_first.transpose(1, 2),
         scale_index=0,
+        scale_lengths=quantizer.scale_lengths,
     )
     upsampled = quantizer.first_scale_upsampler(normalized.transpose(1, 2))
 
@@ -180,6 +181,77 @@ def test_quantization_operates_at_shorter_learned_latent_length() -> None:
     ]
     assert all(scale_logits.shape == (2, 8, 4) for scale_logits in cumulative_logits)
     torch.testing.assert_close(cumulative_logits[-1], logits)
+
+
+def test_one_tokenizer_uses_relative_scales_at_multiple_sequence_lengths() -> None:
+    model = VQVAE(
+        vocab_size=4,
+        context_length=8,
+        max_context_length=16,
+        latent_length=4,
+        embed_dim=8,
+        quantization_dim=4,
+        num_heads=2,
+        scale_lengths=[2, 4],
+        codebook_sizes=[8, 8],
+        encoder_dropout=0.0,
+        decoder_dropout=0.0,
+        pre_quant_num_groups=2,
+    ).eval()
+
+    expected_scales_by_input_length = {
+        4: [1, 2],
+        8: [2, 4],
+        16: [4, 8],
+    }
+    for input_length, expected_scale_lengths in (
+        expected_scales_by_input_length.items()
+    ):
+        token_ids = torch.arange(input_length).remainder(4).unsqueeze(0)
+
+        logits, _, _, indices_by_scale = model(token_ids)
+        decoded_logits = model.decode(indices_by_scale)
+
+        assert model.scale_lengths_for_input_length(input_length) == (
+            expected_scale_lengths
+        )
+        assert [indices.shape[1] for indices in indices_by_scale] == (
+            expected_scale_lengths
+        )
+        assert logits.shape == (1, input_length, 4)
+        torch.testing.assert_close(decoded_logits, logits)
+
+
+def test_multi_resolution_partial_reconstruction_backpropagates() -> None:
+    model = VQVAE(
+        vocab_size=4,
+        context_length=8,
+        max_context_length=16,
+        latent_length=4,
+        embed_dim=8,
+        quantization_dim=4,
+        num_heads=2,
+        scale_lengths=[2, 4],
+        codebook_sizes=[8, 8],
+        encoder_dropout=0.0,
+        decoder_dropout=0.0,
+        pre_quant_num_groups=2,
+    )
+
+    for input_length in (4, 8, 16):
+        model.zero_grad(set_to_none=True)
+        token_ids = torch.arange(input_length).remainder(4).unsqueeze(0)
+
+        logits, partial_logits, vq_loss, _ = model(
+            token_ids,
+            include_partial_reconstruction=True,
+        )
+        assert partial_logits is not None
+        loss = logits.mean() + partial_logits.mean() + vq_loss
+        loss.backward()
+
+        assert model.encoder.quantization_projection.weight.grad is not None
+        assert model.decoder.out_proj.weight.grad is not None
 
 
 def test_encode_returns_continuous_prefix_latents() -> None:

@@ -29,6 +29,7 @@ def evaluate(
     model: VQVAE,
     data_loader: DataLoader,
     use_mixed_precision: bool,
+    sequence_length: int | None = None,
     max_batches: int | None = None,
 ) -> dict[str, float]:
     """Evaluate full and cumulative reconstruction without updating codebooks.
@@ -46,14 +47,16 @@ def evaluate(
     num_batches = 0
 
     # Decoder quality after adding each successive scale.
-    reconstruction_loss_sums_by_scale = [0.0] * len(model.scale_lengths)
-    correct_tokens_by_scale = [0] * len(model.scale_lengths)
+    sequence_length = sequence_length or model.context_length
+    scale_lengths = model.scale_lengths_for_input_length(sequence_length)
+    reconstruction_loss_sums_by_scale = [0.0] * len(scale_lengths)
+    correct_tokens_by_scale = [0] * len(scale_lengths)
 
     # Distance between each cumulative quantized latent and the encoder latent.
-    latent_mse_sums_by_scale = [0.0] * len(model.scale_lengths)
+    latent_mse_sums_by_scale = [0.0] * len(scale_lengths)
 
     # Squared values used to measure the magnitude added by each scale.
-    contribution_squared_sums_by_scale = [0.0] * len(model.scale_lengths)
+    contribution_squared_sums_by_scale = [0.0] * len(scale_lengths)
 
     # Assignment frequencies used to calculate effective codebook size.
     code_counts_by_scale = [
@@ -138,7 +141,7 @@ def evaluate(
     }
 
     scale_metrics = zip(
-        model.scale_lengths,
+        scale_lengths,
         reconstruction_loss_sums_by_scale,
         correct_tokens_by_scale,
     )
@@ -184,10 +187,29 @@ def main(config: DictConfig) -> None:
     distributed_environment = initialize_distributed_training()
     torch.manual_seed(config.run.seed + distributed_environment.rank)
     run_directory = Path(HydraConfig.get().runtime.output_dir)
+    sequence_lengths = [int(length) for length in config.data.sequence_lengths]
+    train_batch_sizes = [
+        int(batch_size) for batch_size in config.data.train_batch_sizes
+    ]
+    validation_batch_sizes = [
+        int(batch_size) for batch_size in config.data.validation_batch_sizes
+    ]
+    if not (
+        len(sequence_lengths)
+        == len(train_batch_sizes)
+        == len(validation_batch_sizes)
+    ):
+        raise ValueError(
+            "Each sequence length must have one training and validation batch size."
+        )
+    if int(config.model.context_length) not in sequence_lengths:
+        raise ValueError("The reference context length must be a training length.")
+    reference_index = sequence_lengths.index(int(config.model.context_length))
     total_steps = calculate_training_steps(
         config,
         distributed_environment.world_size,
         int(config.model.context_length),
+        batch_size=train_batch_sizes[reference_index],
     )
     if distributed_environment.is_main_process:
         print(f"training for {total_steps:,} optimizer steps")
@@ -204,44 +226,52 @@ def main(config: DictConfig) -> None:
         )
 
     # Create the dataset and data loader.
-    train_dataset = load_gtdb_dataset(
-        subset_directory=Path(config.data.subset_directory),
-        split=config.data.train_split,
-        context_length=config.model.context_length,
-        shuffle_buffer_size=config.data.shuffle_buffer_size,
-        seed=config.run.seed,
-        rank=distributed_environment.rank,
-        world_size=distributed_environment.world_size,
-    )
-
-    # Keep DataLoader iterator seeding separate from the model's random state.
-    # Otherwise, starting validation changes later dropout and fine-dropout choices.
-    train_generator = torch.Generator().manual_seed(
-        config.run.seed + distributed_environment.rank
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.data.train_batch_size,
-        collate_fn=collate_dna_sequences,
-        num_workers=config.data.num_workers,
-        generator=train_generator,
-    )
-
-    validation_loader = None
-    if distributed_environment.is_main_process:
-        validation_dataset = load_gtdb_dataset(
+    train_datasets = {}
+    train_loaders = {}
+    for sequence_length, batch_size in zip(sequence_lengths, train_batch_sizes):
+        train_dataset = load_gtdb_dataset(
             subset_directory=Path(config.data.subset_directory),
-            split=config.data.validation_split,
-            context_length=config.model.context_length,
+            split=config.data.train_split,
+            context_length=sequence_length,
+            shuffle_buffer_size=config.data.shuffle_buffer_size,
+            seed=config.run.seed + sequence_length,
+            rank=distributed_environment.rank,
+            world_size=distributed_environment.world_size,
         )
-        validation_generator = torch.Generator().manual_seed(config.run.seed)
-        validation_loader = DataLoader(
-            validation_dataset,
-            batch_size=config.data.validation_batch_size,
+        train_generator = torch.Generator().manual_seed(
+            config.run.seed + distributed_environment.rank + sequence_length
+        )
+        train_datasets[sequence_length] = train_dataset
+        train_loaders[sequence_length] = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
             collate_fn=collate_dna_sequences,
             num_workers=config.data.num_workers,
-            generator=validation_generator,
+            generator=train_generator,
         )
+
+    validation_loaders = None
+    if distributed_environment.is_main_process:
+        validation_loaders = {}
+        for sequence_length, batch_size in zip(
+            sequence_lengths,
+            validation_batch_sizes,
+        ):
+            validation_dataset = load_gtdb_dataset(
+                subset_directory=Path(config.data.subset_directory),
+                split=config.data.validation_split,
+                context_length=sequence_length,
+            )
+            validation_generator = torch.Generator().manual_seed(
+                config.run.seed + sequence_length
+            )
+            validation_loaders[sequence_length] = DataLoader(
+                validation_dataset,
+                batch_size=batch_size,
+                collate_fn=collate_dna_sequences,
+                num_workers=config.data.num_workers,
+                generator=validation_generator,
+            )
 
     # Create the model.
     model = VQVAE(
@@ -253,6 +283,7 @@ def main(config: DictConfig) -> None:
         num_heads=config.model.num_heads,
         scale_lengths=list(config.model.scale_lengths),
         codebook_sizes=list(config.model.codebook_sizes),
+        max_context_length=config.model.max_context_length,
         encoder_dropout=config.model.encoder_dropout,
         decoder_dropout=config.model.decoder_dropout,
         decoder_num_layers=config.model.decoder_num_layers,
@@ -343,8 +374,11 @@ def main(config: DictConfig) -> None:
             training_model = DistributedDataParallel(model)
 
     # Train the model.
-    training_epoch = 0
-    train_iterator = iter(train_loader)
+    training_epochs = {sequence_length: 0 for sequence_length in sequence_lengths}
+    train_iterators = {
+        sequence_length: iter(train_loaders[sequence_length])
+        for sequence_length in sequence_lengths
+    }
     progress_bar = tqdm(
         range(start_step + 1, total_steps + 1),
         desc="Training",
@@ -356,21 +390,38 @@ def main(config: DictConfig) -> None:
     partial_latent_gradient_scale = (
         partial_quantizer_weight / partial_decoder_weight
     )
+    length_generator = torch.Generator().manual_seed(config.run.seed)
+    if start_step > 0:
+        torch.randint(
+            len(sequence_lengths),
+            (start_step,),
+            generator=length_generator,
+        )
 
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
         reconstruction_loss_sum = 0.0
         partial_reconstruction_loss_sum = 0.0
         vq_loss_sum = 0.0
+        length_index = torch.randint(
+            len(sequence_lengths),
+            (),
+            generator=length_generator,
+        ).item()
+        sequence_length = sequence_lengths[length_index]
 
         for micro_step in range(gradient_accumulation_steps):
             try:
-                batch = next(train_iterator)
+                batch = next(train_iterators[sequence_length])
             except StopIteration:
-                training_epoch += 1
-                train_dataset.set_epoch(training_epoch)
-                train_iterator = iter(train_loader)
-                batch = next(train_iterator)
+                training_epochs[sequence_length] += 1
+                train_datasets[sequence_length].set_epoch(
+                    training_epochs[sequence_length]
+                )
+                train_iterators[sequence_length] = iter(
+                    train_loaders[sequence_length]
+                )
+                batch = next(train_iterators[sequence_length])
 
             input_ids = batch["input_ids"].to(device)
 
@@ -476,6 +527,7 @@ def main(config: DictConfig) -> None:
                             "train/gradient_norm": gradient_norm.item(),
                             "train/learning_rate": learning_rate,
                             "train/encoder_learning_rate": encoder_learning_rate,
+                            "train/sequence_length": sequence_length,
                             "codebook/global_utilization": global_utilization,
                         },
                         step=step,
@@ -483,24 +535,35 @@ def main(config: DictConfig) -> None:
 
         if step % config.evaluation.interval == 0:
             if distributed_environment.is_main_process:
-                assert validation_loader is not None
-                validation_metrics = evaluate(
-                    model,
-                    validation_loader,
-                    use_mixed_precision,
-                    max_batches=config.evaluation.max_batches,
-                )
-                tqdm.write(
-                    f"step {step} validation: "
-                    f"reconstruction loss "
-                    f"{validation_metrics['reconstruction_loss']:.4f}, "
-                    f"VQ loss {validation_metrics['vq_loss']:.4f}, "
-                    f"total loss {validation_metrics['total_loss']:.4f}, "
-                    f"accuracy {validation_metrics['accuracy']:.2%}"
-                )
+                assert validation_loaders is not None
+                validation_metrics_by_length = {
+                    sequence_length: evaluate(
+                        model,
+                        validation_loaders[sequence_length],
+                        use_mixed_precision,
+                        sequence_length=sequence_length,
+                        max_batches=config.evaluation.max_batches,
+                    )
+                    for sequence_length in sequence_lengths
+                }
+                for sequence_length, validation_metrics in (
+                    validation_metrics_by_length.items()
+                ):
+                    tqdm.write(
+                        f"step {step} validation length {sequence_length}: "
+                        f"reconstruction loss "
+                        f"{validation_metrics['reconstruction_loss']:.4f}, "
+                        f"VQ loss {validation_metrics['vq_loss']:.4f}, "
+                        f"total loss {validation_metrics['total_loss']:.4f}, "
+                        f"accuracy {validation_metrics['accuracy']:.2%}"
+                    )
 
-                if validation_metrics["reconstruction_loss"] < best_validation_loss:
-                    best_validation_loss = validation_metrics["reconstruction_loss"]
+                mean_validation_reconstruction_loss = sum(
+                    metrics["reconstruction_loss"]
+                    for metrics in validation_metrics_by_length.values()
+                ) / len(validation_metrics_by_length)
+                if mean_validation_reconstruction_loss < best_validation_loss:
+                    best_validation_loss = mean_validation_reconstruction_loss
                     best_checkpoint_path = save_training_checkpoint(
                         run_directory,
                         model,
@@ -513,43 +576,44 @@ def main(config: DictConfig) -> None:
                     )
                     tqdm.write(f"saved best checkpoint: {best_checkpoint_path}")
 
-                scale_utilizations = {
-                    scale_length: utilization.item()
-                    for scale_length, utilization in zip(
-                        config.model.scale_lengths,
-                        model.utilization_by_scale,
-                    )
-                }
+                scale_utilizations = [
+                    utilization.item() for utilization in model.utilization_by_scale
+                ]
                 utilization_by_scale = ", ".join(
-                    f"{scale_length}: {utilization:.2%}"
-                    for scale_length, utilization in scale_utilizations.items()
+                    f"codebook {scale_index}: {utilization:.2%}"
+                    for scale_index, utilization in enumerate(
+                        scale_utilizations,
+                        start=1,
+                    )
                 )
                 tqdm.write(
                     f"step {step} codebook utilization by scale: {utilization_by_scale}"
                 )
 
-                cumulative_accuracies = ", ".join(
-                    f"{scale_length}: "
-                    f"{validation_metrics[f'cumulative_accuracy_scale_{scale_length}']:.2%}"
-                    for scale_length in config.model.scale_lengths
-                )
-                tqdm.write(
-                    f"step {step} cumulative validation accuracy by scale: "
-                    f"{cumulative_accuracies}"
-                )
+                for sequence_length, validation_metrics in (
+                    validation_metrics_by_length.items()
+                ):
+                    runtime_scale_lengths = model.scale_lengths_for_input_length(
+                        sequence_length
+                    )
+                    cumulative_accuracies = ", ".join(
+                        f"{scale_length}: "
+                        f"{validation_metrics[f'cumulative_accuracy_scale_{scale_length}']:.2%}"
+                        for scale_length in runtime_scale_lengths
+                    )
+                    tqdm.write(
+                        f"step {step} length {sequence_length} cumulative "
+                        f"validation accuracy by scale: {cumulative_accuracies}"
+                    )
 
                 if wandb_run is not None:
                     wandb_metrics = {
-                        "validation/reconstruction_loss": validation_metrics[
-                            "reconstruction_loss"
-                        ],
-                        "validation/vq_loss": validation_metrics["vq_loss"],
-                        "validation/total_loss": validation_metrics["total_loss"],
-                        "validation/accuracy": validation_metrics["accuracy"],
-                        "validation/encoder_latent_rms": validation_metrics[
-                            "encoder_latent_rms"
-                        ],
-                        "validation/best_reconstruction_loss": best_validation_loss,
+                        "validation/mean_reconstruction_loss": (
+                            mean_validation_reconstruction_loss
+                        ),
+                        "validation/best_mean_reconstruction_loss": (
+                            best_validation_loss
+                        ),
                     }
                     scale_metric_names = {
                         "reconstruction_loss": "cumulative_reconstruction_loss",
@@ -560,21 +624,46 @@ def main(config: DictConfig) -> None:
                         "codebook_rms": "codebook_rms",
                     }
 
-                    for scale_number, scale_length in enumerate(
-                        config.model.scale_lengths,
-                        start=1,
+                    for sequence_length, validation_metrics in (
+                        validation_metrics_by_length.items()
                     ):
-                        section = f"scale_{scale_number:02d}_length_{scale_length}"
-                        for panel_name, metric_name in scale_metric_names.items():
-                            wandb_metrics[f"{section}/{panel_name}"] = (
-                                validation_metrics[
-                                    f"{metric_name}_scale_{scale_length}"
-                                ]
+                        length_section = f"validation_length_{sequence_length}"
+                        for metric_name in (
+                            "reconstruction_loss",
+                            "vq_loss",
+                            "total_loss",
+                            "accuracy",
+                            "encoder_latent_rms",
+                        ):
+                            wandb_metrics[f"{length_section}/{metric_name}"] = (
+                                validation_metrics[metric_name]
                             )
 
-                        wandb_metrics[f"{section}/utilization"] = scale_utilizations[
-                            scale_length
-                        ]
+                        runtime_scale_lengths = model.scale_lengths_for_input_length(
+                            sequence_length
+                        )
+                        for scale_number, scale_length in enumerate(
+                            runtime_scale_lengths,
+                            start=1,
+                        ):
+                            scale_section = (
+                                f"{length_section}/scale_{scale_number:02d}_"
+                                f"length_{scale_length}"
+                            )
+                            for panel_name, metric_name in scale_metric_names.items():
+                                wandb_metrics[f"{scale_section}/{panel_name}"] = (
+                                    validation_metrics[
+                                        f"{metric_name}_scale_{scale_length}"
+                                    ]
+                                )
+
+                    for scale_number, utilization in enumerate(
+                        scale_utilizations,
+                        start=1,
+                    ):
+                        wandb_metrics[
+                            f"codebook_{scale_number:02d}/utilization"
+                        ] = utilization
 
                     wandb_run.log(wandb_metrics, step=step)
 
