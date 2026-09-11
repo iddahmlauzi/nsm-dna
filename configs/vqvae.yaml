@@ -1,4 +1,4 @@
-# VQ-VAE configuration for 512-base NSM target blocks.
+# Information-bottleneck VQ-VAE for 512-base NSM target blocks.
 
 run:
   seed: 0
@@ -8,7 +8,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: vqvae
-  name: vqvae-512-8scale-500m-batch16
+  name: vqvae-512-latent128-vqdim32-k256-nocontext-decoder4-finalvq
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -22,14 +22,23 @@ data:
 model:
   vocab_size: 4
   context_length: 512
+  # The learned encoder reduces 512 bases to this continuous latent length
+  # before any multiscale quantization. The decoder learns the inverse expansion.
+  latent_length: 128
   embed_dim: 384
+  # Codebook matching occurs in this smaller space. The encoder projects 384 to
+  # 32 before quantization, and the decoder projects 32 back to 384 afterward.
+  quantization_dim: 32
   num_heads: 6
   rope_base: 10_000
-  scale_lengths: [4, 16, 36, 64, 100, 144, 196, 512]
-  codebook_sizes: [256, 256, 256, 256, 256, 256, 256, 256]
+  # 252 total code positions with 256 choices each give a nominal capacity of
+  # 252 * log2(256) = 2,016 bits for each 1,024-bit input block.
+  scale_lengths: [4, 8, 16, 32, 64, 128]
+  codebook_sizes: [256, 256, 256, 256, 256, 256]
 
   encoder_dropout: 0.0
   decoder_dropout: 0.1
+  decoder_num_layers: 4
   bias: false
   pre_quant_num_groups: 4
 
@@ -49,7 +58,7 @@ model:
 
 optimizer:
   learning_rate: 1e-4
-  encoder_learning_rate: 1e-5
+  encoder_learning_rate: 1e-4
   min_learning_rate: 3e-5
   warmup_steps: 300
   beta_1: 0.9

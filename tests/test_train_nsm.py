@@ -21,7 +21,9 @@ def _build_tokenizer() -> VQVAE:
     return VQVAE(
         vocab_size=4,
         context_length=4,
+        latent_length=4,
         embed_dim=8,
+        quantization_dim=4,
         num_heads=2,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
@@ -33,7 +35,7 @@ def _build_tokenizer() -> VQVAE:
 
 def _build_nsm(max_prefix_length: int = 0) -> NSM:
     return NSM(
-        vq_embed_dim=8,
+        vq_embed_dim=4,
         model_dim=8,
         scale_lengths=[1, 2, 4],
         codebook_size=8,
@@ -176,7 +178,9 @@ def test_tokenizer_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
                 "model": {
                     "vocab_size": 4,
                     "context_length": 4,
+                    "latent_length": 4,
                     "embed_dim": 8,
+                    "quantization_dim": 4,
                     "num_heads": 2,
                     "scale_lengths": [1, 2, 4],
                     "codebook_sizes": [8, 8, 8],

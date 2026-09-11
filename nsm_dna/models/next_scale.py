@@ -277,7 +277,7 @@ class NSM(nn.Module):
     def from_config(cls, config: DictConfig, tokenizer: "VQVAE") -> "NSM":
         """Build NSM-DNA from an experiment configuration and its tokenizer."""
         return cls(
-            vq_embed_dim=tokenizer.embed_dim,
+            vq_embed_dim=tokenizer.quantization_dim,
             model_dim=config.model.model_dim,
             scale_lengths=tokenizer.scale_lengths,
             codebook_size=tokenizer.codebook_sizes[0],

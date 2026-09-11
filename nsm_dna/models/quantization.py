@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from jaxtyping import Float, Int
 from torch import Tensor
 
+from .sampling import make_cascaded_downsampler, make_cascaded_upsampler
+
 
 class EMACodebook(nn.Module):
     """Vector-quantization codebook updated with exponential moving averages."""
@@ -104,124 +106,6 @@ class EMACodebook(nn.Module):
         return self.codebook_hits.float().mean()
 
 
-def _make_learned_downsampler(
-    embed_dim: int,
-    stride: int,
-) -> nn.Conv1d:
-    """Create a learned downsampler initialized as average pooling."""
-    downsampler = nn.Conv1d(
-        embed_dim,
-        embed_dim,
-        kernel_size=stride,
-        stride=stride,
-    )
-    average_weight = 1.0 / stride
-
-    with torch.no_grad():
-        downsampler.weight.zero_()
-        channel_indices = torch.arange(embed_dim, device=downsampler.weight.device)
-        downsampler.weight[channel_indices, channel_indices, :] = average_weight
-        downsampler.bias.zero_()
-
-    return downsampler
-
-
-def _make_learned_upsampler(
-    embed_dim: int,
-    stride: int,
-) -> nn.ConvTranspose1d:
-    """Create a learned upsampler initialized as nearest-neighbor repetition.
-
-    Because the kernel size equals the stride, each coarse position is expanded
-    independently. BlendedConv1d later mixes information between adjacent positions.
-    """
-    upsampler = nn.ConvTranspose1d(
-        embed_dim,
-        embed_dim,
-        kernel_size=stride,
-        stride=stride,
-    )
-
-    with torch.no_grad():
-        upsampler.weight.zero_()
-        channel_indices = torch.arange(embed_dim, device=upsampler.weight.device)
-        upsampler.weight[channel_indices, channel_indices, :] = 1.0
-        upsampler.bias.zero_()
-
-    return upsampler
-
-
-class ChannelsFirstLayerNorm(nn.Module):
-    """Apply non-affine LayerNorm to channels-first sequence features."""
-
-    def __init__(self, embed_dim: int) -> None:
-        super().__init__()
-        self.normalization = nn.LayerNorm(embed_dim, elementwise_affine=False)
-
-    def forward(
-        self,
-        x: Float[Tensor, "batch embed_dim length"],
-    ) -> Float[Tensor, "batch embed_dim length"]:
-        x = einx.id("b d l -> b l d", x)
-        x = self.normalization(x)
-        return einx.id("b l d -> b d l", x)
-
-
-def _plan_cascade_strides(
-    total_stride: int,
-    base_stride: int = 4,
-) -> list[int]:
-    """Factor a large sampling stride into a sequence of smaller strides."""
-    remaining_stride = total_stride
-    cascade_strides = []
-
-    while remaining_stride > 1:
-        stage_stride = min(base_stride, remaining_stride)
-
-        # Choose a factor of the remaining stride so the cascade reduces the
-        # sequence to exactly the requested length without a partial final stage.
-        while stage_stride > 1 and remaining_stride % stage_stride != 0:
-            stage_stride -= 1
-
-        if stage_stride == 1:
-            stage_stride = remaining_stride
-
-        cascade_strides.append(stage_stride)
-        remaining_stride //= stage_stride
-
-    return cascade_strides or [1]
-
-
-def _make_cascaded_downsampler(
-    embed_dim: int,
-    total_stride: int,
-) -> nn.Sequential:
-    """Create a large downsampler from normalized small-stride stages."""
-    strides = _plan_cascade_strides(total_stride)
-    modules: list[nn.Module] = []
-
-    for stride in strides:
-        modules.append(_make_learned_downsampler(embed_dim, stride))
-        # Interstage norms prevent numerical gain from compounding. The final norm
-        # fixes the scale presented to the first codebook.
-        modules.append(ChannelsFirstLayerNorm(embed_dim))
-
-    return nn.Sequential(*modules)
-
-
-def _make_cascaded_upsampler(
-    embed_dim: int,
-    total_stride: int,
-) -> nn.Sequential:
-    """Reverse a cascaded downsampler with learned transposed convolutions."""
-    return nn.Sequential(
-        *(
-            _make_learned_upsampler(embed_dim, stride)
-            for stride in reversed(_plan_cascade_strides(total_stride))
-        )
-    )
-
-
 # ----------------------------------------------------------------------
 # Per-scale blended convolution
 #
@@ -279,6 +163,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         codebook_sizes: list[int],
         embed_dim: int,
         *,
+        latent_length: int,
         # Codebook updates and quantization loss
         commitment_cost: float = 0.25,
         decay: float = 0.99,
@@ -295,25 +180,27 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         self.scale_lengths = scale_lengths
         self.codebook_sizes = codebook_sizes
         self.embed_dim = embed_dim
+        self.latent_length = latent_length
         self.commitment_cost = commitment_cost
         self.refinement_ratio = refinement_ratio
         self.refinement_kernel_size = refinement_kernel_size
 
-        full_scale_length = scale_lengths[-1]
         first_scale_length = scale_lengths[0]
-        if full_scale_length % first_scale_length != 0:
+        if self.scale_lengths[-1] != self.latent_length:
+            raise ValueError("The final scale length must equal the latent length.")
+        if self.latent_length % first_scale_length != 0:
             raise ValueError(
-                "The full scale length must be divisible by the first scale length."
+                "The latent length must be divisible by the first scale length."
             )
 
         # Factor the large first-scale stride into small learned stages so its
         # parameter count grows with the number of stages, not the full kernel.
-        first_scale_stride = full_scale_length // first_scale_length
-        self.first_scale_downsampler = _make_cascaded_downsampler(
+        first_scale_stride = self.latent_length // first_scale_length
+        self.first_scale_downsampler = make_cascaded_downsampler(
             embed_dim,
             total_stride=first_scale_stride,
         )
-        self.first_scale_upsampler = _make_cascaded_upsampler(
+        self.first_scale_upsampler = make_cascaded_upsampler(
             embed_dim,
             total_stride=first_scale_stride,
         )
@@ -338,11 +225,11 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
     ) -> Float[Tensor, "batch scale_length embed_dim"]:
         """Resize a full-length latent tensor to the selected scale.
 
-        The first scale uses cascaded learned strided convolutions. Intermediate
-        scales use area interpolation, and the final scale is already full length.
+        The first scale uses cascaded learned strided convolutions. Other scales
+        use area interpolation unless a scale matches the full latent length.
         """
         scale_length = self.scale_lengths[scale_index]
-        if scale_index == len(self.scale_lengths) - 1:
+        if scale_length == self.latent_length:
             return latent
 
         # Conv1d and one-dimensional interpolation expect channels first.
@@ -365,11 +252,11 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
     ) -> Float[Tensor, "batch embed_dim length"]:
         """Upsample a quantized contribution to the full latent length.
 
-        The first scale uses a learned transposed convolution. Intermediate scales
-        use linear interpolation, and the final scale is already full length.
+        The first scale uses a learned transposed convolution. Other scales use
+        linear interpolation unless a scale matches the full latent length.
         The channels-first layout can pass directly into BlendedConv1d afterward.
         """
-        if scale_index == len(self.scale_lengths) - 1:
+        if self.scale_lengths[scale_index] == self.latent_length:
             return quantized
 
         if scale_index == 0:
@@ -377,7 +264,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
 
         return F.interpolate(
             quantized,
-            size=self.scale_lengths[-1],
+            size=self.latent_length,
             mode="linear",
             align_corners=False,
         )
@@ -434,7 +321,6 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
                 size=(),
             ).item()
 
-        vq_loss = x.new_zeros(())
         indices_by_scale: list[Int[Tensor, "batch scale_length"]] = []
         partial_quantized_latent: Tensor | None = None
 
@@ -459,24 +345,23 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             reconstruction = reconstruction + scale_contribution
             residual = residual - scale_contribution
 
-            # Pull the encoder toward the current quantized reconstruction.
-            encoder_commitment_loss = self.commitment_cost * F.mse_loss(
-                reconstruction.detach(),
-                x,
-            )
-
-            # Train the learned samplers and refiners against a fixed encoder target.
-            # The codebooks themselves are updated separately through EMA.
-            quantizer_reconstruction_loss = F.mse_loss(
-                reconstruction,
-                detached_x,
-            )
-            vq_loss = vq_loss + encoder_commitment_loss + quantizer_reconstruction_loss
-
             if scale_index == partial_scale_index:
                 partial_quantized_latent = reconstruction
 
-        vq_loss = vq_loss / len(self.scale_lengths)
+        # Only the completed hierarchy must reproduce the continuous encoder latent.
+        # Partial hierarchies are trained separately through nucleotide reconstruction.
+        encoder_commitment_loss = self.commitment_cost * F.mse_loss(
+            reconstruction.detach(),
+            x,
+        )
+
+        # Train the learned samplers and refiners against a fixed encoder target.
+        # The codebooks themselves are updated separately through EMA.
+        quantizer_reconstruction_loss = F.mse_loss(
+            reconstruction,
+            detached_x,
+        )
+        vq_loss = encoder_commitment_loss + quantizer_reconstruction_loss
 
         # Give the decoder quantized values while passing its gradients to the encoder.
         quantized_latent = x + (reconstruction - x).detach()
@@ -490,7 +375,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
     ) -> list[Float[Tensor, "batch length embed_dim"]]:
         """Reconstruct the latent after successively adding each scale."""
         batch_size = indices_by_scale[0].shape[0]
-        full_length = self.scale_lengths[-1]
+        full_length = self.latent_length
         reconstruction = self.codebooks[0].codebook.new_zeros(
             batch_size,
             full_length,
@@ -522,7 +407,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         preceding scale, resized to the length of the scale to be predicted.
         """
         batch_size = indices_by_scale[0].shape[0]
-        full_length = self.scale_lengths[-1]
+        full_length = self.latent_length
         reconstruction = self.codebooks[0].codebook.new_zeros(
             batch_size,
             full_length,

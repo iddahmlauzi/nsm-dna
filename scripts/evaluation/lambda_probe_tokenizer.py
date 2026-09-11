@@ -130,7 +130,7 @@ def main(config: DictConfig) -> None:
     tokenizer = VQVAE.from_checkpoint(checkpoint_path, device, frozen=True)
     results = evaluate_tokenizer_representations(
         build_parallel_encoder(tokenizer, device_ids),
-        tokenizer.embed_dim,
+        tokenizer.quantization_dim,
         tokenizer.context_length,
         splits,
         config,

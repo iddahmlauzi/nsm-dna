@@ -8,18 +8,27 @@ from nsm_dna.models.vqvae import VQVAE
 from scripts.training.train_vqvae import evaluate
 
 
-def test_encoder_uses_token_embeddings_without_absolute_positions() -> None:
-    encoder = Encoder(vocab_size=4, embed_dim=4, dropout=0.0)
-    with torch.no_grad():
-        encoder.token_embedding.weight.copy_(torch.eye(4))
+def test_encoder_uses_two_stride_two_stages_for_fourfold_reduction() -> None:
+    encoder = Encoder(
+        vocab_size=4,
+        context_length=8,
+        latent_length=2,
+        embed_dim=4,
+        quantization_dim=2,
+        dropout=0.0,
+    )
+    token_ids = torch.tensor([[3, 1, 0, 2, 2, 0, 1, 3]])
 
-    first_sequence = torch.tensor([[3, 1, 0, 2]])
-    shifted_sequence = torch.tensor([[3, 3, 1, 0]])
+    latent = encoder(token_ids)
+    convolutions = [
+        module
+        for module in encoder.downsampler
+        if isinstance(module, nn.Conv1d)
+    ]
 
-    first_embeddings = encoder(first_sequence)
-    shifted_embeddings = encoder(shifted_sequence)
-
-    torch.testing.assert_close(first_embeddings[:, :3], shifted_embeddings[:, 1:])
+    assert latent.shape == (1, 2, 2)
+    assert len(convolutions) == 2
+    assert all(convolution.stride == (2,) for convolution in convolutions)
 
 
 def test_decoder_supplies_rope_to_attention() -> None:
@@ -41,19 +50,40 @@ def test_decoder_supplies_rope_to_attention() -> None:
     decoder = Decoder(
         vocab_size=4,
         context_length=4,
+        latent_length=2,
         embed_dim=8,
+        quantization_dim=4,
         num_heads=2,
         dropout=0.0,
     )
     recording_block = RecordingBlock()
     decoder.block = recording_block
 
-    decoder(torch.randn(1, 4, 8))
+    logits = decoder(torch.randn(1, 2, 4))
 
+    assert logits.shape == (1, 4, 4)
     assert recording_block.rotary_embeddings is not None
     cosine, sine = recording_block.rotary_embeddings
     torch.testing.assert_close(cosine, decoder.rope_cosine)
     torch.testing.assert_close(sine, decoder.rope_sine)
+
+
+def test_decoder_uses_configured_number_of_transformer_blocks() -> None:
+    decoder = Decoder(
+        vocab_size=4,
+        context_length=4,
+        latent_length=2,
+        embed_dim=8,
+        quantization_dim=4,
+        num_heads=2,
+        num_layers=4,
+        dropout=0.0,
+    )
+
+    logits = decoder(torch.randn(1, 2, 4))
+
+    assert len(decoder.additional_blocks) == 3
+    assert logits.shape == (1, 4, 4)
 
 
 def test_first_scale_sampler_uses_a_cascade() -> None:
@@ -61,6 +91,7 @@ def test_first_scale_sampler_uses_a_cascade() -> None:
         scale_lengths=[4, 256],
         codebook_sizes=[4, 4],
         embed_dim=2,
+        latent_length=256,
     )
     channels_first = torch.arange(2 * 256, dtype=torch.float32).reshape(1, 2, 256)
 
@@ -95,7 +126,9 @@ def test_cumulative_decode_matches_full_reconstruction() -> None:
     model = VQVAE(
         vocab_size=4,
         context_length=4,
+        latent_length=4,
         embed_dim=8,
+        quantization_dim=4,
         num_heads=2,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
@@ -115,11 +148,47 @@ def test_cumulative_decode_matches_full_reconstruction() -> None:
     torch.testing.assert_close(cumulative_logits[-1], logits)
 
 
+def test_quantization_operates_at_shorter_learned_latent_length() -> None:
+    model = VQVAE(
+        vocab_size=4,
+        context_length=8,
+        latent_length=4,
+        embed_dim=8,
+        quantization_dim=4,
+        num_heads=2,
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[8, 8, 8],
+        encoder_dropout=0.0,
+        decoder_dropout=0.0,
+        pre_quant_num_groups=2,
+    ).eval()
+    token_ids = torch.tensor(
+        [[0, 1, 2, 3, 3, 2, 1, 0], [3, 2, 1, 0, 0, 1, 2, 3]]
+    )
+
+    latent = model.encode(token_ids)
+    logits, _, _, indices_by_scale = model(token_ids)
+    cumulative_logits = model.decode_cumulative(indices_by_scale)
+
+    assert latent.shape == (2, 4, 4)
+    assert model.quantizer.codebooks[0].codebook.shape == (8, 4)
+    assert logits.shape == (2, 8, 4)
+    assert [indices.shape for indices in indices_by_scale] == [
+        (2, 1),
+        (2, 2),
+        (2, 4),
+    ]
+    assert all(scale_logits.shape == (2, 8, 4) for scale_logits in cumulative_logits)
+    torch.testing.assert_close(cumulative_logits[-1], logits)
+
+
 def test_encode_returns_continuous_prefix_latents() -> None:
     model = VQVAE(
         vocab_size=4,
         context_length=4,
+        latent_length=4,
         embed_dim=8,
+        quantization_dim=4,
         num_heads=2,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
@@ -135,7 +204,7 @@ def test_encode_returns_continuous_prefix_latents() -> None:
         encoder_latents.transpose(1, 2)
     ).transpose(1, 2)
 
-    assert prefix_latents.shape == (2, 4, 8)
+    assert prefix_latents.shape == (2, 4, 4)
     torch.testing.assert_close(prefix_latents, expected_latents)
 
 
@@ -144,6 +213,7 @@ def test_next_scale_inputs_are_resized_cumulative_latents() -> None:
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
         embed_dim=8,
+        latent_length=4,
     ).eval()
     indices_by_scale = [
         torch.tensor([[0], [1]]),
@@ -170,8 +240,10 @@ def test_next_scale_inputs_are_resized_cumulative_latents() -> None:
 def test_partial_reconstruction_trains_quantizer_without_moving_encoder() -> None:
     model = VQVAE(
         vocab_size=4,
-        context_length=4,
+        context_length=8,
+        latent_length=4,
         embed_dim=8,
+        quantization_dim=4,
         num_heads=2,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
@@ -179,14 +251,16 @@ def test_partial_reconstruction_trains_quantizer_without_moving_encoder() -> Non
         decoder_dropout=0.0,
         pre_quant_num_groups=2,
     )
-    token_ids = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
+    token_ids = torch.tensor(
+        [[0, 1, 2, 3, 3, 2, 1, 0], [3, 2, 1, 0, 0, 1, 2, 3]]
+    )
 
     logits, partial_logits, _, _ = model(
         token_ids,
         include_partial_reconstruction=True,
     )
 
-    assert logits.shape == (2, 4, 4)
+    assert logits.shape == (2, 8, 4)
     assert partial_logits is not None
     assert partial_logits.shape == logits.shape
 
@@ -214,7 +288,9 @@ def test_partial_reconstruction_uses_separate_gradient_scales() -> None:
         return VQVAE(
             vocab_size=4,
             context_length=4,
+            latent_length=4,
             embed_dim=8,
+            quantization_dim=4,
             num_heads=2,
             scale_lengths=[1, 2, 4],
             codebook_sizes=[8, 8, 8],
@@ -286,7 +362,9 @@ def test_evaluate_reports_vq_diagnostics_by_scale() -> None:
     model = VQVAE(
         vocab_size=4,
         context_length=4,
+        latent_length=4,
         embed_dim=8,
+        quantization_dim=4,
         num_heads=2,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
@@ -305,13 +383,13 @@ def test_evaluate_reports_vq_diagnostics_by_scale() -> None:
     )
 
     assert "encoder_latent_rms" in metrics
-    mean_cumulative_latent_mse = sum(
-        metrics[f"cumulative_latent_mse_scale_{scale_length}"]
-        for scale_length in model.scale_lengths
-    ) / len(model.scale_lengths)
+    final_scale_length = model.scale_lengths[-1]
+    final_latent_mse = metrics[
+        f"cumulative_latent_mse_scale_{final_scale_length}"
+    ]
     torch.testing.assert_close(
         torch.tensor(metrics["vq_loss"]),
-        torch.tensor(1.25 * mean_cumulative_latent_mse),
+        torch.tensor(1.25 * final_latent_mse),
     )
 
     for scale_length in model.scale_lengths:

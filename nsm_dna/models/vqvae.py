@@ -31,7 +31,9 @@ class VQVAE(nn.Module):
         self,
         vocab_size: int,
         context_length: int,
+        latent_length: int,
         embed_dim: int,
+        quantization_dim: int,
         num_heads: int,
         scale_lengths: list[int],
         codebook_sizes: list[int],
@@ -39,6 +41,7 @@ class VQVAE(nn.Module):
         # Encoder and decoder
         encoder_dropout: float = 0.0,
         decoder_dropout: float = 0.1,
+        decoder_num_layers: int = 1,
         bias: bool = False,
         rope_base: float = 10000.0,
         pre_quant_num_groups: int | None = None,
@@ -52,25 +55,35 @@ class VQVAE(nn.Module):
     ) -> None:
         super().__init__()
 
-        if not scale_lengths or scale_lengths[-1] != context_length:
-            raise ValueError("The final scale length must equal the context length.")
+        if not scale_lengths or scale_lengths[-1] != latent_length:
+            raise ValueError("The final scale length must equal the latent length.")
         if pre_quant_num_groups is not None and (
-            pre_quant_num_groups <= 0 or embed_dim % pre_quant_num_groups != 0
+            pre_quant_num_groups <= 0
+            or quantization_dim % pre_quant_num_groups != 0
         ):
-            raise ValueError("pre_quant_num_groups must evenly divide embed_dim.")
+            raise ValueError(
+                "pre_quant_num_groups must evenly divide quantization_dim."
+            )
 
         self.vocab_size = vocab_size
         self.context_length = context_length
+        self.latent_length = latent_length
         self.embed_dim = embed_dim
+        self.quantization_dim = quantization_dim
         self.num_heads = num_heads
+        self.decoder_num_layers = decoder_num_layers
         self.rope_base = rope_base
         self.scale_lengths = list(scale_lengths)
         self.codebook_sizes = list(codebook_sizes)
 
         self.encoder = Encoder(
             self.vocab_size,
+            self.context_length,
+            self.latent_length,
             self.embed_dim,
+            self.quantization_dim,
             dropout=encoder_dropout,
+            bias=bias,
         )
 
         # Normalize the encoder output before comparing it with codebook vectors.
@@ -89,7 +102,7 @@ class VQVAE(nn.Module):
         # affine transform would apply a learned per-channel scale after normalization,
         # allowing the model to increase their magnitude again, so affine is disabled.
         self.pre_quant_norm = (
-            nn.GroupNorm(pre_quant_num_groups, self.embed_dim, affine=False)
+            nn.GroupNorm(pre_quant_num_groups, self.quantization_dim, affine=False)
             if pre_quant_num_groups is not None
             else None
         )
@@ -97,7 +110,8 @@ class VQVAE(nn.Module):
         self.quantizer = MultiscaleResidualVectorQuantizer(
             self.scale_lengths,
             self.codebook_sizes,
-            self.embed_dim,
+            self.quantization_dim,
+            latent_length=self.latent_length,
             commitment_cost=commitment_cost,
             decay=decay,
             eps=eps,
@@ -107,8 +121,11 @@ class VQVAE(nn.Module):
         self.decoder = Decoder(
             self.vocab_size,
             self.context_length,
+            self.latent_length,
             self.embed_dim,
+            self.quantization_dim,
             self.num_heads,
+            num_layers=self.decoder_num_layers,
             dropout=decoder_dropout,
             bias=bias,
             rope_base=self.rope_base,
@@ -133,8 +150,11 @@ class VQVAE(nn.Module):
         model = cls(
             vocab_size=config.vocab_size,
             context_length=config.context_length,
+            latent_length=config.latent_length,
             embed_dim=config.embed_dim,
+            quantization_dim=config.quantization_dim,
             num_heads=config.num_heads,
+            decoder_num_layers=getattr(config, "decoder_num_layers", 1),
             scale_lengths=list(config.scale_lengths),
             codebook_sizes=list(config.codebook_sizes),
             encoder_dropout=config.encoder_dropout,
@@ -160,7 +180,7 @@ class VQVAE(nn.Module):
     def encode(
         self,
         token_ids: Int[Tensor, "batch length"],
-    ) -> Float[Tensor, "batch length embed_dim"]:
+    ) -> Float[Tensor, "batch latent_length quantization_dim"]:
         """Encode DNA into the normalized continuous latent space.
 
         VQ-VAE training quantizes this latent before reconstruction. NSM-DNA
@@ -234,7 +254,7 @@ class VQVAE(nn.Module):
     def indices_to_next_scale_inputs(
         self,
         indices_by_scale: list[Int[Tensor, "batch scale_length"]],
-    ) -> list[Float[Tensor, "batch scale_length embed_dim"]]:
+    ) -> list[Float[Tensor, "batch scale_length quantization_dim"]]:
         """Construct teacher-forced inputs for each scale after the first."""
         return self.quantizer.indices_to_next_scale_inputs(indices_by_scale)
 
@@ -242,7 +262,7 @@ class VQVAE(nn.Module):
     def indices_to_next_scale_input(
         self,
         preceding_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
-    ) -> Float[Tensor, "batch next_scale_length embed_dim"]:
+    ) -> Float[Tensor, "batch next_scale_length quantization_dim"]:
         """Construct the next input from autoregressively predicted indices."""
         return self.quantizer.indices_to_next_scale_input(
             preceding_indices_by_scale

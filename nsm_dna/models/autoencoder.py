@@ -1,3 +1,4 @@
+import einx
 import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
@@ -8,27 +9,57 @@ from .common import (
     TransformerBlock,
     precompute_rope_cosine_and_sine,
 )
+from .sampling import (
+    make_cascaded_downsampler,
+    make_cascaded_upsampler,
+)
+
+
+def _sampling_factor(context_length: int, latent_length: int) -> int:
+    """Return the total stride needed to reduce context_length to latent_length."""
+    if latent_length <= 0 or context_length % latent_length != 0:
+        raise ValueError("context_length must be divisible by latent_length.")
+    return context_length // latent_length
 
 
 class Encoder(nn.Module):
-    """Embed nucleotides independently without absolute position information."""
+    """Embed nucleotides and downsample them into a continuous latent."""
 
     def __init__(
         self,
         vocab_size: int,
+        context_length: int,
+        latent_length: int,
         embed_dim: int,
+        quantization_dim: int,
         dropout: float = 0.0,
+        bias: bool = False,
     ) -> None:
         super().__init__()
 
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         self.drop = nn.Dropout(dropout)
+        self.downsampler = make_cascaded_downsampler(
+            embed_dim,
+            total_stride=_sampling_factor(context_length, latent_length),
+            base_stride=2,
+            bias=bias,
+        )
+        self.quantization_projection = nn.Linear(
+            embed_dim,
+            quantization_dim,
+            bias=bias,
+        )
 
     def forward(
         self,
         token_ids: Int[Tensor, "batch length"],
-    ) -> Float[Tensor, "batch length embed_dim"]:
-        return self.drop(self.token_embedding(token_ids))
+    ) -> Float[Tensor, "batch latent_length quantization_dim"]:
+        x = self.drop(self.token_embedding(token_ids))
+        x = einx.id("b l d -> b d l", x)
+        x = self.downsampler(x)
+        x = einx.id("b d l -> b l d", x)
+        return self.quantization_projection(x)
 
 
 class Decoder(nn.Module):
@@ -38,13 +69,19 @@ class Decoder(nn.Module):
         self,
         vocab_size: int,
         context_length: int,
+        latent_length: int,
         embed_dim: int,
+        quantization_dim: int,
         num_heads: int,
+        num_layers: int = 1,
         dropout: float = 0.1,
         bias: bool = False,
         rope_base: float = 10000.0,
     ) -> None:
         super().__init__()
+
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive.")
 
         positions = torch.arange(context_length)
         head_dim = embed_dim // num_heads
@@ -56,10 +93,30 @@ class Decoder(nn.Module):
         self.register_buffer("rope_cosine", rope_cosine, persistent=False)
         self.register_buffer("rope_sine", rope_sine, persistent=False)
 
+        self.latent_projection = nn.Linear(
+            quantization_dim,
+            embed_dim,
+            bias=bias,
+        )
         self.block = TransformerBlock(
             embed_dim,
             num_heads,
             dropout=dropout,
+            bias=bias,
+        )
+        self.additional_blocks = nn.ModuleList(
+            TransformerBlock(
+                embed_dim,
+                num_heads,
+                dropout=dropout,
+                bias=bias,
+            )
+            for _ in range(num_layers - 1)
+        )
+        self.upsampler = make_cascaded_upsampler(
+            embed_dim,
+            total_stride=_sampling_factor(context_length, latent_length),
+            base_stride=2,
             bias=bias,
         )
         self.final_norm = LayerNorm(embed_dim, bias=bias)
@@ -67,12 +124,23 @@ class Decoder(nn.Module):
 
     def forward(
         self,
-        latent: Float[Tensor, "batch length embed_dim"],
-    ) -> Float[Tensor, "batch length vocab_size"]:
+        latent: Float[Tensor, "batch latent_length quantization_dim"],
+    ) -> Float[Tensor, "batch context_length vocab_size"]:
+        x = self.latent_projection(latent)
+        x = einx.id("b l d -> b d l", x)
+        x = self.upsampler(x)
+        x = einx.id("b d l -> b l d", x)
+
         x = self.block(
-            latent,
+            x,
             rotary_embeddings=(self.rope_cosine, self.rope_sine),
             is_causal=False,
         )
+        for block in self.additional_blocks:
+            x = block(
+                x,
+                rotary_embeddings=(self.rope_cosine, self.rope_sine),
+                is_causal=False,
+            )
         x = self.final_norm(x)
         return self.out_proj(x)

@@ -12,12 +12,13 @@ from nsm_dna.models.next_scale import NSM, SharedOutputHead
 def test_nsm_from_checkpoint_restores_model_and_step(tmp_path: Path) -> None:
     tokenizer = SimpleNamespace(
         embed_dim=3,
+        quantization_dim=3,
         scale_lengths=[1, 2],
         codebook_sizes=[5, 5],
         context_length=4,
     )
     model = NSM(
-        vq_embed_dim=tokenizer.embed_dim,
+        vq_embed_dim=tokenizer.quantization_dim,
         model_dim=8,
         scale_lengths=tokenizer.scale_lengths,
         codebook_size=tokenizer.codebook_sizes[0],

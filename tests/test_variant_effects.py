@@ -16,7 +16,9 @@ def _build_tokenizer() -> VQVAE:
     tokenizer = VQVAE(
         vocab_size=4,
         context_length=4,
+        latent_length=4,
         embed_dim=8,
+        quantization_dim=4,
         num_heads=2,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
@@ -66,7 +68,7 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
     torch.manual_seed(0)
     tokenizer = _build_tokenizer()
     model = NSM(
-        vq_embed_dim=8,
+        vq_embed_dim=4,
         model_dim=8,
         scale_lengths=[1, 2, 4],
         codebook_size=8,
@@ -110,7 +112,7 @@ def test_sequence_score_supports_target_without_prefix() -> None:
     torch.manual_seed(0)
     tokenizer = _build_tokenizer()
     model = NSM(
-        vq_embed_dim=8,
+        vq_embed_dim=4,
         model_dim=8,
         scale_lengths=[1, 2, 4],
         codebook_size=8,

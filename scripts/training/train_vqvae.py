@@ -63,6 +63,7 @@ def evaluate(
 
     # Encoder magnitude, which GroupNorm should keep stable.
     encoder_latent_squared_sum = 0.0
+    num_latent_values = 0
 
     for batch_index, batch in enumerate(data_loader):
         if max_batches is not None and batch_index == max_batches:
@@ -87,6 +88,7 @@ def evaluate(
             previous_latent = torch.zeros_like(cumulative_latents[0])
 
             encoder_latent_squared_sum += encoder_latent.float().square().sum().item()
+            num_latent_values += encoder_latent.numel()
             for scale_index, cumulative_latent in enumerate(cumulative_latents):
                 scale_logits = model.decoder(cumulative_latent)
                 scale_reconstruction_loss = F.cross_entropy(
@@ -127,7 +129,6 @@ def evaluate(
 
     reconstruction_loss = reconstruction_loss_sum / num_batches
     vq_loss = vq_loss_sum / num_batches
-    num_latent_values = num_tokens * model.embed_dim
     metrics = {
         "reconstruction_loss": reconstruction_loss,
         "vq_loss": vq_loss,
@@ -246,12 +247,15 @@ def main(config: DictConfig) -> None:
     model = VQVAE(
         vocab_size=config.model.vocab_size,
         context_length=config.model.context_length,
+        latent_length=config.model.latent_length,
         embed_dim=config.model.embed_dim,
+        quantization_dim=config.model.quantization_dim,
         num_heads=config.model.num_heads,
         scale_lengths=list(config.model.scale_lengths),
         codebook_sizes=list(config.model.codebook_sizes),
         encoder_dropout=config.model.encoder_dropout,
         decoder_dropout=config.model.decoder_dropout,
+        decoder_num_layers=config.model.decoder_num_layers,
         bias=config.model.bias,
         rope_base=config.model.rope_base,
         pre_quant_num_groups=config.model.pre_quant_num_groups,

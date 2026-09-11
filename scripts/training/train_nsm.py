@@ -144,7 +144,7 @@ def rollout_scale_predictions(
         torch.zeros(
             batch_size,
             scale_length,
-            tokenizer.embed_dim,
+            tokenizer.quantization_dim,
             device=device,
         )
         for scale_length in tokenizer.scale_lengths[1:]
@@ -376,7 +376,7 @@ def main(config: DictConfig) -> None:
         )
 
     model = NSM(
-        vq_embed_dim=tokenizer.embed_dim,
+        vq_embed_dim=tokenizer.quantization_dim,
         model_dim=config.model.model_dim,
         scale_lengths=tokenizer.scale_lengths,
         codebook_size=tokenizer.codebook_sizes[0],
