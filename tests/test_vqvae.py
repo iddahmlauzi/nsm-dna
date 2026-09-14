@@ -240,6 +240,28 @@ def test_code_corruption_only_changes_training_decoder_input(monkeypatch) -> Non
     torch.testing.assert_close(quantizer(latent)[0], clean_decoder_latent)
 
 
+def test_vq_loss_averages_every_cumulative_scale() -> None:
+    quantizer = MultiscaleResidualVectorQuantizer(
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[4, 4, 4],
+        embed_dim=2,
+        latent_length=4,
+    ).eval()
+    latent = torch.randn(2, 4, 2)
+
+    _, _, vq_loss, indices_by_scale = quantizer(latent)
+    cumulative_latents = quantizer.indices_to_cumulative_latents(indices_by_scale)
+    expected_loss = torch.stack(
+        [
+            (1 + quantizer.commitment_cost)
+            * F.mse_loss(cumulative_latent, latent)
+            for cumulative_latent in cumulative_latents
+        ]
+    ).mean()
+
+    torch.testing.assert_close(vq_loss, expected_loss)
+
+
 def test_cumulative_decode_matches_full_reconstruction() -> None:
     model = VQVAE(
         vocab_size=4,
@@ -421,13 +443,15 @@ def test_evaluate_reports_vq_diagnostics_by_scale() -> None:
     )
 
     assert "encoder_latent_rms" in metrics
-    final_scale_length = model.scale_lengths[-1]
-    final_latent_mse = metrics[
-        f"cumulative_latent_mse_scale_{final_scale_length}"
-    ]
+    mean_cumulative_latent_mse = sum(
+        metrics[f"cumulative_latent_mse_scale_{scale_length}"]
+        for scale_length in model.scale_lengths
+    ) / len(model.scale_lengths)
     torch.testing.assert_close(
         torch.tensor(metrics["vq_loss"]),
-        torch.tensor(1.25 * final_latent_mse),
+        torch.tensor(
+            (1 + model.quantizer.commitment_cost) * mean_cumulative_latent_mse
+        ),
     )
 
     for scale_length in model.scale_lengths:

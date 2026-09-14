@@ -329,6 +329,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
 
         indices_by_scale: list[Int[Tensor, "batch scale_length"]] = []
         truncated_quantized_latent: Tensor | None = None
+        vq_loss = x.new_zeros(())
 
         for scale_index, codebook in enumerate(self.codebooks):
             scaled_residual = self._resize_to_scale(residual, scale_index)
@@ -350,6 +351,14 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             )
 
             reconstruction = reconstruction + scale_contribution
+
+            # Make every cumulative hierarchy approximate the encoder latent so
+            # coarse scales cannot rely on the final scale to repair them.
+            vq_loss = vq_loss + self.commitment_cost * F.mse_loss(
+                reconstruction.detach(),
+                x,
+            )
+            vq_loss = vq_loss + F.mse_loss(reconstruction, detached_x)
 
             if decoder_reconstruction is not None:
                 decoder_scale_contribution = scale_contribution
@@ -394,20 +403,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
                     truncated_reconstruction - x
                 ).detach()
 
-        # Only the completed hierarchy must reproduce the continuous encoder latent.
-        # Truncated hierarchies are trained separately through nucleotide reconstruction.
-        encoder_commitment_loss = self.commitment_cost * F.mse_loss(
-            reconstruction.detach(),
-            x,
-        )
-
-        # Train the learned samplers and refiners against a fixed encoder target.
-        # The codebooks themselves are updated separately through EMA.
-        quantizer_reconstruction_loss = F.mse_loss(
-            reconstruction,
-            detached_x,
-        )
-        vq_loss = encoder_commitment_loss + quantizer_reconstruction_loss
+        vq_loss = vq_loss / len(self.scale_lengths)
 
         # Give the decoder the possibly corrupted hierarchy while passing its
         # reconstruction gradients directly to the clean encoder latent.
