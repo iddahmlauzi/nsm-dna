@@ -178,7 +178,6 @@ def test_tokenizer_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
                 "model": {
                     "vocab_size": 4,
                     "context_length": 4,
-                    "max_context_length": 4,
                     "latent_length": 4,
                     "embed_dim": 8,
                     "quantization_dim": 4,

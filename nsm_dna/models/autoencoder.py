@@ -97,7 +97,6 @@ class Decoder(nn.Module):
         embed_dim: int,
         quantization_dim: int,
         num_heads: int,
-        max_context_length: int | None = None,
         num_layers: int = 1,
         use_qk_norm: bool = False,
         dropout: float = 0.1,
@@ -106,11 +105,7 @@ class Decoder(nn.Module):
     ) -> None:
         super().__init__()
 
-        max_context_length = max_context_length or context_length
-        if max_context_length < context_length:
-            raise ValueError("max_context_length cannot be shorter than context_length.")
-
-        positions = torch.arange(max_context_length)
+        positions = torch.arange(context_length)
         head_dim = embed_dim // num_heads
         rope_cosine, rope_sine = precompute_rope_cosine_and_sine(
             positions,
@@ -151,21 +146,11 @@ class Decoder(nn.Module):
         x = einx.id("b l d -> b d l", x)
         x = self.upsampler(x)
         x = einx.id("b d l -> b l d", x)
-        output_length = x.shape[1]
-        if output_length > self.rope_cosine.shape[0]:
-            raise ValueError(
-                f"Decoder output length {output_length} exceeds the configured "
-                f"maximum of {self.rope_cosine.shape[0]}."
-            )
-        rotary_embeddings = (
-            self.rope_cosine[:output_length],
-            self.rope_sine[:output_length],
-        )
 
         for block in self.blocks:
             x = block(
                 x,
-                rotary_embeddings=rotary_embeddings,
+                rotary_embeddings=(self.rope_cosine, self.rope_sine),
                 is_causal=False,
             )
         x = self.final_norm(x)
