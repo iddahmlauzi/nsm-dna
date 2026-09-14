@@ -35,6 +35,7 @@ model:
   # 32 before quantization, and the decoder projects 32 back to 384 afterward.
   quantization_dim: 32
   num_heads: 6
+  # RoPE is applied only in the decoder.
   rope_base: 10_000
   # This is the reference schedule at 512 bases. At runtime, the six position
   # counts scale in proportion to the input length while these six codebooks
@@ -42,9 +43,10 @@ model:
   scale_lengths: [4, 8, 16, 32, 64, 128]
   codebook_sizes: [256, 256, 256, 256, 256, 256]
 
-  encoder_dropout: 0.0
-  decoder_dropout: 0.1
+  dropout: 0.1
+  encoder_num_layers: 0
   decoder_num_layers: 4
+  use_qk_norm: true
   bias: false
   pre_quant_num_groups: 4
 
@@ -52,19 +54,18 @@ model:
   decay: 0.99
   eps: 1e-5
 
+  # Corrupt only decoder-facing codes during training; keep the first scale clean.
+  code_corruption: true
+
   refinement_ratio: 0.5
   refinement_kernel_size: 3
-
-  # Always train the full reconstruction. One randomly selected non-final
-  # cumulative scale receives an auxiliary reconstruction loss. Its gradient is
-  # stronger on the quantizer path than on the shared decoder so it makes each
-  # prefix useful without overwhelming the nearly solved full-decoder objective.
-  partial_reconstruction_quantizer_weight: 0.2
-  partial_reconstruction_decoder_weight: 0.01
+  # Every step trains both the complete hierarchy and one randomly truncated
+  # hierarchy so the decoder can reconstruct from every stage of quantization.
+  full_reconstruction_weight: 0.7
+  truncated_reconstruction_weight: 0.3
 
 optimizer:
   learning_rate: 1e-4
-  encoder_learning_rate: 1e-4
   min_learning_rate: 3e-5
   warmup_steps: 300
   beta_1: 0.9

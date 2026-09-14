@@ -11,19 +11,6 @@ from .autoencoder import Decoder, Encoder
 from .quantization import MultiscaleResidualVectorQuantizer
 
 
-class _ScaleGradient(torch.autograd.Function):
-    """Keep a tensor's forward value while scaling its backward gradient."""
-
-    @staticmethod
-    def forward(ctx, tensor: Tensor, scale: float) -> Tensor:
-        ctx.scale = scale
-        return tensor
-
-    @staticmethod
-    def backward(ctx, gradient: Tensor) -> tuple[Tensor, None]:
-        return gradient * ctx.scale, None
-
-
 class VQVAE(nn.Module):
     """VQ-VAE with a multiscale residual quantization bottleneck."""
 
@@ -40,9 +27,10 @@ class VQVAE(nn.Module):
         *,
         max_context_length: int | None = None,
         # Encoder and decoder
-        encoder_dropout: float = 0.0,
-        decoder_dropout: float = 0.1,
+        dropout: float = 0.1,
+        encoder_num_layers: int = 0,
         decoder_num_layers: int = 1,
+        use_qk_norm: bool = False,
         bias: bool = False,
         rope_base: float = 10000.0,
         pre_quant_num_groups: int | None = None,
@@ -50,6 +38,7 @@ class VQVAE(nn.Module):
         commitment_cost: float = 0.25,
         decay: float = 0.99,
         eps: float = 1e-5,
+        code_corruption: bool = False,
         # Per-scale post-quantization refinement
         refinement_ratio: float = 0.5,
         refinement_kernel_size: int = 3,
@@ -73,7 +62,9 @@ class VQVAE(nn.Module):
         self.embed_dim = embed_dim
         self.quantization_dim = quantization_dim
         self.num_heads = num_heads
+        self.encoder_num_layers = encoder_num_layers
         self.decoder_num_layers = decoder_num_layers
+        self.use_qk_norm = use_qk_norm
         self.rope_base = rope_base
         self.scale_lengths = list(scale_lengths)
         self.codebook_sizes = list(codebook_sizes)
@@ -84,7 +75,10 @@ class VQVAE(nn.Module):
             self.latent_length,
             self.embed_dim,
             self.quantization_dim,
-            dropout=encoder_dropout,
+            num_heads=self.num_heads,
+            num_layers=self.encoder_num_layers,
+            use_qk_norm=self.use_qk_norm,
+            dropout=dropout,
             bias=bias,
         )
 
@@ -117,6 +111,7 @@ class VQVAE(nn.Module):
             commitment_cost=commitment_cost,
             decay=decay,
             eps=eps,
+            code_corruption=code_corruption,
             refinement_ratio=refinement_ratio,
             refinement_kernel_size=refinement_kernel_size,
         )
@@ -129,7 +124,8 @@ class VQVAE(nn.Module):
             self.num_heads,
             max_context_length=self.max_context_length,
             num_layers=self.decoder_num_layers,
-            dropout=decoder_dropout,
+            use_qk_norm=self.use_qk_norm,
+            dropout=dropout,
             bias=bias,
             rope_base=self.rope_base,
         )
@@ -157,22 +153,20 @@ class VQVAE(nn.Module):
             embed_dim=config.embed_dim,
             quantization_dim=config.quantization_dim,
             num_heads=config.num_heads,
-            decoder_num_layers=getattr(config, "decoder_num_layers", 1),
+            encoder_num_layers=config.encoder_num_layers,
+            decoder_num_layers=config.decoder_num_layers,
+            use_qk_norm=config.use_qk_norm,
             scale_lengths=list(config.scale_lengths),
             codebook_sizes=list(config.codebook_sizes),
-            max_context_length=getattr(
-                config,
-                "max_context_length",
-                config.context_length,
-            ),
-            encoder_dropout=config.encoder_dropout,
-            decoder_dropout=config.decoder_dropout,
+            max_context_length=config.max_context_length,
+            dropout=config.dropout,
             bias=config.bias,
-            rope_base=getattr(config, "rope_base", 10000.0),
+            rope_base=config.rope_base,
             pre_quant_num_groups=config.pre_quant_num_groups,
             commitment_cost=config.commitment_cost,
             decay=config.decay,
             eps=config.eps,
+            code_corruption=config.code_corruption,
             refinement_ratio=config.refinement_ratio,
             refinement_kernel_size=config.refinement_kernel_size,
         )
@@ -237,8 +231,7 @@ class VQVAE(nn.Module):
         self,
         token_ids: Int[Tensor, "batch length"],
         *,
-        include_partial_reconstruction: bool = False,
-        partial_latent_gradient_scale: float = 1.0,
+        include_truncated_reconstruction: bool = False,
     ) -> tuple[
         Float[Tensor, "batch length vocab_size"],
         Float[Tensor, "batch length vocab_size"] | None,
@@ -248,28 +241,20 @@ class VQVAE(nn.Module):
         latent = self.encode(token_ids)
         (
             quantized_latent,
-            partial_quantized_latent,
+            truncated_quantized_latent,
             vq_loss,
             indices_by_scale,
         ) = self.quantizer(
             latent,
-            include_partial_reconstruction=include_partial_reconstruction,
+            include_truncated_reconstruction=include_truncated_reconstruction,
         )
         logits = self.decoder(quantized_latent)
 
-        partial_logits = None
-        if partial_quantized_latent is not None:
-            # The partial loss uses one decoder pass, but its gradient can have
-            # different strengths on the quantizer path and decoder parameters.
-            # Scaling at the decoder input affects only the gradient flowing back
-            # into the quantizer; the loss coefficient controls the decoder.
-            partial_quantized_latent = _ScaleGradient.apply(
-                partial_quantized_latent,
-                partial_latent_gradient_scale,
-            )
-            partial_logits = self.decoder(partial_quantized_latent)
+        truncated_logits = None
+        if truncated_quantized_latent is not None:
+            truncated_logits = self.decoder(truncated_quantized_latent)
 
-        return logits, partial_logits, vq_loss, indices_by_scale
+        return logits, truncated_logits, vq_loss, indices_by_scale
 
     @torch.no_grad()
     def encode_indices(

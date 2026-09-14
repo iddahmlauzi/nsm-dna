@@ -284,15 +284,17 @@ def main(config: DictConfig) -> None:
         scale_lengths=list(config.model.scale_lengths),
         codebook_sizes=list(config.model.codebook_sizes),
         max_context_length=config.model.max_context_length,
-        encoder_dropout=config.model.encoder_dropout,
-        decoder_dropout=config.model.decoder_dropout,
+        dropout=config.model.dropout,
+        encoder_num_layers=config.model.encoder_num_layers,
         decoder_num_layers=config.model.decoder_num_layers,
+        use_qk_norm=config.model.use_qk_norm,
         bias=config.model.bias,
         rope_base=config.model.rope_base,
         pre_quant_num_groups=config.model.pre_quant_num_groups,
         commitment_cost=config.model.commitment_cost,
         decay=config.model.decay,
         eps=config.model.eps,
+        code_corruption=config.model.code_corruption,
         refinement_ratio=config.model.refinement_ratio,
         refinement_kernel_size=config.model.refinement_kernel_size,
     )
@@ -317,22 +319,8 @@ def main(config: DictConfig) -> None:
             wandb_run.summary["model/total_parameters"] = total_parameters
 
     # Create the optimizer.
-    encoder_parameters = []
-    other_parameters = []
-    for name, parameter in model.named_parameters():
-        if name.startswith("encoder."):
-            encoder_parameters.append(parameter)
-        else:
-            other_parameters.append(parameter)
-
     optimizer = torch.optim.AdamW(
-        [
-            {"params": other_parameters},
-            {
-                "params": encoder_parameters,
-                "lr": config.optimizer.encoder_learning_rate,
-            },
-        ],
+        model.parameters(),
         lr=config.optimizer.learning_rate,
         betas=(config.optimizer.beta_1, config.optimizer.beta_2),
         weight_decay=config.optimizer.weight_decay,
@@ -385,11 +373,8 @@ def main(config: DictConfig) -> None:
         disable=not distributed_environment.is_main_process,
     )
     gradient_accumulation_steps = config.optimizer.gradient_accumulation_steps
-    partial_quantizer_weight = config.model.partial_reconstruction_quantizer_weight
-    partial_decoder_weight = config.model.partial_reconstruction_decoder_weight
-    partial_latent_gradient_scale = (
-        partial_quantizer_weight / partial_decoder_weight
-    )
+    full_reconstruction_weight = config.model.full_reconstruction_weight
+    truncated_reconstruction_weight = config.model.truncated_reconstruction_weight
     length_generator = torch.Generator().manual_seed(config.run.seed)
     if start_step > 0:
         torch.randint(
@@ -400,8 +385,8 @@ def main(config: DictConfig) -> None:
 
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
-        reconstruction_loss_sum = 0.0
-        partial_reconstruction_loss_sum = 0.0
+        full_reconstruction_loss_sum = 0.0
+        truncated_reconstruction_loss_sum = 0.0
         vq_loss_sum = 0.0
         length_index = torch.randint(
             len(sequence_lengths),
@@ -439,33 +424,33 @@ def main(config: DictConfig) -> None:
                     dtype=torch.bfloat16,
                     enabled=use_mixed_precision,
                 ):
-                    logits, partial_logits, vq_loss, _ = training_model(
+                    full_logits, truncated_logits, vq_loss, _ = training_model(
                         input_ids,
-                        include_partial_reconstruction=True,
-                        partial_latent_gradient_scale=partial_latent_gradient_scale,
+                        include_truncated_reconstruction=True,
                     )
-                    assert partial_logits is not None
-                    reconstruction_loss = F.cross_entropy(
-                        logits.flatten(0, 1),
+                    assert truncated_logits is not None
+                    full_reconstruction_loss = F.cross_entropy(
+                        full_logits.flatten(0, 1),
                         input_ids.flatten(),
                     )
-                    partial_reconstruction_loss = F.cross_entropy(
-                        partial_logits.flatten(0, 1),
+                    truncated_reconstruction_loss = F.cross_entropy(
+                        truncated_logits.flatten(0, 1),
                         input_ids.flatten(),
                     )
                     loss = (
-                        reconstruction_loss
-                        + partial_decoder_weight * partial_reconstruction_loss
+                        full_reconstruction_weight * full_reconstruction_loss
+                        + truncated_reconstruction_weight
+                        * truncated_reconstruction_loss
                         + vq_loss
                     )
                     accumulated_loss = loss / gradient_accumulation_steps
                 accumulated_loss.backward()
 
-            reconstruction_loss_sum += (
-                reconstruction_loss.item() / gradient_accumulation_steps
+            full_reconstruction_loss_sum += (
+                full_reconstruction_loss.item() / gradient_accumulation_steps
             )
-            partial_reconstruction_loss_sum += (
-                partial_reconstruction_loss.item() / gradient_accumulation_steps
+            truncated_reconstruction_loss_sum += (
+                truncated_reconstruction_loss.item() / gradient_accumulation_steps
             )
             vq_loss_sum += vq_loss.item() / gradient_accumulation_steps
 
@@ -475,7 +460,6 @@ def main(config: DictConfig) -> None:
             max_norm=config.optimizer.max_gradient_norm,
         )
         learning_rate = optimizer.param_groups[0]["lr"]
-        encoder_learning_rate = optimizer.param_groups[1]["lr"]
         optimizer.step()
 
         # Set the learning rate that will be used by the next optimizer step.
@@ -484,8 +468,8 @@ def main(config: DictConfig) -> None:
         if step % config.training.log_interval == 0:
             loss_sums = torch.tensor(
                 [
-                    reconstruction_loss_sum,
-                    partial_reconstruction_loss_sum,
+                    full_reconstruction_loss_sum,
+                    truncated_reconstruction_loss_sum,
                     vq_loss_sum,
                 ],
                 device=device,
@@ -496,20 +480,23 @@ def main(config: DictConfig) -> None:
 
             if distributed_environment.is_main_process:
                 (
-                    reconstruction_loss_value,
-                    partial_reconstruction_loss_value,
+                    full_reconstruction_loss_value,
+                    truncated_reconstruction_loss_value,
                     vq_loss_value,
                 ) = loss_sums.tolist()
                 total_loss_value = (
-                    reconstruction_loss_value
-                    + partial_decoder_weight * partial_reconstruction_loss_value
+                    full_reconstruction_weight * full_reconstruction_loss_value
+                    + truncated_reconstruction_weight
+                    * truncated_reconstruction_loss_value
                     + vq_loss_value
                 )
                 global_utilization = model.global_utilization.item()
                 progress_bar.set_postfix(
-                    reconstruction_loss=f"{reconstruction_loss_value:.4f}",
-                    partial_reconstruction_loss=(
-                        f"{partial_reconstruction_loss_value:.4f}"
+                    full_reconstruction_loss=(
+                        f"{full_reconstruction_loss_value:.4f}"
+                    ),
+                    truncated_reconstruction_loss=(
+                        f"{truncated_reconstruction_loss_value:.4f}"
                     ),
                     vq_loss=f"{vq_loss_value:.4f}",
                     total_loss=f"{total_loss_value:.4f}",
@@ -518,15 +505,16 @@ def main(config: DictConfig) -> None:
                 if wandb_run is not None:
                     wandb_run.log(
                         {
-                            "train/reconstruction_loss": reconstruction_loss_value,
-                            "train/partial_reconstruction_loss": (
-                                partial_reconstruction_loss_value
+                            "train/full_reconstruction_loss": (
+                                full_reconstruction_loss_value
+                            ),
+                            "train/truncated_reconstruction_loss": (
+                                truncated_reconstruction_loss_value
                             ),
                             "train/vq_loss": vq_loss_value,
                             "train/total_loss": total_loss_value,
                             "train/gradient_norm": gradient_norm.item(),
                             "train/learning_rate": learning_rate,
-                            "train/encoder_learning_rate": encoder_learning_rate,
                             "train/sequence_length": sequence_length,
                             "codebook/global_utilization": global_utilization,
                         },

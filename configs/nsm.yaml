@@ -63,8 +63,9 @@ training:
   num_epochs: 10
   # Set an integer here to override the epoch-derived training length.
   max_steps: null
-  # Replace this fraction of teacher-forced input codes during training.
-  input_code_corruption_probability: 0.1
+  # Corruption probabilities for scale 8, 16, 32, and 64 codes when they
+  # become inputs to a later scale. Supplied scale 4 always remains clean.
+  input_code_corruption_probabilities: [0.9, 0.8333, 0.7667, 0.7]
   log_interval: 10
 
 evaluation:

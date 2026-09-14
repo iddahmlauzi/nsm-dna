@@ -97,9 +97,10 @@ def score_token_ids(
     Float[Tensor, "batch"],
 ]:
     """Return per-scale hierarchy scores and the decoder score."""
+    predicted_scale_lengths = tokenizer.scale_lengths[1:]
     hierarchy_scores = torch.zeros(
         input_ids.shape[0],
-        len(tokenizer.scale_lengths),
+        len(predicted_scale_lengths),
         device=input_ids.device,
         dtype=torch.float64,
     )
@@ -108,15 +109,16 @@ def score_token_ids(
     )
     if input_ids.shape[1] == tokenizer.context_length:
         target_ids = input_ids
-        targets_by_scale = tokenizer.encode_indices(target_ids)
+        indices_by_scale = tokenizer.encode_indices(target_ids)
         predictions = [
             BlockPredictionBatch(
                 target_ids=target_ids,
                 prefix=None,
+                first_scale_indices=indices_by_scale[0],
                 scale_inputs=tokenizer.indices_to_next_scale_inputs(
-                    targets_by_scale
+                    indices_by_scale
                 ),
-                targets_by_scale=targets_by_scale,
+                targets_by_scale=indices_by_scale[1:],
             )
         ]
     else:
@@ -129,11 +131,13 @@ def score_token_ids(
             enabled=input_ids.device.type == "cuda",
         ):
             logits = model(prediction.scale_inputs, prefix=prediction.prefix)
-            decoder_logits = tokenizer.decode(prediction.targets_by_scale)
+            decoder_logits = tokenizer.decode(
+                [prediction.first_scale_indices, *prediction.targets_by_scale]
+            )
 
         # Likelihood counts every predicted code once; the training loss's scale
         # weights do not enter the sequence score.
-        logits_by_scale = torch.split(logits, tokenizer.scale_lengths, dim=1)
+        logits_by_scale = torch.split(logits, predicted_scale_lengths, dim=1)
         for scale_index, (scale_logits, scale_targets) in enumerate(
             zip(logits_by_scale, prediction.targets_by_scale)
         ):
@@ -167,7 +171,8 @@ def score_sequences(
     device: torch.device,
 ) -> dict[str, list[float]]:
     """Score fixed-length DNA sequences and retain each score component."""
-    scores = {f"scale_{length}": [] for length in tokenizer.scale_lengths}
+    predicted_scale_lengths = tokenizer.scale_lengths[1:]
+    scores = {f"scale_{length}": [] for length in predicted_scale_lengths}
     scores.update({"hierarchy": [], "decoder": [], "joint": []})
 
     for start in tqdm(range(0, len(sequences), batch_size), unit="batch"):
@@ -179,7 +184,7 @@ def score_sequences(
         hierarchy = hierarchy_by_scale.sum(1)
         batch_scores = {
             f"scale_{length}": hierarchy_by_scale[:, scale_index]
-            for scale_index, length in enumerate(tokenizer.scale_lengths)
+            for scale_index, length in enumerate(predicted_scale_lengths)
         }
         batch_scores["hierarchy"] = hierarchy
         batch_scores["decoder"] = decoder
@@ -365,7 +370,7 @@ def main(config: DictConfig) -> None:
             f"the model maximum of {model.max_prefix_length}."
         )
     target_length = int(tokenizer.context_length)
-    component_names = [f"scale_{length}" for length in tokenizer.scale_lengths]
+    component_names = [f"scale_{length}" for length in tokenizer.scale_lengths[1:]]
     component_names.extend(["hierarchy", "decoder"])
 
     results = []

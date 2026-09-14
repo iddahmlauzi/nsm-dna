@@ -168,6 +168,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         commitment_cost: float = 0.25,
         decay: float = 0.99,
         eps: float = 1e-5,
+        code_corruption: bool = False,
         # Per-scale post-quantization refinement
         refinement_ratio: float = 0.5,
         refinement_kernel_size: int = 3,
@@ -182,6 +183,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         self.embed_dim = embed_dim
         self.latent_length = latent_length
         self.commitment_cost = commitment_cost
+        self.code_corruption = code_corruption
         self.refinement_ratio = refinement_ratio
         self.refinement_kernel_size = refinement_kernel_size
 
@@ -320,7 +322,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         self,
         x: Float[Tensor, "batch length embed_dim"],
         *,
-        include_partial_reconstruction: bool = False,
+        include_truncated_reconstruction: bool = False,
     ) -> tuple[
         Float[Tensor, "batch length embed_dim"],
         Float[Tensor, "batch length embed_dim"] | None,
@@ -329,7 +331,7 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
     ]:
         """Quantize an encoder latent into cumulative multiscale contributions.
 
-        When partial reconstruction is enabled, the second return value is one
+        When truncated reconstruction is enabled, the second return value is one
         randomly selected non-final cumulative latent. The caller decodes that
         latent and computes the auxiliary reconstruction loss against the input
         tokens.
@@ -343,21 +345,25 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         reconstruction = torch.zeros_like(residual)
         latent_length = x.shape[1]
         scale_lengths = self.scale_lengths_for_latent_length(latent_length)
+        corrupt_decoder_input = self.training and self.code_corruption
+        decoder_reconstruction = (
+            torch.zeros_like(residual) if corrupt_decoder_input else None
+        )
 
-        partial_scale_index = None
-        if include_partial_reconstruction:
+        truncated_scale_index = None
+        if include_truncated_reconstruction:
             if len(self.scale_lengths) < 2:
                 raise ValueError(
-                    "Partial reconstruction requires at least two quantization scales."
+                    "Truncated reconstruction requires at least two quantization scales."
                 )
-            partial_scale_index = torch.randint(
+            truncated_scale_index = torch.randint(
                 low=0,
                 high=len(self.scale_lengths) - 1,
                 size=(),
             ).item()
 
         indices_by_scale: list[Int[Tensor, "batch scale_length"]] = []
-        partial_quantized_latent: Tensor | None = None
+        truncated_quantized_latent: Tensor | None = None
 
         for scale_index, codebook in enumerate(self.codebooks):
             scaled_residual = self._resize_to_scale(
@@ -368,9 +374,10 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             quantized_at_scale, scale_indices = codebook(scaled_residual)
             indices_by_scale.append(scale_indices)
 
-            # Nearest-code selection blocks gradients to the learned downsampler.
-            # This preserves the selected code in the forward pass while treating
-            # the lookup as an identity when calculating downsampler gradients.
+            # Only the first scale has learned downsampler weights to train. Its
+            # nearest-code lookup blocks gradients, so this uses the selected code
+            # during forward but passes backward gradients into the downsampler.
+            # Later scales use fixed area interpolation and therefore need no STE.
             if scale_index == 0 and len(self.scale_lengths) > 1:
                 quantized_at_scale = (
                     scaled_residual + (quantized_at_scale - scaled_residual).detach()
@@ -384,13 +391,54 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
             )
 
             reconstruction = reconstruction + scale_contribution
+
+            if decoder_reconstruction is not None:
+                decoder_scale_contribution = scale_contribution
+                # The next-scale model receives the true first scale directly
+                # instead of predicting it from BOS, so only later scales are corrupted.
+                if scale_index > 0:
+                    batch_size = scale_indices.shape[0]
+                    corruption_probability = torch.rand(
+                        batch_size,
+                        1,
+                        device=scale_indices.device,
+                    )
+                    corruption_mask = (
+                        torch.rand_like(scale_indices, dtype=torch.float32)
+                        < corruption_probability
+                    )
+                    decoder_indices = torch.where(
+                        corruption_mask,
+                        torch.randint_like(scale_indices, codebook.codebook_size),
+                        scale_indices,
+                    )
+                    decoder_quantized_at_scale = codebook.codebook[decoder_indices]
+                    decoder_scale_contribution = self._prepare_scale_contribution(
+                        decoder_quantized_at_scale,
+                        scale_index,
+                        scale_lengths,
+                        latent_length,
+                    )
+                decoder_reconstruction = (
+                    decoder_reconstruction + decoder_scale_contribution
+                )
+
             residual = residual - scale_contribution
 
-            if scale_index == partial_scale_index:
-                partial_quantized_latent = reconstruction
+            if scale_index == truncated_scale_index:
+                # Give the decoder the truncated hierarchy while passing its
+                # reconstruction gradient directly to the encoder latent.
+                truncated_reconstruction = (
+                    decoder_reconstruction
+                    if decoder_reconstruction is not None
+                    else reconstruction
+                )
+                truncated_quantized_latent = x + (
+                    truncated_reconstruction - x
+                ).detach()
 
         # Only the completed hierarchy must reproduce the continuous encoder latent.
-        # Partial hierarchies are trained separately through nucleotide reconstruction.
+        # Truncated hierarchies are trained separately through nucleotide reconstruction.
         encoder_commitment_loss = self.commitment_cost * F.mse_loss(
             reconstruction.detach(),
             x,
@@ -404,10 +452,16 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         )
         vq_loss = encoder_commitment_loss + quantizer_reconstruction_loss
 
-        # Give the decoder quantized values while passing its gradients to the encoder.
-        quantized_latent = x + (reconstruction - x).detach()
+        # Give the decoder the possibly corrupted hierarchy while passing its
+        # reconstruction gradients directly to the clean encoder latent.
+        decoder_reconstruction = (
+            decoder_reconstruction
+            if decoder_reconstruction is not None
+            else reconstruction
+        )
+        quantized_latent = x + (decoder_reconstruction - x).detach()
 
-        return quantized_latent, partial_quantized_latent, vq_loss, indices_by_scale
+        return quantized_latent, truncated_quantized_latent, vq_loss, indices_by_scale
 
     @torch.no_grad()
     def indices_to_cumulative_latents(

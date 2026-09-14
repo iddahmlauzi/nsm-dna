@@ -27,8 +27,8 @@ def _build_tokenizer() -> VQVAE:
         num_heads=2,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
-        encoder_dropout=0.0,
-        decoder_dropout=0.0,
+        dropout=0.0,
+        use_qk_norm=True,
         pre_quant_num_groups=2,
     )
 
@@ -37,7 +37,7 @@ def _build_nsm(max_prefix_length: int = 0) -> NSM:
     return NSM(
         vq_embed_dim=4,
         model_dim=8,
-        scale_lengths=[1, 2, 4],
+        scale_lengths=[2, 4],
         codebook_size=8,
         num_layers=1,
         num_heads=2,
@@ -178,19 +178,24 @@ def test_tokenizer_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
                 "model": {
                     "vocab_size": 4,
                     "context_length": 4,
+                    "max_context_length": 4,
                     "latent_length": 4,
                     "embed_dim": 8,
                     "quantization_dim": 4,
                     "num_heads": 2,
                     "scale_lengths": [1, 2, 4],
                     "codebook_sizes": [8, 8, 8],
-                    "encoder_dropout": 0.0,
-                    "decoder_dropout": 0.0,
+                    "dropout": 0.0,
+                    "encoder_num_layers": 0,
+                    "decoder_num_layers": 1,
+                    "use_qk_norm": True,
                     "bias": False,
+                    "rope_base": 10000.0,
                     "pre_quant_num_groups": 2,
                     "commitment_cost": 0.25,
                     "decay": 0.99,
                     "eps": 1e-5,
+                    "code_corruption": True,
                     "refinement_ratio": 0.5,
                     "refinement_kernel_size": 3,
                 }
@@ -233,20 +238,21 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     model = _build_nsm()
     input_ids = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
     scale_weights = build_scale_loss_weights(
-        tokenizer.scale_lengths,
+        tokenizer.scale_lengths[1:],
         scale_loss_alpha=0.25,
         device=torch.device("cpu"),
     )
 
-    targets_by_scale = tokenizer.encode_indices(input_ids)
-    next_scale_inputs = tokenizer.indices_to_next_scale_inputs(targets_by_scale)
+    indices_by_scale = tokenizer.encode_indices(input_ids)
+    targets_by_scale = indices_by_scale[1:]
+    next_scale_inputs = tokenizer.indices_to_next_scale_inputs(indices_by_scale)
     logits = model(next_scale_inputs)
     loss, _ = compute_next_scale_loss(logits, targets_by_scale, scale_weights)
     loss.backward()
 
     assert [scale_input.shape[1] for scale_input in next_scale_inputs] == [2, 4]
-    assert [targets.shape[1] for targets in targets_by_scale] == [1, 2, 4]
-    assert logits.shape == (2, 7, 8)
+    assert [targets.shape[1] for targets in targets_by_scale] == [2, 4]
+    assert logits.shape == (2, 6, 8)
     assert all(parameter.grad is None for parameter in tokenizer.parameters())
     assert any(parameter.grad is not None for parameter in model.parameters())
 
@@ -268,7 +274,8 @@ def test_block_prediction_uses_first_block_as_prefix_and_second_as_target() -> N
     expected_inputs = tokenizer.indices_to_next_scale_inputs(expected_targets)
     for actual, expected in zip(prediction.scale_inputs, expected_inputs):
         torch.testing.assert_close(actual, expected)
-    for actual, expected in zip(prediction.targets_by_scale, expected_targets):
+    torch.testing.assert_close(prediction.first_scale_indices, expected_targets[0])
+    for actual, expected in zip(prediction.targets_by_scale, expected_targets[1:]):
         torch.testing.assert_close(actual, expected)
 
 
@@ -281,14 +288,11 @@ def test_corruption_changes_inputs_without_changing_targets() -> None:
 
     corrupted_indices = corrupt_scale_indices(
         targets_by_scale,
-        codebook_sizes=[1, 1, 1],
-        probability=1.0,
+        codebook_sizes=[8, 1, 8],
+        probabilities=[1.0],
     )
 
-    torch.testing.assert_close(
-        corrupted_indices[0],
-        torch.zeros_like(targets_by_scale[0]),
-    )
+    torch.testing.assert_close(corrupted_indices[0], targets_by_scale[0])
     torch.testing.assert_close(
         corrupted_indices[1],
         torch.zeros_like(targets_by_scale[1]),
@@ -329,7 +333,12 @@ def test_default_config_matches_long_context_recipe() -> None:
         == 131_072
     )
     assert config.training.num_epochs == 10
-    assert config.training.input_code_corruption_probability == 0.1
+    assert list(config.training.input_code_corruption_probabilities) == [
+        0.9,
+        0.8333,
+        0.7667,
+        0.7,
+    ]
 
 
 def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
@@ -338,7 +347,7 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
     model = _build_nsm(max_prefix_length=4)
     input_ids = torch.arange(2 * 8).reshape(2, 8) % 4
     scale_weights = build_scale_loss_weights(
-        tokenizer.scale_lengths,
+        tokenizer.scale_lengths[1:],
         scale_loss_alpha=0.25,
         device=torch.device("cpu"),
     )
@@ -357,7 +366,7 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
     assert 0 <= metrics["accuracy"] <= 1
     assert metrics["rollout_nucleotide_loss"] > 0
     assert 0 <= metrics["rollout_nucleotide_accuracy"] <= 1
-    for scale_length in tokenizer.scale_lengths:
+    for scale_length in tokenizer.scale_lengths[1:]:
         assert 0 <= metrics[f"accuracy_scale_{scale_length}"] <= 1
 
 
@@ -368,7 +377,7 @@ def test_rollout_feeds_predictions_into_the_next_scale() -> None:
     predicted_indices_by_scale = rollout_scale_predictions(
         model,
         tokenizer,
-        batch_size=2,
+        first_scale_indices=torch.tensor([[3], [4]]),
         prefix=None,
     )
 

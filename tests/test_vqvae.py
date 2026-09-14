@@ -3,12 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nsm_dna.models.autoencoder import Decoder, Encoder
+from nsm_dna.models.common import RMSNorm
 from nsm_dna.models.quantization import MultiscaleResidualVectorQuantizer
 from nsm_dna.models.vqvae import VQVAE
 from scripts.training.train_vqvae import evaluate
 
 
-def test_encoder_uses_two_stride_two_stages_for_fourfold_reduction() -> None:
+def test_encoder_uses_one_stride_four_sampler_for_fourfold_reduction() -> None:
     encoder = Encoder(
         vocab_size=4,
         context_length=8,
@@ -20,15 +21,42 @@ def test_encoder_uses_two_stride_two_stages_for_fourfold_reduction() -> None:
     token_ids = torch.tensor([[3, 1, 0, 2, 2, 0, 1, 3]])
 
     latent = encoder(token_ids)
-    convolutions = [
-        module
-        for module in encoder.downsampler
-        if isinstance(module, nn.Conv1d)
-    ]
-
     assert latent.shape == (1, 2, 2)
-    assert len(convolutions) == 2
-    assert all(convolution.stride == (2,) for convolution in convolutions)
+    assert isinstance(encoder.downsampler, nn.Conv1d)
+    assert encoder.downsampler.stride == (4,)
+
+
+def test_encoder_contextualizes_before_downsampling() -> None:
+    class RecordingBlock(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.input_shape = None
+
+        def forward(
+            self,
+            x: torch.Tensor,
+            **kwargs,
+        ) -> torch.Tensor:
+            self.input_shape = x.shape
+            return x
+
+    encoder = Encoder(
+        vocab_size=4,
+        context_length=8,
+        latent_length=2,
+        embed_dim=8,
+        quantization_dim=2,
+        num_heads=2,
+        num_layers=1,
+        dropout=0.0,
+    )
+    recording_block = RecordingBlock()
+    encoder.context_blocks[0] = recording_block
+
+    latent = encoder(torch.tensor([[3, 1, 0, 2, 2, 0, 1, 3]]))
+
+    assert recording_block.input_shape == (1, 8, 8)
+    assert latent.shape == (1, 2, 2)
 
 
 def test_decoder_supplies_rope_to_attention() -> None:
@@ -57,7 +85,7 @@ def test_decoder_supplies_rope_to_attention() -> None:
         dropout=0.0,
     )
     recording_block = RecordingBlock()
-    decoder.block = recording_block
+    decoder.blocks[0] = recording_block
 
     logits = decoder(torch.randn(1, 2, 4))
 
@@ -82,8 +110,49 @@ def test_decoder_uses_configured_number_of_transformer_blocks() -> None:
 
     logits = decoder(torch.randn(1, 2, 4))
 
-    assert len(decoder.additional_blocks) == 3
+    assert len(decoder.blocks) == 4
     assert logits.shape == (1, 4, 4)
+
+
+def test_decoder_normalizes_queries_and_keys() -> None:
+    decoder = Decoder(
+        vocab_size=4,
+        context_length=4,
+        latent_length=2,
+        embed_dim=8,
+        quantization_dim=4,
+        num_heads=2,
+        num_layers=4,
+        use_qk_norm=True,
+        dropout=0.0,
+    )
+
+    for block in decoder.blocks:
+        assert isinstance(block.attn.q_norm, RMSNorm)
+        assert isinstance(block.attn.k_norm, RMSNorm)
+
+
+def test_vqvae_applies_qk_norm_to_encoder_and_decoder() -> None:
+    model = VQVAE(
+        vocab_size=4,
+        context_length=4,
+        latent_length=4,
+        embed_dim=8,
+        quantization_dim=4,
+        num_heads=2,
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[8, 8, 8],
+        encoder_num_layers=1,
+        decoder_num_layers=2,
+        use_qk_norm=True,
+        dropout=0.0,
+        pre_quant_num_groups=2,
+    )
+
+    blocks = [*model.encoder.context_blocks, *model.decoder.blocks]
+    for block in blocks:
+        assert isinstance(block.attn.q_norm, RMSNorm)
+        assert isinstance(block.attn.k_norm, RMSNorm)
 
 
 def test_first_scale_sampler_uses_a_cascade() -> None:
@@ -123,6 +192,55 @@ def test_first_scale_sampler_uses_a_cascade() -> None:
     torch.testing.assert_close(normalized, downsampled.transpose(1, 2))
 
 
+def test_code_corruption_only_changes_training_decoder_input(monkeypatch) -> None:
+    quantizer = MultiscaleResidualVectorQuantizer(
+        scale_lengths=[1, 2],
+        codebook_sizes=[2, 2],
+        embed_dim=1,
+        latent_length=2,
+        code_corruption=True,
+        refinement_ratio=0.0,
+    )
+    with torch.no_grad():
+        for codebook in quantizer.codebooks:
+            codebook.codebook.copy_(torch.tensor([[0.0], [1.0]]))
+
+    latent = torch.zeros(1, 2, 1)
+    quantizer.eval()
+    clean_decoder_latent, _, clean_vq_loss, clean_indices = quantizer(latent)
+
+    monkeypatch.setattr(torch, "rand", lambda *_, **__: torch.ones(1, 1))
+    monkeypatch.setattr(
+        torch,
+        "rand_like",
+        lambda tensor, **__: torch.zeros_like(tensor, dtype=torch.float32),
+    )
+    monkeypatch.setattr(
+        torch,
+        "randint_like",
+        lambda tensor, _: torch.ones_like(tensor),
+    )
+    quantizer.train()
+    for codebook in quantizer.codebooks:
+        codebook.eval()
+    corrupted_decoder_latent, _, corrupted_vq_loss, corrupted_indices = quantizer(
+        latent
+    )
+
+    for clean_scale_indices, corrupted_scale_indices in zip(
+        clean_indices,
+        corrupted_indices,
+        strict=True,
+    ):
+        torch.testing.assert_close(corrupted_scale_indices, clean_scale_indices)
+    torch.testing.assert_close(corrupted_vq_loss, clean_vq_loss)
+    torch.testing.assert_close(clean_decoder_latent, torch.zeros_like(latent))
+    torch.testing.assert_close(corrupted_decoder_latent, torch.ones_like(latent))
+
+    quantizer.eval()
+    torch.testing.assert_close(quantizer(latent)[0], clean_decoder_latent)
+
+
 def test_cumulative_decode_matches_full_reconstruction() -> None:
     model = VQVAE(
         vocab_size=4,
@@ -133,17 +251,16 @@ def test_cumulative_decode_matches_full_reconstruction() -> None:
         num_heads=2,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
-        encoder_dropout=0.0,
-        decoder_dropout=0.0,
+        dropout=0.0,
         pre_quant_num_groups=2,
     )
     model.eval()
     token_ids = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
 
-    logits, partial_logits, _, indices_by_scale = model(token_ids)
+    logits, truncated_logits, _, indices_by_scale = model(token_ids)
     cumulative_logits = model.decode_cumulative(indices_by_scale)
 
-    assert partial_logits is None
+    assert truncated_logits is None
     assert len(cumulative_logits) == 3
     assert all(scale_logits.shape == (2, 4, 4) for scale_logits in cumulative_logits)
     torch.testing.assert_close(cumulative_logits[-1], logits)
@@ -159,8 +276,7 @@ def test_quantization_operates_at_shorter_learned_latent_length() -> None:
         num_heads=2,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
-        encoder_dropout=0.0,
-        decoder_dropout=0.0,
+        dropout=0.0,
         pre_quant_num_groups=2,
     ).eval()
     token_ids = torch.tensor(
@@ -194,8 +310,7 @@ def test_one_tokenizer_uses_relative_scales_at_multiple_sequence_lengths() -> No
         num_heads=2,
         scale_lengths=[2, 4],
         codebook_sizes=[8, 8],
-        encoder_dropout=0.0,
-        decoder_dropout=0.0,
+        dropout=0.0,
         pre_quant_num_groups=2,
     ).eval()
 
@@ -222,7 +337,7 @@ def test_one_tokenizer_uses_relative_scales_at_multiple_sequence_lengths() -> No
         torch.testing.assert_close(decoded_logits, logits)
 
 
-def test_multi_resolution_partial_reconstruction_backpropagates() -> None:
+def test_multi_resolution_truncated_reconstruction_backpropagates() -> None:
     model = VQVAE(
         vocab_size=4,
         context_length=8,
@@ -233,8 +348,7 @@ def test_multi_resolution_partial_reconstruction_backpropagates() -> None:
         num_heads=2,
         scale_lengths=[2, 4],
         codebook_sizes=[8, 8],
-        encoder_dropout=0.0,
-        decoder_dropout=0.0,
+        dropout=0.0,
         pre_quant_num_groups=2,
     )
 
@@ -242,12 +356,12 @@ def test_multi_resolution_partial_reconstruction_backpropagates() -> None:
         model.zero_grad(set_to_none=True)
         token_ids = torch.arange(input_length).remainder(4).unsqueeze(0)
 
-        logits, partial_logits, vq_loss, _ = model(
+        logits, truncated_logits, vq_loss, _ = model(
             token_ids,
-            include_partial_reconstruction=True,
+            include_truncated_reconstruction=True,
         )
-        assert partial_logits is not None
-        loss = logits.mean() + partial_logits.mean() + vq_loss
+        assert truncated_logits is not None
+        loss = logits.mean() + truncated_logits.mean() + vq_loss
         loss.backward()
 
         assert model.encoder.quantization_projection.weight.grad is not None
@@ -264,8 +378,7 @@ def test_encode_returns_continuous_prefix_latents() -> None:
         num_heads=2,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
-        encoder_dropout=0.0,
-        decoder_dropout=0.0,
+        dropout=0.0,
         pre_quant_num_groups=2,
     ).eval()
     token_ids = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
@@ -309,7 +422,7 @@ def test_next_scale_inputs_are_resized_cumulative_latents() -> None:
     torch.testing.assert_close(next_scale_inputs[1], cumulative_latents[1])
 
 
-def test_partial_reconstruction_trains_quantizer_without_moving_encoder() -> None:
+def test_truncated_reconstruction_uses_straight_through_encoder_gradient() -> None:
     model = VQVAE(
         vocab_size=4,
         context_length=8,
@@ -319,115 +432,39 @@ def test_partial_reconstruction_trains_quantizer_without_moving_encoder() -> Non
         num_heads=2,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
-        encoder_dropout=0.0,
-        decoder_dropout=0.0,
+        dropout=0.0,
         pre_quant_num_groups=2,
     )
     token_ids = torch.tensor(
         [[0, 1, 2, 3, 3, 2, 1, 0], [3, 2, 1, 0, 0, 1, 2, 3]]
     )
 
-    logits, partial_logits, _, _ = model(
+    logits, truncated_logits, _, _ = model(
         token_ids,
-        include_partial_reconstruction=True,
+        include_truncated_reconstruction=True,
     )
 
     assert logits.shape == (2, 8, 4)
-    assert partial_logits is not None
-    assert partial_logits.shape == logits.shape
+    assert truncated_logits is not None
+    assert truncated_logits.shape == logits.shape
 
-    partial_loss = F.cross_entropy(
-        partial_logits.flatten(0, 1),
+    truncated_loss = F.cross_entropy(
+        truncated_logits.flatten(0, 1),
         token_ids.flatten(),
     )
-    partial_loss.backward()
-    assert all(
-        parameter.grad is None or parameter.grad.count_nonzero() == 0
-        for parameter in model.encoder.parameters()
-    )
+    truncated_loss.backward()
     assert any(
         parameter.grad is not None and parameter.grad.count_nonzero() > 0
+        for parameter in model.encoder.parameters()
+    )
+    assert all(
+        parameter.grad is None or parameter.grad.count_nonzero() == 0
         for parameter in model.quantizer.parameters()
     )
     assert any(
         parameter.grad is not None and parameter.grad.count_nonzero() > 0
         for parameter in model.decoder.parameters()
     )
-
-
-def test_partial_reconstruction_uses_separate_gradient_scales() -> None:
-    def build_model() -> VQVAE:
-        return VQVAE(
-            vocab_size=4,
-            context_length=4,
-            latent_length=4,
-            embed_dim=8,
-            quantization_dim=4,
-            num_heads=2,
-            scale_lengths=[1, 2, 4],
-            codebook_sizes=[8, 8, 8],
-            encoder_dropout=0.0,
-            decoder_dropout=0.0,
-            pre_quant_num_groups=2,
-        ).eval()
-
-    def partial_gradients(
-        model: VQVAE,
-        token_ids: torch.Tensor,
-        *,
-        loss_weight: float,
-        latent_gradient_scale: float,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        torch.manual_seed(0)
-        _, partial_logits, _, _ = model(
-            token_ids,
-            include_partial_reconstruction=True,
-            partial_latent_gradient_scale=latent_gradient_scale,
-        )
-        assert partial_logits is not None
-        partial_loss = F.cross_entropy(
-            partial_logits.flatten(0, 1),
-            token_ids.flatten(),
-        )
-        (loss_weight * partial_loss).backward()
-        quantizer_gradients = [
-            parameter.grad.detach().clone()
-            for parameter in model.quantizer.parameters()
-            if parameter.grad is not None
-        ]
-        decoder_gradients = [
-            parameter.grad.detach().clone()
-            for parameter in model.decoder.parameters()
-            if parameter.grad is not None
-        ]
-        return quantizer_gradients, decoder_gradients
-
-    baseline_model = build_model()
-    split_model = build_model()
-    split_model.load_state_dict(baseline_model.state_dict())
-    token_ids = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
-
-    baseline_quantizer, baseline_decoder = partial_gradients(
-        baseline_model,
-        token_ids,
-        loss_weight=1.0,
-        latent_gradient_scale=1.0,
-    )
-    split_quantizer, split_decoder = partial_gradients(
-        split_model,
-        token_ids,
-        loss_weight=0.01,
-        latent_gradient_scale=20.0,
-    )
-
-    assert len(baseline_quantizer) == len(split_quantizer)
-    assert len(baseline_decoder) == len(split_decoder)
-    for baseline_gradient, split_gradient in zip(
-        baseline_quantizer, split_quantizer
-    ):
-        torch.testing.assert_close(split_gradient, 0.2 * baseline_gradient)
-    for baseline_gradient, split_gradient in zip(baseline_decoder, split_decoder):
-        torch.testing.assert_close(split_gradient, 0.01 * baseline_gradient)
 
 
 def test_evaluate_reports_vq_diagnostics_by_scale() -> None:
@@ -440,8 +477,7 @@ def test_evaluate_reports_vq_diagnostics_by_scale() -> None:
         num_heads=2,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
-        encoder_dropout=0.0,
-        decoder_dropout=0.0,
+        dropout=0.0,
         pre_quant_num_groups=2,
     )
     batches = [

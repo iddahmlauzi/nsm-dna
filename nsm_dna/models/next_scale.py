@@ -100,7 +100,7 @@ class SharedOutputHead(nn.Module):
 
 
 class NSM(nn.Module):
-    """Predict a discrete VQ-VAE hierarchy from coarse to fine."""
+    """Predict every VQ-VAE scale after the supplied first scale."""
 
     def __init__(
         self,
@@ -147,7 +147,7 @@ class NSM(nn.Module):
                     padding=self.input_refinement_kernel_size // 2,
                     bias=bias,
                 )
-                for _ in self.scale_lengths[1:]
+                for _ in self.scale_lengths
             ]
         )
 
@@ -164,15 +164,8 @@ class NSM(nn.Module):
             bias=bias,
         )
 
-        # The first scale has no preceding reconstruction to use as input, so
-        # it receives learned BOS embeddings in model space.
-        self.bos = nn.Parameter(
-            torch.empty(1, self.scale_lengths[0], self.model_dim)
-        )
-        nn.init.normal_(self.bos, mean=0.0, std=0.02)
-
         # Reset RoPE positions do not identify the scale, so add one learned
-        # model-space vector per scale to the hierarchy hidden states.
+        # model-space vector per predicted scale to the hierarchy hidden states.
         self.scale_embedding = nn.Embedding(len(self.scale_lengths), self.model_dim)
         nn.init.normal_(self.scale_embedding.weight, mean=0.0, std=0.02)
 
@@ -279,7 +272,7 @@ class NSM(nn.Module):
         return cls(
             vq_embed_dim=tokenizer.quantization_dim,
             model_dim=config.model.model_dim,
-            scale_lengths=tokenizer.scale_lengths,
+            scale_lengths=tokenizer.scale_lengths[1:],
             codebook_size=tokenizer.codebook_sizes[0],
             num_layers=config.model.num_layers,
             num_heads=config.model.num_heads,
@@ -328,8 +321,8 @@ class NSM(nn.Module):
     ) -> list[Float[Tensor, "batch scale_length vq_dim"]]:
         """Adapt the tokenizer's resized reconstructions for NSM prediction.
 
-        Each target scale after the first receives a cumulative reconstruction
-        that the tokenizer has resized from the preceding scales. A separate
+        Each predicted scale receives a cumulative reconstruction that the
+        tokenizer has resized from the preceding scales. A separate
         Conv1d lets NSM learn a local correction for each resolution. The
         correction is added residually, and zero initialization makes this
         operation an identity at the start of training.
@@ -369,14 +362,9 @@ class NSM(nn.Module):
         hierarchy_reads_prefix = (row_section_ids >= 0) & (
             column_section_ids == -1
         )
-        later_scales_read_first_scale = (row_section_ids > 0) & (
-            column_section_ids == 0
-        )
         return einx.id(
             "row column -> 1 1 row column",
-            same_section
-            | hierarchy_reads_prefix
-            | later_scales_read_first_scale,
+            same_section | hierarchy_reads_prefix,
         )
 
     def _get_rotary_embeddings(self, prefix_length: int) -> RotaryEmbeddings:
@@ -413,28 +401,13 @@ class NSM(nn.Module):
         else:
             combined_inputs = torch.cat([prefix, hierarchy_inputs], dim=1)
 
-        projected_inputs = self.input_projection(combined_inputs)
-        prefix_hidden_states = projected_inputs[:, :prefix_length]
-        later_scale_hidden_states = projected_inputs[:, prefix_length:]
-
-        first_scale_hidden_states = self.bos.expand(
-            projected_inputs.shape[0],
-            -1,
-            -1,
-        )
-        hierarchy_hidden_states = torch.cat(
-            [first_scale_hidden_states, later_scale_hidden_states],
-            dim=1,
-        )
+        hidden_states = self.input_projection(combined_inputs)
+        hierarchy_hidden_states = hidden_states[:, prefix_length:]
         hierarchy_hidden_states = hierarchy_hidden_states + self.scale_embedding(
             self.scale_ids
         )
-
-        # The prefix comes first in the Transformer sequence; BOS begins the
-        # target hierarchy and is followed by the remaining scale inputs.
         hidden_states = torch.cat(
-            [prefix_hidden_states, hierarchy_hidden_states],
-            dim=1,
+            [hidden_states[:, :prefix_length], hierarchy_hidden_states], dim=1
         )
 
         attention_mask = self._build_attention_mask(prefix_length)

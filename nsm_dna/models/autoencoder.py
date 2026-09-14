@@ -10,8 +10,9 @@ from .common import (
     precompute_rope_cosine_and_sine,
 )
 from .sampling import (
-    make_cascaded_downsampler,
-    make_cascaded_upsampler,
+    ChannelsFirstLayerNorm,
+    make_learned_downsampler,
+    make_learned_upsampler,
 )
 
 
@@ -32,6 +33,9 @@ class Encoder(nn.Module):
         latent_length: int,
         embed_dim: int,
         quantization_dim: int,
+        num_heads: int = 1,
+        num_layers: int = 0,
+        use_qk_norm: bool = False,
         dropout: float = 0.0,
         bias: bool = False,
     ) -> None:
@@ -39,12 +43,22 @@ class Encoder(nn.Module):
 
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         self.drop = nn.Dropout(dropout)
-        self.downsampler = make_cascaded_downsampler(
+        self.context_blocks = nn.ModuleList(
+            TransformerBlock(
+                embed_dim,
+                num_heads,
+                dropout=dropout,
+                bias=bias,
+                use_qk_norm=use_qk_norm,
+            )
+            for _ in range(num_layers)
+        )
+        self.downsampler = make_learned_downsampler(
             embed_dim,
-            total_stride=_sampling_factor(context_length, latent_length),
-            base_stride=2,
+            stride=_sampling_factor(context_length, latent_length),
             bias=bias,
         )
+        self.downsampling_norm = ChannelsFirstLayerNorm(embed_dim)
         self.quantization_projection = nn.Linear(
             embed_dim,
             quantization_dim,
@@ -56,9 +70,19 @@ class Encoder(nn.Module):
         token_ids: Int[Tensor, "batch length"],
     ) -> Float[Tensor, "batch latent_length quantization_dim"]:
         x = self.drop(self.token_embedding(token_ids))
+        for block in self.context_blocks:
+            x = block(x, is_causal=False)
         x = einx.id("b l d -> b d l", x)
+        # Create the shorter continuous latent that the multiscale quantizer models;
+        # the quantization scales describe this latent rather than the full input.
         x = self.downsampler(x)
+        x = self.downsampling_norm(x)
         x = einx.id("b d l -> b l d", x)
+        # Reduce each encoder vector from embed_dim to quantization_dim before
+        # finding its nearest code. With many independently varying dimensions and
+        # only a fixed number of codebook vectors, even the nearest code may be a
+        # poor match. Fewer dimensions mean fewer combinations for the codebook to
+        # represent, making a closer match more likely.
         return self.quantization_projection(x)
 
 
@@ -75,14 +99,13 @@ class Decoder(nn.Module):
         num_heads: int,
         max_context_length: int | None = None,
         num_layers: int = 1,
+        use_qk_norm: bool = False,
         dropout: float = 0.1,
         bias: bool = False,
         rope_base: float = 10000.0,
     ) -> None:
         super().__init__()
 
-        if num_layers <= 0:
-            raise ValueError("num_layers must be positive.")
         max_context_length = max_context_length or context_length
         if max_context_length < context_length:
             raise ValueError("max_context_length cannot be shorter than context_length.")
@@ -102,25 +125,19 @@ class Decoder(nn.Module):
             embed_dim,
             bias=bias,
         )
-        self.block = TransformerBlock(
-            embed_dim,
-            num_heads,
-            dropout=dropout,
-            bias=bias,
-        )
-        self.additional_blocks = nn.ModuleList(
+        self.blocks = nn.ModuleList(
             TransformerBlock(
                 embed_dim,
                 num_heads,
                 dropout=dropout,
                 bias=bias,
+                use_qk_norm=use_qk_norm,
             )
-            for _ in range(num_layers - 1)
+            for _ in range(num_layers)
         )
-        self.upsampler = make_cascaded_upsampler(
+        self.upsampler = make_learned_upsampler(
             embed_dim,
-            total_stride=_sampling_factor(context_length, latent_length),
-            base_stride=2,
+            stride=_sampling_factor(context_length, latent_length),
             bias=bias,
         )
         self.final_norm = LayerNorm(embed_dim, bias=bias)
@@ -145,12 +162,7 @@ class Decoder(nn.Module):
             self.rope_sine[:output_length],
         )
 
-        x = self.block(
-            x,
-            rotary_embeddings=rotary_embeddings,
-            is_causal=False,
-        )
-        for block in self.additional_blocks:
+        for block in self.blocks:
             x = block(
                 x,
                 rotary_embeddings=rotary_embeddings,

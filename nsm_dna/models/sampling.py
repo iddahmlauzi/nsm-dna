@@ -5,7 +5,7 @@ from jaxtyping import Float
 from torch import Tensor
 
 
-def _make_learned_downsampler(
+def make_learned_downsampler(
     embed_dim: int,
     stride: int,
     bias: bool,
@@ -30,7 +30,7 @@ def _make_learned_downsampler(
     return downsampler
 
 
-def _make_learned_upsampler(
+def make_learned_upsampler(
     embed_dim: int,
     stride: int,
     bias: bool,
@@ -107,7 +107,7 @@ def make_cascaded_downsampler(
     modules: list[nn.Module] = []
 
     for stride in strides:
-        modules.append(_make_learned_downsampler(embed_dim, stride, bias))
+        modules.append(make_learned_downsampler(embed_dim, stride, bias))
         # Interstage norms prevent numerical gain from compounding. The final norm
         # fixes the scale presented to the next component.
         modules.append(ChannelsFirstLayerNorm(embed_dim))
@@ -125,7 +125,7 @@ def make_cascaded_upsampler(
     """Reverse a cascaded downsampler with learned transposed convolutions."""
     return nn.Sequential(
         *(
-            _make_learned_upsampler(embed_dim, stride, bias)
+            make_learned_upsampler(embed_dim, stride, bias)
             for stride in reversed(_plan_cascade_strides(total_stride, base_stride))
         )
     )
