@@ -6,8 +6,6 @@ import torch.nn.functional as F
 from jaxtyping import Float, Int
 from torch import Tensor
 
-from .sampling import make_cascaded_downsampler, make_cascaded_upsampler
-
 
 class EMACodebook(nn.Module):
     """Vector-quantization codebook updated with exponential moving averages."""
@@ -15,18 +13,18 @@ class EMACodebook(nn.Module):
     def __init__(
         self,
         codebook_size: int,
-        embed_dim: int,
+        quantization_dim: int,
         decay: float = 0.99,
         eps: float = 1e-5,
     ) -> None:
         super().__init__()
 
         self.codebook_size = codebook_size
-        self.embed_dim = embed_dim
+        self.quantization_dim = quantization_dim
         self.base_decay = decay
         self.eps = eps
 
-        codebook = torch.randn(codebook_size, embed_dim)
+        codebook = torch.randn(codebook_size, quantization_dim)
         self.register_buffer("codebook", codebook)
         self.register_buffer("ema_counts", torch.ones(codebook_size))
         self.register_buffer("ema_vector_sums", codebook.clone())
@@ -45,9 +43,9 @@ class EMACodebook(nn.Module):
 
     def forward(
         self,
-        x: Float[Tensor, "batch length embed_dim"],
+        x: Float[Tensor, "batch length quantization_dim"],
     ) -> tuple[
-        Float[Tensor, "batch length embed_dim"],
+        Float[Tensor, "batch length quantization_dim"],
         Int[Tensor, "batch length"],
     ]:
         flat_input = einx.id("b l d -> (b l) d", x.detach().float())
@@ -106,54 +104,6 @@ class EMACodebook(nn.Module):
         return self.codebook_hits.float().mean()
 
 
-# ----------------------------------------------------------------------
-# Per-scale blended convolution
-#
-# Each codebook produces quantized vectors at its scale. These vectors are
-# upsampled to the full latent length when necessary; the final scale is already
-# full length.
-#
-# BlendedConv1d lets neighboring quantized positions interact before this scale's
-# contribution is added to the reconstruction. This can correct local artifacts
-# introduced by quantization and upsampling.
-#
-# refined = (1 - ratio) * quantized + ratio * Conv1d(quantized)
-#
-# Each scale has its own trainable convolution. The fixed refinement ratio
-# defaults to 0.5, the empirically best configuration in the NCM ablations.
-# ----------------------------------------------------------------------
-class BlendedConv1d(nn.Module):
-    """Blend an input with a learned one-dimensional convolution."""
-
-    def __init__(
-        self,
-        embed_dim: int,
-        refinement_ratio: float = 0.5,
-        kernel_size: int = 3,
-    ) -> None:
-        super().__init__()
-
-        if kernel_size % 2 == 0:
-            raise ValueError("kernel_size must be odd to preserve sequence length.")
-
-        self.refinement_ratio = refinement_ratio
-        self.conv = nn.Conv1d(
-            embed_dim,
-            embed_dim,
-            kernel_size=kernel_size,
-            padding=kernel_size // 2,
-        )
-
-    def forward(
-        self,
-        x: Float[Tensor, "batch embed_dim length"],
-    ) -> Float[Tensor, "batch embed_dim length"]:
-        # Blend the original contribution with its locally refined form.
-        convolved = self.conv(x)
-        refined = x * (1 - self.refinement_ratio) + convolved * self.refinement_ratio
-        return refined
-
-
 class MultiscaleResidualVectorQuantizer(nn.Module):
     """Multiscale residual vector quantizer."""
 
@@ -161,144 +111,100 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         self,
         scale_lengths: list[int],
         codebook_sizes: list[int],
-        embed_dim: int,
+        quantization_dim: int,
         *,
         latent_length: int,
         # Codebook updates and quantization loss
         commitment_cost: float = 0.25,
         decay: float = 0.99,
         eps: float = 1e-5,
-        code_corruption: bool = False,
-        # Per-scale post-quantization refinement
-        refinement_ratio: float = 0.5,
-        refinement_kernel_size: int = 3,
     ) -> None:
         super().__init__()
 
         if len(scale_lengths) != len(codebook_sizes):
             raise ValueError("Each scale length must have one codebook size.")
+        if scale_lengths[-1] != latent_length:
+            raise ValueError("The final scale length must equal the latent length.")
 
-        self.scale_lengths = scale_lengths
-        self.codebook_sizes = codebook_sizes
-        self.embed_dim = embed_dim
+        self.scale_lengths = list(scale_lengths)
+        self.codebook_sizes = list(codebook_sizes)
+        self.quantization_dim = quantization_dim
         self.latent_length = latent_length
         self.commitment_cost = commitment_cost
-        self.code_corruption = code_corruption
-        self.refinement_ratio = refinement_ratio
-        self.refinement_kernel_size = refinement_kernel_size
-
-        first_scale_length = scale_lengths[0]
-        if self.scale_lengths[-1] != self.latent_length:
-            raise ValueError("The final scale length must equal the latent length.")
-        if self.latent_length % first_scale_length != 0:
-            raise ValueError(
-                "The latent length must be divisible by the first scale length."
-            )
-
-        # Factor the large first-scale stride into small learned stages so its
-        # parameter count grows with the number of stages, not the full kernel.
-        first_scale_stride = self.latent_length // first_scale_length
-        self.first_scale_downsampler = make_cascaded_downsampler(
-            embed_dim,
-            total_stride=first_scale_stride,
-        )
-        self.first_scale_upsampler = make_cascaded_upsampler(
-            embed_dim,
-            total_stride=first_scale_stride,
-        )
 
         self.codebooks = nn.ModuleList(
-            EMACodebook(codebook_size, embed_dim, decay=decay, eps=eps)
-            for codebook_size in codebook_sizes
-        )
-        self.refiners = nn.ModuleList(
-            BlendedConv1d(
-                embed_dim,
-                refinement_ratio=refinement_ratio,
-                kernel_size=refinement_kernel_size,
+            EMACodebook(
+                codebook_size,
+                quantization_dim,
+                decay=decay,
+                eps=eps,
             )
-            for _ in scale_lengths
+            for codebook_size in codebook_sizes
         )
 
     def _resize_to_scale(
         self,
-        latent: Float[Tensor, "batch length embed_dim"],
+        latent: Float[Tensor, "batch length quantization_dim"],
         scale_index: int,
-    ) -> Float[Tensor, "batch scale_length embed_dim"]:
-        """Resize a full-length latent tensor to the selected scale.
-
-        The first scale uses cascaded learned strided convolutions. Other scales
-        use area interpolation unless a scale matches the full latent length.
-        """
+    ) -> Float[Tensor, "batch scale_length quantization_dim"]:
+        """Average equal, non-overlapping latent blocks into one scale."""
         scale_length = self.scale_lengths[scale_index]
         if scale_length == self.latent_length:
             return latent
 
-        # Conv1d and one-dimensional interpolation expect channels first.
+        # Area interpolation computes one mean for each contiguous latent block.
         latent = einx.id("b l d -> b d l", latent)
-        if scale_index == 0:
-            resized_latent = self.first_scale_downsampler(latent)
-        else:
-            resized_latent = F.interpolate(
-                latent,
-                size=scale_length,
-                mode="area",
-            )
+        resized_latent = F.interpolate(
+            latent,
+            size=scale_length,
+            mode="area",
+        )
 
         return einx.id("b d l -> b l d", resized_latent)
 
     def _upsample_to_full_length(
         self,
-        quantized: Float[Tensor, "batch embed_dim scale_length"],
+        quantized: Float[Tensor, "batch quantization_dim scale_length"],
         scale_index: int,
-    ) -> Float[Tensor, "batch embed_dim length"]:
-        """Upsample a quantized contribution to the full latent length.
-
-        The first scale uses a learned transposed convolution. Other scales use
-        linear interpolation unless a scale matches the full latent length.
-        The channels-first layout can pass directly into BlendedConv1d afterward.
-        """
-        if self.scale_lengths[scale_index] == self.latent_length:
+    ) -> Float[Tensor, "batch quantization_dim length"]:
+        """Repeat each scale vector across its corresponding latent block."""
+        scale_length = self.scale_lengths[scale_index]
+        if scale_length == self.latent_length:
             return quantized
 
-        if scale_index == 0:
-            return self.first_scale_upsampler(quantized)
-
-        return F.interpolate(
-            quantized,
-            size=self.latent_length,
-            mode="linear",
-            align_corners=False,
-        )
+        repeats_per_position = self.latent_length // scale_length
+        return quantized.repeat_interleave(repeats_per_position, dim=-1)
 
     def _prepare_scale_contribution(
         self,
-        quantized_at_scale: Float[Tensor, "batch scale_length embed_dim"],
+        quantized_at_scale: Float[
+            Tensor,
+            "batch scale_length quantization_dim",
+        ],
         scale_index: int,
-    ) -> Float[Tensor, "batch length embed_dim"]:
-        """Upsample and refine one scale's quantized vectors."""
+    ) -> Float[Tensor, "batch length quantization_dim"]:
+        """Expand one scale's quantized vectors to the full latent length."""
         quantized_at_scale = einx.id("b l d -> b d l", quantized_at_scale)
         scale_contribution = self._upsample_to_full_length(
             quantized_at_scale,
             scale_index,
         )
-        scale_contribution = self.refiners[scale_index](scale_contribution)
         return einx.id("b d l -> b l d", scale_contribution)
 
     def forward(
         self,
-        x: Float[Tensor, "batch length embed_dim"],
+        x: Float[Tensor, "batch length quantization_dim"],
         *,
-        include_truncated_reconstruction: bool = False,
+        include_partial_reconstruction: bool = False,
     ) -> tuple[
-        Float[Tensor, "batch length embed_dim"],
-        Float[Tensor, "batch length embed_dim"] | None,
+        Float[Tensor, "batch length quantization_dim"],
+        Float[Tensor, "batch length quantization_dim"] | None,
         Float[Tensor, ""],
         list[Int[Tensor, "batch scale_length"]],
     ]:
         """Quantize an encoder latent into cumulative multiscale contributions.
 
-        When truncated reconstruction is enabled, the second return value is one
+        When partial reconstruction is enabled, the second return value is one
         randomly selected non-final cumulative latent. The caller decodes that
         latent and computes the auxiliary reconstruction loss against the input
         tokens.
@@ -308,128 +214,61 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         # Quantize the encoder output without backpropagating through the residual
         # hierarchy. The commitment loss and final STE provide encoder gradients.
         detached_x = x.detach()
-        residual = detached_x.clone()
+        residual = detached_x
         reconstruction = torch.zeros_like(residual)
-        corrupt_decoder_input = self.training and self.code_corruption
-        decoder_reconstruction = (
-            torch.zeros_like(residual) if corrupt_decoder_input else None
-        )
 
-        truncated_scale_index = None
-        if include_truncated_reconstruction:
-            if len(self.scale_lengths) < 2:
-                raise ValueError(
-                    "Truncated reconstruction requires at least two quantization scales."
-                )
-            truncated_scale_index = torch.randint(
+        partial_scale_index = None
+        if include_partial_reconstruction:
+            partial_scale_index = torch.randint(
                 low=0,
                 high=len(self.scale_lengths) - 1,
                 size=(),
             ).item()
 
         indices_by_scale: list[Int[Tensor, "batch scale_length"]] = []
-        truncated_quantized_latent: Tensor | None = None
-        vq_loss = x.new_zeros(())
+        partial_quantized_latent: Tensor | None = None
 
         for scale_index, codebook in enumerate(self.codebooks):
             scaled_residual = self._resize_to_scale(residual, scale_index)
             quantized_at_scale, scale_indices = codebook(scaled_residual)
             indices_by_scale.append(scale_indices)
 
-            # Only the first scale has learned downsampler weights to train. Its
-            # nearest-code lookup blocks gradients, so this uses the selected code
-            # during forward but passes backward gradients into the downsampler.
-            # Later scales use fixed area interpolation and therefore need no STE.
-            if scale_index == 0 and len(self.scale_lengths) > 1:
-                quantized_at_scale = (
-                    scaled_residual + (quantized_at_scale - scaled_residual).detach()
-                )
-
             scale_contribution = self._prepare_scale_contribution(
                 quantized_at_scale,
                 scale_index,
             )
-
             reconstruction = reconstruction + scale_contribution
-
-            # Make every cumulative hierarchy approximate the encoder latent so
-            # coarse scales cannot rely on the final scale to repair them.
-            vq_loss = vq_loss + self.commitment_cost * F.mse_loss(
-                reconstruction.detach(),
-                x,
-            )
-            vq_loss = vq_loss + F.mse_loss(reconstruction, detached_x)
-
-            if decoder_reconstruction is not None:
-                decoder_scale_contribution = scale_contribution
-                # The next-scale model receives the true first scale directly
-                # instead of predicting it from BOS, so only later scales are corrupted.
-                if scale_index > 0:
-                    batch_size = scale_indices.shape[0]
-                    corruption_probability = torch.rand(
-                        batch_size,
-                        1,
-                        device=scale_indices.device,
-                    )
-                    corruption_mask = (
-                        torch.rand_like(scale_indices, dtype=torch.float32)
-                        < corruption_probability
-                    )
-                    decoder_indices = torch.where(
-                        corruption_mask,
-                        torch.randint_like(scale_indices, codebook.codebook_size),
-                        scale_indices,
-                    )
-                    decoder_quantized_at_scale = codebook.codebook[decoder_indices]
-                    decoder_scale_contribution = self._prepare_scale_contribution(
-                        decoder_quantized_at_scale,
-                        scale_index,
-                    )
-                decoder_reconstruction = (
-                    decoder_reconstruction + decoder_scale_contribution
-                )
-
             residual = residual - scale_contribution
 
-            if scale_index == truncated_scale_index:
-                # Give the decoder the truncated hierarchy while passing its
-                # reconstruction gradient directly to the encoder latent.
-                truncated_reconstruction = (
-                    decoder_reconstruction
-                    if decoder_reconstruction is not None
-                    else reconstruction
-                )
-                truncated_quantized_latent = x + (
-                    truncated_reconstruction - x
-                ).detach()
+            if scale_index == partial_scale_index:
+                partial_quantized_latent = x + (reconstruction - x).detach()
 
-        vq_loss = vq_loss / len(self.scale_lengths)
-
-        # Give the decoder the possibly corrupted hierarchy while passing its
-        # reconstruction gradients directly to the clean encoder latent.
-        decoder_reconstruction = (
-            decoder_reconstruction
-            if decoder_reconstruction is not None
-            else reconstruction
+        commitment_loss = self.commitment_cost * F.mse_loss(
+            x,
+            reconstruction.detach(),
         )
-        quantized_latent = x + (decoder_reconstruction - x).detach()
+        quantized_latent = x + (reconstruction - x).detach()
 
-        return quantized_latent, truncated_quantized_latent, vq_loss, indices_by_scale
+        return (
+            quantized_latent,
+            partial_quantized_latent,
+            commitment_loss,
+            indices_by_scale,
+        )
 
     @torch.no_grad()
     def indices_to_cumulative_latents(
         self,
         indices_by_scale: list[Int[Tensor, "batch scale_length"]],
-    ) -> list[Float[Tensor, "batch length embed_dim"]]:
+    ) -> list[Float[Tensor, "batch length quantization_dim"]]:
         """Reconstruct the latent after successively adding each scale."""
         batch_size = indices_by_scale[0].shape[0]
-        full_length = self.latent_length
         reconstruction = self.codebooks[0].codebook.new_zeros(
             batch_size,
-            full_length,
-            self.embed_dim,
+            self.latent_length,
+            self.quantization_dim,
         )
-        cumulative_latents = []
+        cumulative_latents: list[Tensor] = []
 
         for scale_index, (codebook, scale_indices) in enumerate(
             zip(self.codebooks, indices_by_scale)
@@ -448,43 +287,28 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
     def indices_to_next_scale_inputs(
         self,
         indices_by_scale: list[Int[Tensor, "batch scale_length"]],
-    ) -> list[Float[Tensor, "batch scale_length embed_dim"]]:
+    ) -> list[Float[Tensor, "batch scale_length quantization_dim"]]:
         """Construct the teacher-forced scale inputs for NSM-DNA.
 
         Each scale input is the cumulative reconstruction through the
         preceding scale, resized to the length of the scale to be predicted.
         """
-        batch_size = indices_by_scale[0].shape[0]
-        full_length = self.latent_length
-        reconstruction = self.codebooks[0].codebook.new_zeros(
-            batch_size,
-            full_length,
-            self.embed_dim,
+        cumulative_latents = self.indices_to_cumulative_latents(
+            indices_by_scale[:-1]
         )
-        next_scale_inputs = []
-
-        preceding_scales = zip(self.codebooks[:-1], indices_by_scale[:-1])
-        for scale_index, (codebook, scale_indices) in enumerate(preceding_scales):
-            quantized_at_scale = codebook.codebook[scale_indices]
-            scale_contribution = self._prepare_scale_contribution(
-                quantized_at_scale,
-                scale_index,
-            )
-            reconstruction = reconstruction + scale_contribution
-
-            next_scale_input = self._resize_to_scale(
-                reconstruction,
+        return [
+            self._resize_to_scale(
+                cumulative_latent,
                 scale_index=scale_index + 1,
             )
-            next_scale_inputs.append(next_scale_input)
-
-        return next_scale_inputs
+            for scale_index, cumulative_latent in enumerate(cumulative_latents)
+        ]
 
     @torch.no_grad()
     def indices_to_next_scale_input(
         self,
         preceding_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
-    ) -> Float[Tensor, "batch next_scale_length embed_dim"]:
+    ) -> Float[Tensor, "batch next_scale_length quantization_dim"]:
         """Construct the next input from an autoregressively predicted prefix."""
         cumulative_latent = self.indices_to_cumulative_latents(
             preceding_indices_by_scale
