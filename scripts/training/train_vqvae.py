@@ -29,6 +29,7 @@ def evaluate(
     model: VQVAE,
     data_loader: DataLoader,
     use_mixed_precision: bool,
+    partial_reconstruction_weight: float,
     max_batches: int | None = None,
 ) -> dict[str, float]:
     """Evaluate full and cumulative reconstruction without updating codebooks.
@@ -39,8 +40,8 @@ def evaluate(
     model.eval()
     device = next(model.parameters()).device
 
-    reconstruction_loss_sum = 0.0
-    vq_loss_sum = 0.0
+    full_reconstruction_loss_sum = 0.0
+    commitment_loss_sum = 0.0
     correct_tokens = 0
     num_tokens = 0
     num_batches = 0
@@ -61,7 +62,7 @@ def evaluate(
         for codebook_size in model.codebook_sizes
     ]
 
-    # Encoder magnitude, which GroupNorm should keep stable.
+    # Encoder magnitude, which position-wise LayerNorm should keep stable.
     encoder_latent_squared_sum = 0.0
     num_latent_values = 0
 
@@ -75,8 +76,8 @@ def evaluate(
             dtype=torch.bfloat16,
             enabled=use_mixed_precision,
         ):
-            logits, _, vq_loss, indices_by_scale = model(input_ids)
-            reconstruction_loss = F.cross_entropy(
+            logits, _, commitment_loss, indices_by_scale = model(input_ids)
+            full_reconstruction_loss = F.cross_entropy(
                 logits.flatten(0, 1),
                 input_ids.flatten(),
             )
@@ -118,8 +119,8 @@ def evaluate(
                 minlength=model.codebook_sizes[scale_index],
             )
 
-        reconstruction_loss_sum += reconstruction_loss.item()
-        vq_loss_sum += vq_loss.item()
+        full_reconstruction_loss_sum += full_reconstruction_loss.item()
+        commitment_loss_sum += commitment_loss.item()
         correct_tokens += (logits.argmax(dim=-1) == input_ids).sum().item()
         num_tokens += input_ids.numel()
         num_batches += 1
@@ -127,12 +128,20 @@ def evaluate(
     if was_training:
         model.train()
 
-    reconstruction_loss = reconstruction_loss_sum / num_batches
-    vq_loss = vq_loss_sum / num_batches
+    full_reconstruction_loss = full_reconstruction_loss_sum / num_batches
+    partial_reconstruction_loss = sum(
+        reconstruction_loss_sums_by_scale[:-1]
+    ) / ((len(model.scale_lengths) - 1) * num_batches)
+    commitment_loss = commitment_loss_sum / num_batches
     metrics = {
-        "reconstruction_loss": reconstruction_loss,
-        "vq_loss": vq_loss,
-        "total_loss": reconstruction_loss + vq_loss,
+        "full_reconstruction_loss": full_reconstruction_loss,
+        "partial_reconstruction_loss": partial_reconstruction_loss,
+        "commitment_loss": commitment_loss,
+        "total_loss": (
+            full_reconstruction_loss
+            + partial_reconstruction_weight * partial_reconstruction_loss
+            + commitment_loss
+        ),
         "accuracy": correct_tokens / num_tokens,
         "encoder_latent_rms": (encoder_latent_squared_sum / num_latent_values) ** 0.5,
     }
@@ -215,7 +224,6 @@ def main(config: DictConfig) -> None:
     )
 
     # Keep DataLoader iterator seeding separate from the model's random state.
-    # Otherwise, starting validation changes later dropout and fine-dropout choices.
     train_generator = torch.Generator().manual_seed(
         config.run.seed + distributed_environment.rank
     )
@@ -253,19 +261,13 @@ def main(config: DictConfig) -> None:
         num_heads=config.model.num_heads,
         scale_lengths=list(config.model.scale_lengths),
         codebook_sizes=list(config.model.codebook_sizes),
-        dropout=config.model.dropout,
-        encoder_num_layers=config.model.encoder_num_layers,
         decoder_num_layers=config.model.decoder_num_layers,
         use_qk_norm=config.model.use_qk_norm,
         bias=config.model.bias,
         rope_base=config.model.rope_base,
-        pre_quant_num_groups=config.model.pre_quant_num_groups,
         commitment_cost=config.model.commitment_cost,
         decay=config.model.decay,
         eps=config.model.eps,
-        code_corruption=config.model.code_corruption,
-        refinement_ratio=config.model.refinement_ratio,
-        refinement_kernel_size=config.model.refinement_kernel_size,
     )
 
     device = distributed_environment.device
@@ -339,14 +341,13 @@ def main(config: DictConfig) -> None:
         disable=not distributed_environment.is_main_process,
     )
     gradient_accumulation_steps = config.optimizer.gradient_accumulation_steps
-    full_reconstruction_weight = config.model.full_reconstruction_weight
-    truncated_reconstruction_weight = config.model.truncated_reconstruction_weight
+    partial_reconstruction_weight = config.model.partial_reconstruction_weight
 
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
         full_reconstruction_loss_sum = 0.0
-        truncated_reconstruction_loss_sum = 0.0
-        vq_loss_sum = 0.0
+        partial_reconstruction_loss_sum = 0.0
+        commitment_loss_sum = 0.0
 
         for micro_step in range(gradient_accumulation_steps):
             try:
@@ -373,24 +374,24 @@ def main(config: DictConfig) -> None:
                     dtype=torch.bfloat16,
                     enabled=use_mixed_precision,
                 ):
-                    full_logits, truncated_logits, vq_loss, _ = training_model(
+                    full_logits, partial_logits, commitment_loss, _ = training_model(
                         input_ids,
-                        include_truncated_reconstruction=True,
+                        include_partial_reconstruction=True,
                     )
-                    assert truncated_logits is not None
+                    assert partial_logits is not None
                     full_reconstruction_loss = F.cross_entropy(
                         full_logits.flatten(0, 1),
                         input_ids.flatten(),
                     )
-                    truncated_reconstruction_loss = F.cross_entropy(
-                        truncated_logits.flatten(0, 1),
+                    partial_reconstruction_loss = F.cross_entropy(
+                        partial_logits.flatten(0, 1),
                         input_ids.flatten(),
                     )
                     loss = (
-                        full_reconstruction_weight * full_reconstruction_loss
-                        + truncated_reconstruction_weight
-                        * truncated_reconstruction_loss
-                        + vq_loss
+                        full_reconstruction_loss
+                        + partial_reconstruction_weight
+                        * partial_reconstruction_loss
+                        + commitment_loss
                     )
                     accumulated_loss = loss / gradient_accumulation_steps
                 accumulated_loss.backward()
@@ -398,10 +399,12 @@ def main(config: DictConfig) -> None:
             full_reconstruction_loss_sum += (
                 full_reconstruction_loss.item() / gradient_accumulation_steps
             )
-            truncated_reconstruction_loss_sum += (
-                truncated_reconstruction_loss.item() / gradient_accumulation_steps
+            partial_reconstruction_loss_sum += (
+                partial_reconstruction_loss.item() / gradient_accumulation_steps
             )
-            vq_loss_sum += vq_loss.item() / gradient_accumulation_steps
+            commitment_loss_sum += (
+                commitment_loss.item() / gradient_accumulation_steps
+            )
 
         # Limit unusually large parameter updates before the optimizer step.
         gradient_norm = torch.nn.utils.clip_grad_norm_(
@@ -418,8 +421,8 @@ def main(config: DictConfig) -> None:
             loss_sums = torch.tensor(
                 [
                     full_reconstruction_loss_sum,
-                    truncated_reconstruction_loss_sum,
-                    vq_loss_sum,
+                    partial_reconstruction_loss_sum,
+                    commitment_loss_sum,
                 ],
                 device=device,
             )
@@ -430,24 +433,24 @@ def main(config: DictConfig) -> None:
             if distributed_environment.is_main_process:
                 (
                     full_reconstruction_loss_value,
-                    truncated_reconstruction_loss_value,
-                    vq_loss_value,
+                    partial_reconstruction_loss_value,
+                    commitment_loss_value,
                 ) = loss_sums.tolist()
                 total_loss_value = (
-                    full_reconstruction_weight * full_reconstruction_loss_value
-                    + truncated_reconstruction_weight
-                    * truncated_reconstruction_loss_value
-                    + vq_loss_value
+                    full_reconstruction_loss_value
+                    + partial_reconstruction_weight
+                    * partial_reconstruction_loss_value
+                    + commitment_loss_value
                 )
                 global_utilization = model.global_utilization.item()
                 progress_bar.set_postfix(
                     full_reconstruction_loss=(
                         f"{full_reconstruction_loss_value:.4f}"
                     ),
-                    truncated_reconstruction_loss=(
-                        f"{truncated_reconstruction_loss_value:.4f}"
+                    partial_reconstruction_loss=(
+                        f"{partial_reconstruction_loss_value:.4f}"
                     ),
-                    vq_loss=f"{vq_loss_value:.4f}",
+                    commitment_loss=f"{commitment_loss_value:.4f}",
                     total_loss=f"{total_loss_value:.4f}",
                 )
 
@@ -457,10 +460,10 @@ def main(config: DictConfig) -> None:
                             "train/full_reconstruction_loss": (
                                 full_reconstruction_loss_value
                             ),
-                            "train/truncated_reconstruction_loss": (
-                                truncated_reconstruction_loss_value
+                            "train/partial_reconstruction_loss": (
+                                partial_reconstruction_loss_value
                             ),
-                            "train/vq_loss": vq_loss_value,
+                            "train/commitment_loss": commitment_loss_value,
                             "train/total_loss": total_loss_value,
                             "train/gradient_norm": gradient_norm.item(),
                             "train/learning_rate": learning_rate,
@@ -476,19 +479,28 @@ def main(config: DictConfig) -> None:
                     model,
                     validation_loader,
                     use_mixed_precision,
+                    partial_reconstruction_weight,
                     max_batches=config.evaluation.max_batches,
                 )
                 tqdm.write(
                     f"step {step} validation: "
-                    f"reconstruction loss "
-                    f"{validation_metrics['reconstruction_loss']:.4f}, "
-                    f"VQ loss {validation_metrics['vq_loss']:.4f}, "
+                    f"full reconstruction loss "
+                    f"{validation_metrics['full_reconstruction_loss']:.4f}, "
+                    f"partial reconstruction loss "
+                    f"{validation_metrics['partial_reconstruction_loss']:.4f}, "
+                    f"commitment loss "
+                    f"{validation_metrics['commitment_loss']:.4f}, "
                     f"total loss {validation_metrics['total_loss']:.4f}, "
                     f"accuracy {validation_metrics['accuracy']:.2%}"
                 )
 
-                if validation_metrics["reconstruction_loss"] < best_validation_loss:
-                    best_validation_loss = validation_metrics["reconstruction_loss"]
+                if (
+                    validation_metrics["full_reconstruction_loss"]
+                    < best_validation_loss
+                ):
+                    best_validation_loss = validation_metrics[
+                        "full_reconstruction_loss"
+                    ]
                     best_checkpoint_path = save_training_checkpoint(
                         run_directory,
                         model,
@@ -528,10 +540,15 @@ def main(config: DictConfig) -> None:
 
                 if wandb_run is not None:
                     wandb_metrics = {
-                        "validation/reconstruction_loss": validation_metrics[
-                            "reconstruction_loss"
+                        "validation/full_reconstruction_loss": validation_metrics[
+                            "full_reconstruction_loss"
                         ],
-                        "validation/vq_loss": validation_metrics["vq_loss"],
+                        "validation/partial_reconstruction_loss": validation_metrics[
+                            "partial_reconstruction_loss"
+                        ],
+                        "validation/commitment_loss": validation_metrics[
+                            "commitment_loss"
+                        ],
                         "validation/total_loss": validation_metrics["total_loss"],
                         "validation/accuracy": validation_metrics["accuracy"],
                         "validation/encoder_latent_rms": validation_metrics[

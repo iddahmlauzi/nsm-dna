@@ -1,6 +1,5 @@
 from pathlib import Path
 
-import einx
 import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
@@ -25,34 +24,15 @@ class VQVAE(nn.Module):
         scale_lengths: list[int],
         codebook_sizes: list[int],
         *,
-        # Encoder and decoder
-        dropout: float = 0.1,
-        encoder_num_layers: int = 0,
         decoder_num_layers: int = 1,
         use_qk_norm: bool = False,
         bias: bool = False,
         rope_base: float = 10000.0,
-        pre_quant_num_groups: int | None = None,
-        # Codebook updates and quantization loss
         commitment_cost: float = 0.25,
         decay: float = 0.99,
         eps: float = 1e-5,
-        code_corruption: bool = False,
-        # Per-scale post-quantization refinement
-        refinement_ratio: float = 0.5,
-        refinement_kernel_size: int = 3,
     ) -> None:
         super().__init__()
-
-        if not scale_lengths or scale_lengths[-1] != latent_length:
-            raise ValueError("The final scale length must equal the latent length.")
-        if pre_quant_num_groups is not None and (
-            pre_quant_num_groups <= 0
-            or quantization_dim % pre_quant_num_groups != 0
-        ):
-            raise ValueError(
-                "pre_quant_num_groups must evenly divide quantization_dim."
-            )
 
         self.vocab_size = vocab_size
         self.context_length = context_length
@@ -60,7 +40,6 @@ class VQVAE(nn.Module):
         self.embed_dim = embed_dim
         self.quantization_dim = quantization_dim
         self.num_heads = num_heads
-        self.encoder_num_layers = encoder_num_layers
         self.decoder_num_layers = decoder_num_layers
         self.use_qk_norm = use_qk_norm
         self.rope_base = rope_base
@@ -73,32 +52,7 @@ class VQVAE(nn.Module):
             self.latent_length,
             self.embed_dim,
             self.quantization_dim,
-            num_heads=self.num_heads,
-            num_layers=self.encoder_num_layers,
-            use_qk_norm=self.use_qk_norm,
-            dropout=dropout,
             bias=bias,
-        )
-
-        # Normalize the encoder output before comparing it with codebook vectors.
-        # Quantization uses squared Euclidean distance, and the commitment loss is
-        # ||z - e||^2, where z is an encoder vector and e is its selected codebook
-        # vector. Both therefore depend on the numerical magnitude of these vectors.
-        #
-        # Reconstruction loss only measures the decoder's predictions. It does not
-        # require a particular magnitude for z because the decoder can adjust its
-        # downstream transformations to produce similar predictions from larger
-        # encoder values. The encoder magnitude can therefore drift upward even when
-        # reconstruction is improving, forcing the codebook to follow and increasing
-        # the VQ loss. NCM observed that loss rise from about 3 to 31 over 5,000 steps.
-        #
-        # GroupNorm keeps the encoder values at a fixed statistical scale. Its normal
-        # affine transform would apply a learned per-channel scale after normalization,
-        # allowing the model to increase their magnitude again, so affine is disabled.
-        self.pre_quant_norm = (
-            nn.GroupNorm(pre_quant_num_groups, self.quantization_dim, affine=False)
-            if pre_quant_num_groups is not None
-            else None
         )
 
         self.quantizer = MultiscaleResidualVectorQuantizer(
@@ -109,9 +63,6 @@ class VQVAE(nn.Module):
             commitment_cost=commitment_cost,
             decay=decay,
             eps=eps,
-            code_corruption=code_corruption,
-            refinement_ratio=refinement_ratio,
-            refinement_kernel_size=refinement_kernel_size,
         )
         self.decoder = Decoder(
             self.vocab_size,
@@ -122,7 +73,6 @@ class VQVAE(nn.Module):
             self.num_heads,
             num_layers=self.decoder_num_layers,
             use_qk_norm=self.use_qk_norm,
-            dropout=dropout,
             bias=bias,
             rope_base=self.rope_base,
         )
@@ -150,21 +100,15 @@ class VQVAE(nn.Module):
             embed_dim=config.embed_dim,
             quantization_dim=config.quantization_dim,
             num_heads=config.num_heads,
-            encoder_num_layers=config.encoder_num_layers,
             decoder_num_layers=config.decoder_num_layers,
             use_qk_norm=config.use_qk_norm,
             scale_lengths=list(config.scale_lengths),
             codebook_sizes=list(config.codebook_sizes),
-            dropout=config.dropout,
             bias=config.bias,
             rope_base=config.rope_base,
-            pre_quant_num_groups=config.pre_quant_num_groups,
             commitment_cost=config.commitment_cost,
             decay=config.decay,
             eps=config.eps,
-            code_corruption=config.code_corruption,
-            refinement_ratio=config.refinement_ratio,
-            refinement_kernel_size=config.refinement_kernel_size,
         )
         model.load_state_dict(checkpoint["model"])
         model = model.to(device)
@@ -184,20 +128,13 @@ class VQVAE(nn.Module):
         VQ-VAE training quantizes this latent before reconstruction. NSM-DNA
         uses the same latent directly when a completed block is prefix context.
         """
-        latent = self.encoder(token_ids)
-
-        if self.pre_quant_norm is not None:
-            latent = einx.id("b l d -> b d l", latent)
-            latent = self.pre_quant_norm(latent)
-            latent = einx.id("b d l -> b l d", latent)
-
-        return latent
+        return self.encoder(token_ids)
 
     def forward(
         self,
         token_ids: Int[Tensor, "batch length"],
         *,
-        include_truncated_reconstruction: bool = False,
+        include_partial_reconstruction: bool = False,
     ) -> tuple[
         Float[Tensor, "batch length vocab_size"],
         Float[Tensor, "batch length vocab_size"] | None,
@@ -207,20 +144,20 @@ class VQVAE(nn.Module):
         latent = self.encode(token_ids)
         (
             quantized_latent,
-            truncated_quantized_latent,
-            vq_loss,
+            partial_quantized_latent,
+            commitment_loss,
             indices_by_scale,
         ) = self.quantizer(
             latent,
-            include_truncated_reconstruction=include_truncated_reconstruction,
+            include_partial_reconstruction=include_partial_reconstruction,
         )
         logits = self.decoder(quantized_latent)
 
-        truncated_logits = None
-        if truncated_quantized_latent is not None:
-            truncated_logits = self.decoder(truncated_quantized_latent)
+        partial_logits = None
+        if partial_quantized_latent is not None:
+            partial_logits = self.decoder(partial_quantized_latent)
 
-        return logits, truncated_logits, vq_loss, indices_by_scale
+        return logits, partial_logits, commitment_loss, indices_by_scale
 
     @torch.no_grad()
     def encode_indices(
@@ -274,9 +211,6 @@ class VQVAE(nn.Module):
         indices_by_scale: list[Int[Tensor, "batch scale_length"]],
     ) -> list[Float[Tensor, "batch length vocab_size"]]:
         """Decode the reconstruction after each additional quantization scale."""
-        if self.training:
-            raise RuntimeError("Call model.eval() before decoding sequences.")
-
         cumulative_latents = self.quantizer.indices_to_cumulative_latents(
             indices_by_scale
         )
