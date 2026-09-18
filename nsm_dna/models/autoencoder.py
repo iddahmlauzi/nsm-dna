@@ -9,15 +9,10 @@ from .common import (
     TransformerBlock,
     precompute_rope_cosine_and_sine,
 )
-from .sampling import (
-    ChannelsFirstLayerNorm,
-    make_learned_downsampler,
-    make_learned_upsampler,
-)
 
 
 def _sampling_factor(context_length: int, latent_length: int) -> int:
-    """Return the total stride needed to reduce context_length to latent_length."""
+    """Return the size of each non-overlapping nucleotide group."""
     if latent_length <= 0 or context_length % latent_length != 0:
         raise ValueError("context_length must be divisible by latent_length.")
     return context_length // latent_length
@@ -33,57 +28,41 @@ class Encoder(nn.Module):
         latent_length: int,
         embed_dim: int,
         quantization_dim: int,
-        num_heads: int = 1,
-        num_layers: int = 0,
-        use_qk_norm: bool = False,
-        dropout: float = 0.0,
         bias: bool = False,
     ) -> None:
         super().__init__()
 
+        sampling_factor = _sampling_factor(context_length, latent_length)
+
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-        self.drop = nn.Dropout(dropout)
-        self.context_blocks = nn.ModuleList(
-            TransformerBlock(
-                embed_dim,
-                num_heads,
-                dropout=dropout,
-                bias=bias,
-                use_qk_norm=use_qk_norm,
-            )
-            for _ in range(num_layers)
-        )
-        self.downsampler = make_learned_downsampler(
-            embed_dim,
-            stride=_sampling_factor(context_length, latent_length),
+
+        # Combine each non-overlapping group of nucleotides into one latent
+        # position, reducing context_length positions to latent_length positions.
+        # It also reduces embed_dim to quantization_dim. With fewer independently
+        # varying values in each vector, a fixed number of codebook vectors can
+        # provide closer matches during nearest-code lookup.
+        self.downsampler = nn.Conv1d(
+            in_channels=embed_dim,
+            out_channels=quantization_dim,
+            kernel_size=sampling_factor,
+            stride=sampling_factor,
             bias=bias,
         )
-        self.downsampling_norm = ChannelsFirstLayerNorm(embed_dim)
-        self.quantization_projection = nn.Linear(
-            embed_dim,
-            quantization_dim,
-            bias=bias,
-        )
+
+        # Euclidean codebook distances grow with the magnitude of the latent
+        # vectors. Normalize each vector so that magnitude cannot drift during
+        # training and make nearest-code matching progressively harder.
+        self.norm = nn.LayerNorm(quantization_dim, elementwise_affine=False)
 
     def forward(
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> Float[Tensor, "batch latent_length quantization_dim"]:
-        x = self.drop(self.token_embedding(token_ids))
-        for block in self.context_blocks:
-            x = block(x, is_causal=False)
+        x = self.token_embedding(token_ids)
         x = einx.id("b l d -> b d l", x)
-        # Create the shorter continuous latent that the multiscale quantizer models;
-        # the quantization scales describe this latent rather than the full input.
         x = self.downsampler(x)
-        x = self.downsampling_norm(x)
         x = einx.id("b d l -> b l d", x)
-        # Reduce each encoder vector from embed_dim to quantization_dim before
-        # finding its nearest code. With many independently varying dimensions and
-        # only a fixed number of codebook vectors, even the nearest code may be a
-        # poor match. Fewer dimensions mean fewer combinations for the codebook to
-        # represent, making a closer match more likely.
-        return self.quantization_projection(x)
+        return self.norm(x)
 
 
 class Decoder(nn.Module):
@@ -99,11 +78,12 @@ class Decoder(nn.Module):
         num_heads: int,
         num_layers: int = 1,
         use_qk_norm: bool = False,
-        dropout: float = 0.1,
         bias: bool = False,
         rope_base: float = 10000.0,
     ) -> None:
         super().__init__()
+
+        sampling_factor = _sampling_factor(context_length, latent_length)
 
         positions = torch.arange(context_length)
         head_dim = embed_dim // num_heads
@@ -115,34 +95,33 @@ class Decoder(nn.Module):
         self.register_buffer("rope_cosine", rope_cosine, persistent=False)
         self.register_buffer("rope_sine", rope_sine, persistent=False)
 
-        self.latent_projection = nn.Linear(
-            quantization_dim,
-            embed_dim,
+        # Expand each quantized vector back over its nucleotide group while also
+        # projecting from quantization_dim to the decoder's hidden dimension.
+        self.upsampler = nn.ConvTranspose1d(
+            in_channels=quantization_dim,
+            out_channels=embed_dim,
+            kernel_size=sampling_factor,
+            stride=sampling_factor,
             bias=bias,
         )
+
         self.blocks = nn.ModuleList(
             TransformerBlock(
                 embed_dim,
                 num_heads,
-                dropout=dropout,
+                dropout=0.0,
                 bias=bias,
                 use_qk_norm=use_qk_norm,
             )
             for _ in range(num_layers)
-        )
-        self.upsampler = make_learned_upsampler(
-            embed_dim,
-            stride=_sampling_factor(context_length, latent_length),
-            bias=bias,
         )
         self.final_norm = LayerNorm(embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, vocab_size, bias=bias)
 
     def forward(
         self,
-        latent: Float[Tensor, "batch latent_length quantization_dim"],
+        x: Float[Tensor, "batch latent_length quantization_dim"],
     ) -> Float[Tensor, "batch context_length vocab_size"]:
-        x = self.latent_projection(latent)
         x = einx.id("b l d -> b d l", x)
         x = self.upsampler(x)
         x = einx.id("b d l -> b l d", x)
