@@ -283,41 +283,6 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
 
         return cumulative_latents
 
-    @torch.no_grad()
-    def indices_to_next_scale_inputs(
-        self,
-        indices_by_scale: list[Int[Tensor, "batch scale_length"]],
-    ) -> list[Float[Tensor, "batch scale_length quantization_dim"]]:
-        """Construct the teacher-forced scale inputs for NSM-DNA.
-
-        Each scale input is the cumulative reconstruction through the
-        preceding scale, resized to the length of the scale to be predicted.
-        """
-        cumulative_latents = self.indices_to_cumulative_latents(
-            indices_by_scale[:-1]
-        )
-        return [
-            self._resize_to_scale(
-                cumulative_latent,
-                scale_index=scale_index + 1,
-            )
-            for scale_index, cumulative_latent in enumerate(cumulative_latents)
-        ]
-
-    @torch.no_grad()
-    def indices_to_next_scale_input(
-        self,
-        preceding_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
-    ) -> Float[Tensor, "batch next_scale_length quantization_dim"]:
-        """Construct the next input from an autoregressively predicted prefix."""
-        cumulative_latent = self.indices_to_cumulative_latents(
-            preceding_indices_by_scale
-        )[-1]
-        return self._resize_to_scale(
-            cumulative_latent,
-            scale_index=len(preceding_indices_by_scale),
-        )
-
     @property
     def utilization_by_scale(self) -> list[Float[Tensor, ""]]:
         """Fraction of each scale's codes that have been used."""

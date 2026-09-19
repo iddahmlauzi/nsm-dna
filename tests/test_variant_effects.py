@@ -21,9 +21,8 @@ def _build_tokenizer() -> VQVAE:
         quantization_dim=4,
         num_heads=2,
         scale_lengths=[1, 2, 4],
-        codebook_sizes=[8, 8, 8],
-        dropout=0.0,
-        pre_quant_num_groups=2,
+        codebook_sizes=[4, 6, 8],
+        decoder_num_layers=1,
     ).eval()
     tokenizer.requires_grad_(False)
     return tokenizer
@@ -67,10 +66,11 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
     torch.manual_seed(0)
     tokenizer = _build_tokenizer()
     model = NSM(
-        vq_embed_dim=4,
+        prefix_dim=4,
         model_dim=8,
-        scale_lengths=[2, 4],
-        codebook_size=8,
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[4, 6, 8],
+        codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(8, 4)],
         num_layers=1,
         num_heads=2,
         dropout=0.0,
@@ -80,11 +80,13 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
 
     hierarchy_scores, decoder_scores = score_token_ids(model, tokenizer, input_ids)
 
-    expected_hierarchy_scores = torch.zeros(2, 2, dtype=torch.float64)
+    expected_hierarchy_scores = torch.zeros(2, 3, dtype=torch.float64)
     expected_decoder_scores = torch.zeros(2, dtype=torch.float64)
     for prediction in prepare_block_predictions(tokenizer, input_ids):
-        logits = model(prediction.scale_inputs, prefix=prediction.prefix)
-        logits_by_scale = torch.split(logits, tokenizer.scale_lengths[1:], dim=1)
+        logits_by_scale = model(
+            prediction.targets_by_scale,
+            prefix=prediction.prefix,
+        )
         for scale_index, (scale_logits, scale_targets) in enumerate(
             zip(logits_by_scale, prediction.targets_by_scale)
         ):
@@ -95,9 +97,7 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
             ).reshape(scale_targets.shape)
             expected_hierarchy_scores[:, scale_index] -= scale_losses.sum(1).double()
 
-        decoder_logits = tokenizer.decode(
-            [prediction.first_scale_indices, *prediction.targets_by_scale]
-        )
+        decoder_logits = tokenizer.decode(prediction.targets_by_scale)
         decoder_losses = F.cross_entropy(
             decoder_logits.flatten(0, 1),
             prediction.target_ids.flatten(),
@@ -113,10 +113,11 @@ def test_sequence_score_supports_target_without_prefix() -> None:
     torch.manual_seed(0)
     tokenizer = _build_tokenizer()
     model = NSM(
-        vq_embed_dim=4,
+        prefix_dim=4,
         model_dim=8,
-        scale_lengths=[2, 4],
-        codebook_size=8,
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[4, 6, 8],
+        codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(8, 4)],
         num_layers=1,
         num_heads=2,
         dropout=0.0,
@@ -126,7 +127,7 @@ def test_sequence_score_supports_target_without_prefix() -> None:
 
     hierarchy_scores, decoder_scores = score_token_ids(model, tokenizer, input_ids)
 
-    assert hierarchy_scores.shape == (2, 2)
+    assert hierarchy_scores.shape == (2, 3)
     assert decoder_scores.shape == (2,)
     assert torch.isfinite(hierarchy_scores).all()
     assert torch.isfinite(decoder_scores).all()

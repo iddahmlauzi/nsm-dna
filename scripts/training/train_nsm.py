@@ -35,8 +35,6 @@ class BlockPredictionBatch:
 
     target_ids: Int[Tensor, "batch block_length"]
     prefix: Float[Tensor, "batch prefix_length vq_dim"] | None
-    first_scale_indices: Int[Tensor, "batch first_scale_length"]
-    scale_inputs: list[Float[Tensor, "batch scale_length vq_dim"]]
     targets_by_scale: list[Int[Tensor, "batch scale_length"]]
 
 
@@ -56,13 +54,11 @@ def build_scale_loss_weights(
 
 
 def compute_next_scale_loss(
-    logits: Tensor,
+    logits_by_scale: list[Tensor],
     targets_by_scale: list[Tensor],
     scale_loss_weights: Tensor,
 ) -> tuple[Tensor, Tensor]:
     """Compute cross-entropy at each scale and their configured weighted mean."""
-    scale_lengths = [targets.shape[1] for targets in targets_by_scale]
-    logits_by_scale = torch.split(logits, scale_lengths, dim=1)
     losses_by_scale = torch.stack(
         [
             F.cross_entropy(
@@ -79,36 +75,10 @@ def compute_next_scale_loss(
     return loss, losses_by_scale
 
 
-def corrupt_scale_indices(
-    indices_by_scale: list[Tensor],
-    codebook_sizes: list[int],
-    probabilities: list[float],
-) -> list[Tensor]:
-    """Uniformly replace later codes that become teacher-forced inputs."""
-    if not any(probabilities):
-        return indices_by_scale
-
-    corrupted_inputs = [
-        torch.where(
-            torch.rand(indices.shape, device=indices.device) < probability,
-            torch.randint(codebook_size, indices.shape, device=indices.device),
-            indices,
-        )
-        for indices, codebook_size, probability in zip(
-            indices_by_scale[1:-1],
-            codebook_sizes[1:-1],
-            probabilities,
-            strict=True,
-        )
-    ]
-    return [indices_by_scale[0], *corrupted_inputs, indices_by_scale[-1]]
-
-
 @torch.no_grad()
 def prepare_block_predictions(
     tokenizer: VQVAE,
     input_ids: Int[Tensor, "batch sequence_length"],
-    corruption_probabilities: list[float] | None = None,
 ) -> list[BlockPredictionBatch]:
     """Create one task that predicts the second block from the first block."""
     block_length = tokenizer.context_length
@@ -116,57 +86,41 @@ def prepare_block_predictions(
     target_ids = input_ids[:, block_length:]
     prefix = tokenizer.encode(prefix_ids)
     indices_by_scale = tokenizer.encode_indices(target_ids)
-    if corruption_probabilities is None:
-        corruption_probabilities = [0.0] * (len(indices_by_scale) - 2)
-    input_indices_by_scale = corrupt_scale_indices(
-        indices_by_scale,
-        tokenizer.codebook_sizes,
-        corruption_probabilities,
-    )
-    scale_inputs = tokenizer.indices_to_next_scale_inputs(input_indices_by_scale)
 
     return [
         BlockPredictionBatch(
             target_ids=target_ids,
             prefix=prefix,
-            first_scale_indices=indices_by_scale[0],
-            scale_inputs=scale_inputs,
-            targets_by_scale=indices_by_scale[1:],
+            targets_by_scale=indices_by_scale,
         )
     ]
 
 
 @torch.no_grad()
-def rollout_scale_predictions(
+def rollout_hierarchy(
     model: NSM,
     tokenizer: VQVAE,
-    first_scale_indices: Int[Tensor, "batch first_scale_length"],
+    batch_size: int,
     prefix: Float[Tensor, "batch prefix_length vq_dim"] | None,
 ) -> list[Int[Tensor, "batch scale_length"]]:
-    """Predict later scales from the supplied first scale."""
+    """Greedily generate every hierarchy code in coarse-to-fine order."""
     device = next(model.parameters()).device
-    scale_inputs = [
+    predicted_indices_by_scale = [
         torch.zeros(
-            first_scale_indices.shape[0],
+            batch_size,
             scale_length,
-            tokenizer.quantization_dim,
+            dtype=torch.long,
             device=device,
         )
-        for scale_length in tokenizer.scale_lengths[1:]
+        for scale_length in tokenizer.scale_lengths
     ]
-    predicted_indices_by_scale = [first_scale_indices]
 
-    for scale_index in range(len(scale_inputs)):
-        scale_inputs[scale_index] = tokenizer.indices_to_next_scale_input(
-            predicted_indices_by_scale
-        )
-        # Unpredicted scale sections contain zeros. The model's block-diagonal
-        # attention keeps them from affecting the section currently predicted.
-        logits = model(scale_inputs, prefix=prefix)
-        scale_logits = torch.split(logits, tokenizer.scale_lengths[1:], dim=1)[
-            scale_index
-        ]
-        predicted_indices_by_scale.append(scale_logits.argmax(dim=-1))
+    for scale_index, scale_length in enumerate(tokenizer.scale_lengths):
+        for position in range(scale_length):
+            logits_by_scale = model(predicted_indices_by_scale, prefix=prefix)
+            predicted_indices_by_scale[scale_index][:, position] = logits_by_scale[
+                scale_index
+            ][:, position].argmax(dim=-1)
 
     return predicted_indices_by_scale
 
@@ -188,7 +142,7 @@ def evaluate(
     was_training = model.training
     model.eval()
     device = next(model.parameters()).device
-    predicted_scale_lengths = tokenizer.scale_lengths[1:]
+    predicted_scale_lengths = tokenizer.scale_lengths
     num_scales = len(predicted_scale_lengths)
 
     loss_sum = 0.0
@@ -214,22 +168,25 @@ def evaluate(
                 dtype=torch.bfloat16,
                 enabled=use_mixed_precision,
             ):
-                # Teacher forcing supplies the correct preceding-scale
-                # reconstructions and predicts every scale in one model call.
-                logits = model(prediction.scale_inputs, prefix=prediction.prefix)
+                # Each scale sees completed earlier scales and teacher-forced
+                # earlier codes at its own scale, never its current code.
+                logits_by_scale = model(
+                    prediction.targets_by_scale,
+                    prefix=prediction.prefix,
+                )
                 loss, _ = compute_next_scale_loss(
-                    logits,
+                    logits_by_scale,
                     prediction.targets_by_scale,
                     scale_loss_weights,
                 )
 
-                # Rollout builds each next-scale input from NSM's own previous
-                # predictions, then decodes the completed hierarchy into DNA.
+                # Rollout predicts the first scale from the real prefix, then
+                # builds each later cumulative input from generated codes.
                 if batch_index < rollout_max_batches:
-                    rollout_indices = rollout_scale_predictions(
+                    rollout_indices = rollout_hierarchy(
                         model,
                         tokenizer,
-                        first_scale_indices=prediction.first_scale_indices,
+                        batch_size=prediction.target_ids.shape[0],
                         prefix=prediction.prefix,
                     )
                     rollout_logits = tokenizer.decode(rollout_indices)
@@ -239,7 +196,6 @@ def evaluate(
                     )
 
             # Pool exact code matches by scale across all evaluated blocks.
-            logits_by_scale = torch.split(logits, predicted_scale_lengths, dim=1)
             for scale_index, (scale_logits, scale_targets) in enumerate(
                 zip(
                     logits_by_scale,
@@ -282,9 +238,7 @@ def evaluate(
     # Rollout loss averages the block-batch losses, while rollout accuracy pools
     # every decoded nucleotide position.
     if num_rollouts > 0:
-        metrics["rollout_nucleotide_loss"] = (
-            rollout_nucleotide_loss_sum / num_rollouts
-        )
+        metrics["rollout_nucleotide_loss"] = rollout_nucleotide_loss_sum / num_rollouts
         metrics["rollout_nucleotide_accuracy"] = (
             rollout_correct_nucleotides / rollout_num_nucleotides
         )
@@ -320,11 +274,6 @@ def main(config: DictConfig) -> None:
         raise ValueError(
             "data.sequence_length must be divisible by the tokenizer context length."
         )
-
-    # One shared output head requires every tokenizer scale to use the same
-    # number of codes, as in the final long-context NSM configuration.
-    if len(set(tokenizer.codebook_sizes)) != 1:
-        raise ValueError("NSM requires equal codebook sizes across all scales.")
 
     # Create the experiment logger.
     wandb_run = None
@@ -376,22 +325,7 @@ def main(config: DictConfig) -> None:
             generator=validation_generator,
         )
 
-    model = NSM(
-        vq_embed_dim=tokenizer.quantization_dim,
-        model_dim=config.model.model_dim,
-        scale_lengths=tokenizer.scale_lengths[1:],
-        codebook_size=tokenizer.codebook_sizes[0],
-        num_layers=config.model.num_layers,
-        num_heads=config.model.num_heads,
-        dropout=config.model.dropout,
-        bias=config.model.bias,
-        use_qk_norm=config.model.use_qk_norm,
-        rope_base=config.model.rope_base,
-        head_num_blocks=config.model.head_num_blocks,
-        head_hidden_multiplier=config.model.head_hidden_multiplier,
-        input_refinement_kernel_size=config.model.input_refinement_kernel_size,
-        max_prefix_length=sequence_length - tokenizer.context_length,
-    ).to(device)
+    model = NSM.from_config(config, tokenizer).to(device)
     use_mixed_precision = config.mixed_precision.enabled and device.type == "cuda"
 
     num_parameters = sum(parameter.numel() for parameter in model.parameters())
@@ -401,7 +335,7 @@ def main(config: DictConfig) -> None:
             wandb_run.summary["model/parameters"] = num_parameters
 
     scale_loss_weights = build_scale_loss_weights(
-        tokenizer.scale_lengths[1:],
+        tokenizer.scale_lengths,
         config.optimizer.scale_loss_alpha,
         device,
     )
@@ -461,9 +395,6 @@ def main(config: DictConfig) -> None:
         disable=not distributed_environment.is_main_process,
     )
     gradient_accumulation_steps = config.optimizer.gradient_accumulation_steps
-    corruption_probabilities = list(
-        config.training.input_code_corruption_probabilities
-    )
 
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
@@ -484,11 +415,7 @@ def main(config: DictConfig) -> None:
                 batch = next(train_iterator)
 
             input_ids = batch["input_ids"].to(device)
-            block_predictions = prepare_block_predictions(
-                tokenizer,
-                input_ids,
-                corruption_probabilities=corruption_probabilities,
-            )
+            block_predictions = prepare_block_predictions(tokenizer, input_ids)
             num_predictions_per_step = gradient_accumulation_steps * len(
                 block_predictions
             )
@@ -511,12 +438,12 @@ def main(config: DictConfig) -> None:
                         dtype=torch.bfloat16,
                         enabled=use_mixed_precision,
                     ):
-                        logits = training_model(
-                            prediction.scale_inputs,
+                        logits_by_scale = training_model(
+                            prediction.targets_by_scale,
                             prefix=prediction.prefix,
                         )
                         loss, _ = compute_next_scale_loss(
-                            logits,
+                            logits_by_scale,
                             prediction.targets_by_scale,
                             scale_loss_weights,
                         )
@@ -527,14 +454,15 @@ def main(config: DictConfig) -> None:
                     mean_loss += loss.detach() / num_predictions_per_step
 
                     with torch.no_grad():
-                        targets = torch.cat(
+                        for scale_logits, scale_targets in zip(
+                            logits_by_scale,
                             prediction.targets_by_scale,
-                            dim=1,
-                        )
-                        predictions = logits.argmax(dim=-1)
-                        correct = predictions == targets
-                        correct_codes += correct.sum()
-                        num_codes += targets.numel()
+                            strict=True,
+                        ):
+                            correct_codes += (
+                                scale_logits.argmax(dim=-1) == scale_targets
+                            ).sum()
+                            num_codes += scale_targets.numel()
 
         gradient_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(),
@@ -618,11 +546,9 @@ def main(config: DictConfig) -> None:
                             "rollout_nucleotide_accuracy"
                         ],
                     }
-                    for scale_index, scale_length in enumerate(
-                        tokenizer.scale_lengths[1:]
-                    ):
+                    for scale_index, scale_length in enumerate(tokenizer.scale_lengths):
                         scale_name = (
-                            f"scale_{scale_index + 2:02d}_length_{scale_length}"
+                            f"scale_{scale_index + 1:02d}_length_{scale_length}"
                         )
                         wandb_metrics[f"{scale_name}/validation_accuracy"] = (
                             validation_metrics[f"accuracy_scale_{scale_length}"]
@@ -633,44 +559,22 @@ def main(config: DictConfig) -> None:
             if distributed_environment.is_distributed:
                 dist.barrier()
 
-        checkpoints_to_save: list[tuple[str, str | None]] = []
-        if step % config.checkpoint.recovery_interval == 0:
-            checkpoints_to_save.append(("recovery", "latest.pt"))
-        if step % config.checkpoint.milestone_interval == 0:
-            checkpoints_to_save.append(("milestone", None))
-
-        if checkpoints_to_save:
+        if step % config.checkpoint.interval == 0:
             if distributed_environment.is_main_process:
-                for checkpoint_type, checkpoint_name in checkpoints_to_save:
-                    checkpoint_path = save_training_checkpoint(
-                        run_directory,
-                        model,
-                        optimizer,
-                        scheduler,
-                        config,
-                        step,
-                        best_validation_loss,
-                        checkpoint_name=checkpoint_name,
-                    )
-                    tqdm.write(
-                        f"saved {checkpoint_type} checkpoint: {checkpoint_path}"
-                    )
+                checkpoint_path = save_training_checkpoint(
+                    run_directory,
+                    model,
+                    optimizer,
+                    scheduler,
+                    config,
+                    step,
+                    best_validation_loss,
+                    checkpoint_name="latest.pt",
+                )
+                tqdm.write(f"saved checkpoint: {checkpoint_path}")
 
             if distributed_environment.is_distributed:
                 dist.barrier()
-
-    if distributed_environment.is_main_process:
-        final_checkpoint_path = save_training_checkpoint(
-            run_directory,
-            model,
-            optimizer,
-            scheduler,
-            config,
-            total_steps,
-            best_validation_loss,
-            checkpoint_name="final.pt",
-        )
-        tqdm.write(f"saved final checkpoint: {final_checkpoint_path}")
 
     if wandb_run is not None:
         wandb_run.finish()

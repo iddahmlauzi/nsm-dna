@@ -1,0 +1,18 @@
+checkpoint: ../runs/nsm-256-ar/checkpoints/best.pt
+tokenizer_checkpoint: ../runs/vqvae-256-progressive/checkpoints/best.pt
+output_directory: ../results/nsm-256-ar/hierarchy-analysis
+
+data:
+  subset_directory: ../datasets/gtdb/500M_subset
+  split: validation
+  batch_size: 32
+  max_batches: 100
+  rollout_max_batches: 1
+  num_workers: 1
+
+seed: 0
+device: cuda:0
+
+hydra:
+  run:
+    dir: ${output_directory}

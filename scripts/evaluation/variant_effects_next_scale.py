@@ -97,7 +97,7 @@ def score_token_ids(
     Float[Tensor, "batch"],
 ]:
     """Return per-scale hierarchy scores and the decoder score."""
-    predicted_scale_lengths = tokenizer.scale_lengths[1:]
+    predicted_scale_lengths = tokenizer.scale_lengths
     hierarchy_scores = torch.zeros(
         input_ids.shape[0],
         len(predicted_scale_lengths),
@@ -114,11 +114,7 @@ def score_token_ids(
             BlockPredictionBatch(
                 target_ids=target_ids,
                 prefix=None,
-                first_scale_indices=indices_by_scale[0],
-                scale_inputs=tokenizer.indices_to_next_scale_inputs(
-                    indices_by_scale
-                ),
-                targets_by_scale=indices_by_scale[1:],
+                targets_by_scale=indices_by_scale,
             )
         ]
     else:
@@ -130,14 +126,14 @@ def score_token_ids(
             dtype=torch.bfloat16,
             enabled=input_ids.device.type == "cuda",
         ):
-            logits = model(prediction.scale_inputs, prefix=prediction.prefix)
-            decoder_logits = tokenizer.decode(
-                [prediction.first_scale_indices, *prediction.targets_by_scale]
+            logits_by_scale = model(
+                prediction.targets_by_scale,
+                prefix=prediction.prefix,
             )
+            decoder_logits = tokenizer.decode(prediction.targets_by_scale)
 
         # Likelihood counts every predicted code once; the training loss's scale
         # weights do not enter the sequence score.
-        logits_by_scale = torch.split(logits, predicted_scale_lengths, dim=1)
         for scale_index, (scale_logits, scale_targets) in enumerate(
             zip(logits_by_scale, prediction.targets_by_scale)
         ):
@@ -171,7 +167,7 @@ def score_sequences(
     device: torch.device,
 ) -> dict[str, list[float]]:
     """Score fixed-length DNA sequences and retain each score component."""
-    predicted_scale_lengths = tokenizer.scale_lengths[1:]
+    predicted_scale_lengths = tokenizer.scale_lengths
     scores = {f"scale_{length}": [] for length in predicted_scale_lengths}
     scores.update({"hierarchy": [], "decoder": [], "joint": []})
 
@@ -370,7 +366,7 @@ def main(config: DictConfig) -> None:
             f"the model maximum of {model.max_prefix_length}."
         )
     target_length = int(tokenizer.context_length)
-    component_names = [f"scale_{length}" for length in tokenizer.scale_lengths[1:]]
+    component_names = [f"scale_{length}" for length in tokenizer.scale_lengths]
     component_names.extend(["hierarchy", "decoder"])
 
     results = []

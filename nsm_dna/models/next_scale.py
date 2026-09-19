@@ -2,10 +2,10 @@ import math
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import einx
 import torch
 import torch.nn as nn
-from jaxtyping import Bool, Float
+import torch.nn.functional as F
+from jaxtyping import Bool, Float, Int
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
@@ -52,18 +52,19 @@ class _ResidualOutputHeadBlock(nn.Module):
         return residual + x
 
 
-class SharedOutputHead(nn.Module):
-    """Apply residual FFN corrections before one shared linear readout.
+class MultiscaleOutputHead(nn.Module):
+    """Apply shared residual corrections before scale-specific classifiers.
 
     Each block expands to a wider hidden dimension and projects back to
-    model_dim. This preserves a direct path from the Transformer states to the
-    codebook classifier while adding nonlinear capacity around that path.
+    model_dim. Each scale then projects into its own codebook because codebook
+    sizes and code identities are specific to that scale.
     """
 
     def __init__(
         self,
         model_dim: int,
-        codebook_size: int,
+        scale_lengths: list[int],
+        codebook_sizes: list[int],
         num_blocks: int = 2,
         hidden_multiplier: float = 2.0,
         dropout: float = 0.0,
@@ -71,6 +72,7 @@ class SharedOutputHead(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.scale_lengths = list(scale_lengths)
         hidden_dim = int(round(hidden_multiplier * model_dim))
         self.blocks = nn.ModuleList(
             [
@@ -83,31 +85,39 @@ class SharedOutputHead(nn.Module):
                 for _ in range(num_blocks)
             ]
         )
-        self.codebook_projection = nn.Linear(
-            model_dim,
-            codebook_size,
-            bias=False,
+        self.codebook_projections = nn.ModuleList(
+            nn.Linear(model_dim, codebook_size, bias=False)
+            for codebook_size in codebook_sizes
         )
 
     def forward(
         self,
         x: Float[Tensor, "batch length model_dim"],
-    ) -> Float[Tensor, "batch length codebook_size"]:
+    ) -> list[Float[Tensor, "batch scale_length codebook_size"]]:
         for block in self.blocks:
             x = block(x)
 
-        return self.codebook_projection(x)
+        hidden_states_by_scale = torch.split(x, self.scale_lengths, dim=1)
+        return [
+            projection(hidden_states)
+            for projection, hidden_states in zip(
+                self.codebook_projections,
+                hidden_states_by_scale,
+                strict=True,
+            )
+        ]
 
 
 class NSM(nn.Module):
-    """Predict every VQ-VAE scale after the supplied first scale."""
+    """Predict each scale from preceding scales and earlier codes at that scale."""
 
     def __init__(
         self,
-        vq_embed_dim: int,
+        prefix_dim: int,
         model_dim: int,
         scale_lengths: list[int],
-        codebook_size: int,
+        codebook_sizes: list[int],
+        codebook_vectors: list[Tensor],
         num_layers: int,
         num_heads: int,
         *,
@@ -117,60 +127,55 @@ class NSM(nn.Module):
         rope_base: float = 10000.0,
         head_num_blocks: int = 2,
         head_hidden_multiplier: float = 2.0,
-        input_refinement_kernel_size: int = 3,
         max_prefix_length: int = 0,
     ) -> None:
         super().__init__()
 
-        if input_refinement_kernel_size % 2 == 0:
-            raise ValueError("input_refinement_kernel_size must be odd.")
-
-        self.vq_embed_dim = vq_embed_dim
+        self.prefix_dim = prefix_dim
         self.model_dim = model_dim
         self.scale_lengths = list(scale_lengths)
-        self.codebook_size = codebook_size
+        self.codebook_sizes = list(codebook_sizes)
+        self.latent_length = self.scale_lengths[-1]
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.use_qk_norm = use_qk_norm
         self.rope_base = rope_base
-        self.input_refinement_kernel_size = input_refinement_kernel_size
         self.max_prefix_length = max_prefix_length
 
-        # Each resized scale input receives its own local residual correction
-        # before all scales share the model-space input projection.
-        self.scale_input_convs = nn.ModuleList(
-            [
-                nn.Conv1d(
-                    self.vq_embed_dim,
-                    self.vq_embed_dim,
-                    kernel_size=self.input_refinement_kernel_size,
-                    padding=self.input_refinement_kernel_size // 2,
-                    bias=bias,
-                )
-                for _ in self.scale_lengths
-            ]
-        )
+        self._codebook_buffer_names: list[str] = []
+        for scale_index, vectors in enumerate(codebook_vectors):
+            buffer_name = f"codebook_vectors_{scale_index}"
+            self.register_buffer(
+                buffer_name,
+                vectors.detach().float().clone(),
+                persistent=False,
+            )
+            self._codebook_buffer_names.append(buffer_name)
 
-        # Start with no residual correction so refinement initially leaves the
-        # resized scale inputs unchanged.
+        self.input_projection = nn.Linear(
+            self.prefix_dim,
+            self.model_dim,
+            bias=bias,
+        )
+        self.scale_input_convs = nn.ModuleList(
+            nn.Conv1d(
+                self.prefix_dim,
+                self.prefix_dim,
+                kernel_size=3,
+                padding=1,
+                bias=bias,
+            )
+            for _ in self.scale_lengths[1:]
+        )
         for conv in self.scale_input_convs:
             nn.init.zeros_(conv.weight)
             if conv.bias is not None:
                 nn.init.zeros_(conv.bias)
 
-        self.input_projection = nn.Linear(
-            self.vq_embed_dim,
-            self.model_dim,
-            bias=bias,
-        )
-
-        # Reset RoPE positions do not identify the scale, so add one learned
-        # model-space vector per predicted scale to the hierarchy hidden states.
+        # A learned scale vector marks the codebook predicted at each position.
         self.scale_embedding = nn.Embedding(len(self.scale_lengths), self.model_dim)
         nn.init.normal_(self.scale_embedding.weight, mean=0.0, std=0.02)
 
-        # Each scale input already contains the cumulative reconstruction from
-        # preceding scales, so attention remains within each scale section.
         scale_ids = torch.cat(
             [
                 torch.full((scale_length,), scale_index)
@@ -179,20 +184,17 @@ class NSM(nn.Module):
         )
         self.register_buffer("scale_ids", scale_ids, persistent=False)
 
-        row_scale_ids = einx.id("row -> row 1", scale_ids)
-        column_scale_ids = einx.id("column -> 1 column", scale_ids)
-        scale_attention_mask = einx.id(
-            "row column -> 1 1 row column",
-            row_scale_ids == column_scale_ids,
+        hierarchy_attention_mask = (
+            (scale_ids[:, None] == scale_ids[None, :])
+            & torch.ones(len(scale_ids), len(scale_ids), dtype=torch.bool).tril()
         )
         self.register_buffer(
-            "scale_attention_mask",
-            scale_attention_mask,
+            "hierarchy_attention_mask",
+            hierarchy_attention_mask.reshape(1, 1, len(scale_ids), len(scale_ids)),
             persistent=False,
         )
 
-        # Block-diagonal scale sections use independent position ranges, so
-        # RoPE restarts from position zero at every scale.
+        # Each scale is its own causal section; cumulative inputs carry earlier scales.
         rope_positions = torch.cat(
             [torch.arange(scale_length) for scale_length in self.scale_lengths]
         )
@@ -239,9 +241,10 @@ class NSM(nn.Module):
         )
         self._initialize_residual_projections()
         self.final_norm = RMSNorm(self.model_dim, eps=1e-5)
-        self.output_head = SharedOutputHead(
+        self.output_head = MultiscaleOutputHead(
             self.model_dim,
-            self.codebook_size,
+            self.scale_lengths,
+            self.codebook_sizes,
             num_blocks=head_num_blocks,
             hidden_multiplier=head_hidden_multiplier,
             dropout=dropout,
@@ -270,10 +273,13 @@ class NSM(nn.Module):
     def from_config(cls, config: DictConfig, tokenizer: "VQVAE") -> "NSM":
         """Build NSM-DNA from an experiment configuration and its tokenizer."""
         return cls(
-            vq_embed_dim=tokenizer.quantization_dim,
+            prefix_dim=tokenizer.quantization_dim,
             model_dim=config.model.model_dim,
-            scale_lengths=tokenizer.scale_lengths[1:],
-            codebook_size=tokenizer.codebook_sizes[0],
+            scale_lengths=tokenizer.scale_lengths,
+            codebook_sizes=tokenizer.codebook_sizes,
+            codebook_vectors=[
+                codebook.codebook for codebook in tokenizer.quantizer.codebooks
+            ],
             num_layers=config.model.num_layers,
             num_heads=config.model.num_heads,
             dropout=config.model.dropout,
@@ -282,10 +288,7 @@ class NSM(nn.Module):
             rope_base=config.model.rope_base,
             head_num_blocks=config.model.head_num_blocks,
             head_hidden_multiplier=config.model.head_hidden_multiplier,
-            input_refinement_kernel_size=config.model.input_refinement_kernel_size,
-            max_prefix_length=(
-                config.data.sequence_length - tokenizer.context_length
-            ),
+            max_prefix_length=(config.data.sequence_length - tokenizer.context_length),
         )
 
     @classmethod
@@ -315,60 +318,81 @@ class NSM(nn.Module):
 
         return model, int(checkpoint["step"])
 
-    def _refine_scale_inputs(
+    def _embed_hierarchy_inputs(
         self,
-        scale_inputs: list[Float[Tensor, "batch scale_length vq_dim"]],
-    ) -> list[Float[Tensor, "batch scale_length vq_dim"]]:
-        """Adapt the tokenizer's resized reconstructions for NSM prediction.
+        indices_by_scale: list[Int[Tensor, "batch scale_length"]],
+    ) -> Float[Tensor, "batch hierarchy_length model_dim"]:
+        """Combine cumulative prior-scale inputs with shifted same-scale codes."""
+        codebook_vectors = [
+            getattr(self, buffer_name) for buffer_name in self._codebook_buffer_names
+        ]
+        batch_size = indices_by_scale[0].shape[0]
+        cumulative_latent = codebook_vectors[0].new_zeros(
+            batch_size, self.latent_length, self.prefix_dim
+        )
+        scale_inputs = []
 
-        Each predicted scale receives a cumulative reconstruction that the
-        tokenizer has resized from the preceding scales. A separate
-        Conv1d lets NSM learn a local correction for each resolution. The
-        correction is added residually, and zero initialization makes this
-        operation an identity at the start of training.
-        """
-        refined_scale_inputs = []
-
-        for scale_input, refinement_conv in zip(
-            scale_inputs,
-            self.scale_input_convs,
-            strict=True,
+        for scale_index, (indices, vectors) in enumerate(
+            zip(indices_by_scale, codebook_vectors, strict=True)
         ):
-            scale_input_channels_first = einx.id("b l d -> b d l", scale_input)
-            correction = refinement_conv(scale_input_channels_first)
-            correction = einx.id("b d l -> b l d", correction)
-            refined_scale_inputs.append(scale_input + correction)
+            scale_length = self.scale_lengths[scale_index]
+            if scale_index == 0:
+                prior_scale_input = cumulative_latent[:, :scale_length]
+            else:
+                prior_scale_input = F.interpolate(
+                    cumulative_latent.transpose(1, 2),
+                    size=scale_length,
+                    mode="area",
+                ).transpose(1, 2)
+                correction = self.scale_input_convs[scale_index - 1](
+                    prior_scale_input.transpose(1, 2)
+                ).transpose(1, 2)
+                prior_scale_input = prior_scale_input + correction
 
-        return refined_scale_inputs
+            current_codes = vectors[indices]
+            shifted_codes = torch.cat(
+                [torch.zeros_like(current_codes[:, :1]), current_codes[:, :-1]],
+                dim=1,
+            )
+            scale_inputs.append(prior_scale_input + shifted_codes)
+
+            # Only completed earlier scales contribute to the next scale's input.
+            cumulative_latent = cumulative_latent + current_codes.repeat_interleave(
+                self.latent_length // scale_length,
+                dim=1,
+            )
+
+        return self.input_projection(torch.cat(scale_inputs, dim=1))
 
     def _build_attention_mask(
         self,
         prefix_length: int,
     ) -> Bool[Tensor, "1 1 length length"]:
-        """Build the prefix and scale-section attention routes."""
+        """Let each scale read the prefix and its own earlier positions."""
         if prefix_length == 0:
-            return self.scale_attention_mask
+            return self.hierarchy_attention_mask
 
-        prefix_section_ids = torch.full(
-            (prefix_length,),
-            -1,
-            device=self.scale_ids.device,
+        hierarchy_length = self.hierarchy_attention_mask.shape[-1]
+        attention_mask = torch.zeros(
+            prefix_length + hierarchy_length,
+            prefix_length + hierarchy_length,
+            dtype=torch.bool,
+            device=self.hierarchy_attention_mask.device,
         )
-        section_ids = torch.cat([prefix_section_ids, self.scale_ids])
-        row_section_ids = einx.id("row -> row 1", section_ids)
-        column_section_ids = einx.id("column -> 1 column", section_ids)
-
-        same_section = row_section_ids == column_section_ids
-        hierarchy_reads_prefix = (row_section_ids >= 0) & (
-            column_section_ids == -1
-        )
-        return einx.id(
-            "row column -> 1 1 row column",
-            same_section | hierarchy_reads_prefix,
+        attention_mask[:prefix_length, :prefix_length] = True
+        attention_mask[prefix_length:, :prefix_length] = True
+        attention_mask[prefix_length:, prefix_length:] = self.hierarchy_attention_mask[
+            0, 0
+        ]
+        return attention_mask.reshape(
+            1,
+            1,
+            prefix_length + hierarchy_length,
+            prefix_length + hierarchy_length,
         )
 
     def _get_rotary_embeddings(self, prefix_length: int) -> RotaryEmbeddings:
-        """Combine sequential prefix positions with reset per-scale positions."""
+        """Combine prefix positions with the scale-local hierarchy positions."""
         cosine = torch.cat(
             [self.prefix_rope_cosine[:prefix_length], self.rope_cosine],
             dim=0,
@@ -381,13 +405,15 @@ class NSM(nn.Module):
 
     def encode(
         self,
-        scale_inputs: list[Float[Tensor, "batch scale_length vq_dim"]],
+        indices_by_scale: list[Int[Tensor, "batch scale_length"]],
         *,
-        prefix: Float[Tensor, "batch prefix_length vq_dim"] | None = None,
+        prefix: Float[Tensor, "batch prefix_length prefix_dim"] | None = None,
     ) -> Float[Tensor, "batch length model_dim"]:
-        """Return final normalized states for the prefix and target hierarchy."""
-        refined_scale_inputs = self._refine_scale_inputs(scale_inputs)
-        hierarchy_inputs = torch.cat(refined_scale_inputs, dim=1)
+        """Return causal hierarchy states after an optional encoded DNA prefix."""
+        hierarchy_hidden_states = self._embed_hierarchy_inputs(indices_by_scale)
+        hierarchy_hidden_states = hierarchy_hidden_states + self.scale_embedding(
+            self.scale_ids
+        )
 
         prefix_length = 0 if prefix is None else prefix.shape[1]
         if prefix_length > self.max_prefix_length:
@@ -397,18 +423,13 @@ class NSM(nn.Module):
             )
 
         if prefix is None:
-            combined_inputs = hierarchy_inputs
+            hidden_states = hierarchy_hidden_states
         else:
-            combined_inputs = torch.cat([prefix, hierarchy_inputs], dim=1)
-
-        hidden_states = self.input_projection(combined_inputs)
-        hierarchy_hidden_states = hidden_states[:, prefix_length:]
-        hierarchy_hidden_states = hierarchy_hidden_states + self.scale_embedding(
-            self.scale_ids
-        )
-        hidden_states = torch.cat(
-            [hidden_states[:, :prefix_length], hierarchy_hidden_states], dim=1
-        )
+            prefix_hidden_states = self.input_projection(prefix)
+            hidden_states = torch.cat(
+                [prefix_hidden_states, hierarchy_hidden_states],
+                dim=1,
+            )
 
         attention_mask = self._build_attention_mask(prefix_length)
         rotary_embeddings = self._get_rotary_embeddings(prefix_length)
@@ -423,11 +444,11 @@ class NSM(nn.Module):
 
     def forward(
         self,
-        scale_inputs: list[Float[Tensor, "batch scale_length vq_dim"]],
+        indices_by_scale: list[Int[Tensor, "batch scale_length"]],
         *,
-        prefix: Float[Tensor, "batch prefix_length vq_dim"] | None = None,
-    ) -> Float[Tensor, "batch hierarchy_length codebook_size"]:
-        hidden_states = self.encode(scale_inputs, prefix=prefix)
+        prefix: Float[Tensor, "batch prefix_length prefix_dim"] | None = None,
+    ) -> list[Float[Tensor, "batch scale_length codebook_size"]]:
+        hidden_states = self.encode(indices_by_scale, prefix=prefix)
         prefix_length = 0 if prefix is None else prefix.shape[1]
         hierarchy_hidden_states = hidden_states[:, prefix_length:]
         return self.output_head(hierarchy_hidden_states)

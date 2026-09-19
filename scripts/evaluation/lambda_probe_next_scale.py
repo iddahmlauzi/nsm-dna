@@ -42,10 +42,7 @@ class NSMWindowEncoder(nn.Module):
         ):
             prefix = self.tokenizer.encode(prefix_ids)
             targets_by_scale = self.tokenizer.encode_indices(target_ids)
-            scale_inputs = self.tokenizer.indices_to_next_scale_inputs(
-                targets_by_scale
-            )
-            hidden_states = self.model.encode(scale_inputs, prefix=prefix)
+            hidden_states = self.model.encode(targets_by_scale, prefix=prefix)
 
         memory_token_index = prefix.shape[1]
         return hidden_states[:, memory_token_index].float()
@@ -328,9 +325,9 @@ def main(config: DictConfig) -> None:
             for name, path in split_paths.items()
         },
         "representation": (
-            "final normalized first-scale BOS state after the last NSM "
-            "transformer layer for each teacher-forced 128-base prefix and "
-            "128-base target window, then mean across windows"
+            "final normalized hierarchy BOS state after the last NSM "
+            "transformer layer, conditioned on the encoded prefix, then "
+            "mean across windows"
         ),
         "window_length": window_length,
         "window_stride": stride,

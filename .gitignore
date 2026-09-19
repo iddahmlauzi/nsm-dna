@@ -33,6 +33,9 @@ PROJECT_STATUS.md
 # Local generated datasets
 /datasets/gtdb/
 
+# Local training runs
+/runs/
+
 # Python and macOS-generated files
 .venv/
 .ruff_cache/

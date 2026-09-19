@@ -4,6 +4,7 @@
 .pytest_cache/
 documents/
 datasets/
+runs/
 __pycache__/
 *.py[cod]
 .DS_Store
