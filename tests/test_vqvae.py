@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from nsm_dna.models.autoencoder import Decoder, Encoder
 from nsm_dna.models.common import RMSNorm
-from nsm_dna.models.quantization import MultiscaleResidualVectorQuantizer
+from nsm_dna.models.quantization import MultiscaleVectorQuantizer
 from nsm_dna.models.vqvae import VQVAE
 from scripts.training.train_vqvae import evaluate
 
@@ -156,7 +156,7 @@ def test_vqvae_applies_qk_norm_to_encoder_and_decoder() -> None:
 
 
 def test_first_scale_sampler_uses_a_cascade() -> None:
-    quantizer = MultiscaleResidualVectorQuantizer(
+    quantizer = MultiscaleVectorQuantizer(
         scale_lengths=[4, 256],
         codebook_sizes=[4, 4],
         embed_dim=2,
@@ -192,7 +192,7 @@ def test_first_scale_sampler_uses_a_cascade() -> None:
 
 
 def test_code_corruption_only_changes_training_decoder_input(monkeypatch) -> None:
-    quantizer = MultiscaleResidualVectorQuantizer(
+    quantizer = MultiscaleVectorQuantizer(
         scale_lengths=[1, 2],
         codebook_sizes=[2, 2],
         embed_dim=1,
@@ -241,7 +241,7 @@ def test_code_corruption_only_changes_training_decoder_input(monkeypatch) -> Non
 
 
 def test_vq_loss_averages_every_cumulative_scale() -> None:
-    quantizer = MultiscaleResidualVectorQuantizer(
+    quantizer = MultiscaleVectorQuantizer(
         scale_lengths=[1, 2, 4],
         codebook_sizes=[4, 4, 4],
         embed_dim=2,

@@ -1,0 +1,16 @@
+checkpoint: ../runs/vqvae-256-continuous-final/checkpoints/best.pt
+output_directory: ../results/vqvae-256-continuous-final/region-structure
+
+data:
+  subset_directory: ../datasets/gtdb/500M_subset
+  split: validation
+  region_length: 8192
+  batch_size: 256
+  max_regions: null
+
+seed: 0
+device: cuda:0
+
+hydra:
+  run:
+    dir: ${output_directory}

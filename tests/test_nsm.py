@@ -12,7 +12,7 @@ from nsm_dna.models.next_scale import MultiscaleOutputHead, NSM
 def _build_model(
     *,
     num_layers: int = 1,
-    max_prefix_length: int = 0,
+    max_prefix_length: int = 4,
 ) -> NSM:
     return NSM(
         prefix_dim=3,
@@ -35,18 +35,22 @@ def _indices() -> list[torch.Tensor]:
     ]
 
 
+def _prefix_code() -> torch.Tensor:
+    return torch.tensor([[0], [1]])
+
+
 def test_nsm_from_checkpoint_restores_model_and_step(tmp_path: Path) -> None:
     codebook_vectors = [torch.randn(4, 3), torch.randn(5, 3)]
     tokenizer = SimpleNamespace(
         quantization_dim=3,
+        latent_length=2,
         scale_lengths=[1, 2],
         codebook_sizes=[4, 5],
         context_length=4,
         quantizer=SimpleNamespace(
-            codebooks=[
-                SimpleNamespace(codebook=vectors) for vectors in codebook_vectors
-            ]
+            codebooks=[SimpleNamespace(codebook=codebook_vectors[0])]
         ),
+        final_codebook_vectors=lambda: codebook_vectors[1],
     )
     model = NSM(
         prefix_dim=tokenizer.quantization_dim,
@@ -126,55 +130,37 @@ def test_multiscale_output_head_starts_as_linear_classifiers() -> None:
         torch.testing.assert_close(actual, expected)
 
 
-def test_hierarchy_inputs_are_cumulative_and_shifted_within_each_scale() -> None:
+def test_scale_inputs_are_explicit_codes_from_completed_scales() -> None:
     model = _build_model(num_layers=0)
     indices_by_scale = _indices()
 
-    inputs = model._embed_hierarchy_inputs(indices_by_scale)
+    inputs = model._embed_code_inputs(
+        [indices_by_scale[0], indices_by_scale[1][:, :1]]
+    )
     first_codes = model.codebook_vectors_0[indices_by_scale[0]]
-    second_codes = model.codebook_vectors_1[indices_by_scale[1]]
-    third_codes = model.codebook_vectors_2[indices_by_scale[2]]
+    second_codes = model.codebook_vectors_1[indices_by_scale[1][:, :1]]
     expected_inputs = torch.cat(
         [
-            torch.zeros(2, 1, 3),
-            first_codes.repeat_interleave(2, dim=1)
-            + torch.cat(
-                [torch.zeros_like(second_codes[:, :1]), second_codes[:, :1]],
-                dim=1,
-            ),
-            first_codes.repeat_interleave(4, dim=1)
-            + second_codes.repeat_interleave(2, dim=1)
-            + torch.cat(
-                [torch.zeros_like(third_codes[:, :1]), third_codes[:, :-1]],
-                dim=1,
-            ),
+            model.input_projection(first_codes) + model.scale_embedding.weight[0],
+            model.input_projection(second_codes) + model.scale_embedding.weight[1],
         ],
         dim=1,
     )
-    torch.testing.assert_close(inputs, model.input_projection(expected_inputs))
+    torch.testing.assert_close(inputs, expected_inputs)
 
 
-def test_hierarchy_attention_is_causal() -> None:
-    model = NSM(
-        prefix_dim=3,
-        model_dim=8,
-        scale_lengths=[1, 2],
-        codebook_sizes=[4, 5],
-        codebook_vectors=[torch.randn(4, 3), torch.randn(5, 3)],
-        num_layers=1,
-        num_heads=2,
-        dropout=0.0,
-    )
-
+def test_target_codes_are_causal() -> None:
+    model = _build_model()
     expected_mask = torch.tensor(
         [
-            [True, False, False],
-            [False, True, False],
-            [False, True, True],
+            [True, True, False, False],
+            [True, True, False, False],
+            [True, True, True, False],
+            [True, True, True, True],
         ]
-    ).reshape(1, 1, 3, 3)
+    ).reshape(1, 1, 4, 4)
 
-    torch.testing.assert_close(model.hierarchy_attention_mask, expected_mask)
+    torch.testing.assert_close(model._build_attention_mask(2, 4), expected_mask)
 
 
 def test_prefix_is_visible_to_every_causal_hierarchy_position() -> None:
@@ -195,38 +181,18 @@ def test_prefix_is_visible_to_every_causal_hierarchy_position() -> None:
             [True, True, False, False, False],
             [True, True, False, False, False],
             [True, True, True, False, False],
-            [True, True, False, True, False],
-            [True, True, False, True, True],
+            [True, True, True, True, False],
+            [True, True, True, True, True],
         ]
     ).reshape(1, 1, 5, 5)
 
-    torch.testing.assert_close(model._build_attention_mask(2), expected_mask)
+    torch.testing.assert_close(model._build_attention_mask(2, 5), expected_mask)
 
 
-def test_scale_ids_match_hierarchy_sections() -> None:
+def test_rope_positions_follow_the_flattened_input() -> None:
     model = _build_model()
-    torch.testing.assert_close(model.scale_ids, torch.tensor([0, 1, 1, 2, 2, 2, 2]))
-
-
-def test_rope_positions_restart_at_each_scale() -> None:
-    model = _build_model()
-
-    cosine, sine = model._get_rotary_embeddings(prefix_length=0)
-    torch.testing.assert_close(cosine, model.rope_cosine)
-    torch.testing.assert_close(sine, model.rope_sine)
-    torch.testing.assert_close(model.rope_cosine[0], model.rope_cosine[1])
-    torch.testing.assert_close(model.rope_cosine[1], model.rope_cosine[3])
+    assert not torch.equal(model.rope_cosine[0], model.rope_cosine[1])
     assert not torch.equal(model.rope_cosine[1], model.rope_cosine[2])
-
-
-def test_prefix_rope_precedes_hierarchy_positions() -> None:
-    model = _build_model(max_prefix_length=2)
-    cosine, sine = model._get_rotary_embeddings(prefix_length=2)
-
-    torch.testing.assert_close(cosine[:2], model.prefix_rope_cosine)
-    torch.testing.assert_close(sine[:2], model.prefix_rope_sine)
-    torch.testing.assert_close(cosine[2:], model.rope_cosine)
-    torch.testing.assert_close(sine[2:], model.rope_sine)
 
 
 def test_nsm_uses_rms_norm_and_qk_norm() -> None:
@@ -268,13 +234,14 @@ def test_nsm_scales_residual_projection_initialization() -> None:
 def test_nsm_predicts_every_codebook_including_scale_one() -> None:
     model = _build_model(num_layers=0)
     indices_by_scale = _indices()
+    prefix = torch.randn(2, 4, 3)
+    prefix_code = _prefix_code()
 
-    logits = model(indices_by_scale)
-    hierarchy_inputs = model._embed_hierarchy_inputs(indices_by_scale)
-    expected_hidden_states = model.final_norm(
-        hierarchy_inputs + model.scale_embedding(model.scale_ids)
+    logits = model(indices_by_scale, prefix=prefix, prefix_code=prefix_code)
+    expected_hidden_states = model.encode(
+        indices_by_scale, prefix=prefix, prefix_code=prefix_code
     )
-    expected_logits = model.output_head(expected_hidden_states)
+    expected_logits = model.output_head(expected_hidden_states[:, 5:])
 
     assert [value.shape for value in logits] == [
         (2, 1, 4),
@@ -285,21 +252,42 @@ def test_nsm_predicts_every_codebook_including_scale_one() -> None:
         torch.testing.assert_close(actual, expected)
 
 
+def test_prefix_scale_one_code_is_the_first_prediction_input() -> None:
+    model = _build_model(num_layers=0)
+    prefix = torch.randn(2, 4, 3)
+    prefix_code = _prefix_code()
+
+    hidden_states = model.encode(
+        _indices(), prefix=prefix, prefix_code=prefix_code
+    )
+    prefix_code_input = (
+        model.input_projection(model.codebook_vectors_0[prefix_code])
+        + model.scale_embedding.weight[0]
+    )
+
+    torch.testing.assert_close(
+        hidden_states[:, 5:6], model.final_norm(prefix_code_input)
+    )
+
+
 def test_nsm_returns_prefix_and_hierarchy_hidden_states() -> None:
     model = _build_model(num_layers=0, max_prefix_length=4)
     prefix = torch.randn(2, 4, 3)
     indices_by_scale = _indices()
+    prefix_code = _prefix_code()
 
-    hidden_states = model.encode(indices_by_scale, prefix=prefix)
-    logits = model(indices_by_scale, prefix=prefix)
+    hidden_states = model.encode(
+        indices_by_scale, prefix=prefix, prefix_code=prefix_code
+    )
+    logits = model(indices_by_scale, prefix=prefix, prefix_code=prefix_code)
 
-    assert hidden_states.shape == (2, 11, 8)
+    assert hidden_states.shape == (2, 12, 8)
     assert [value.shape for value in logits] == [
         (2, 1, 4),
         (2, 2, 5),
         (2, 4, 6),
     ]
-    expected_logits = model.output_head(hidden_states[:, 4:])
+    expected_logits = model.output_head(hidden_states[:, 5:])
     for actual, expected in zip(logits, expected_logits, strict=True):
         torch.testing.assert_close(actual, expected)
 
@@ -307,12 +295,14 @@ def test_nsm_returns_prefix_and_hierarchy_hidden_states() -> None:
 def test_current_code_cannot_change_its_own_or_earlier_logits() -> None:
     torch.manual_seed(0)
     model = _build_model(num_layers=2).eval()
+    prefix = torch.randn(2, 4, 3)
+    prefix_code = _prefix_code()
     indices_by_scale = _indices()
     changed_indices = [indices.clone() for indices in indices_by_scale]
     changed_indices[1][:, 0] = (changed_indices[1][:, 0] + 1) % 5
 
-    logits = model(indices_by_scale)
-    changed_logits = model(changed_indices)
+    logits = model(indices_by_scale, prefix=prefix, prefix_code=prefix_code)
+    changed_logits = model(changed_indices, prefix=prefix, prefix_code=prefix_code)
 
     # A code first enters its own scale at the next position.
     torch.testing.assert_close(logits[0], changed_logits[0])
@@ -323,12 +313,37 @@ def test_current_code_cannot_change_its_own_or_earlier_logits() -> None:
 def test_first_scale_is_predicted_without_supplying_its_code() -> None:
     torch.manual_seed(0)
     model = _build_model(num_layers=1).eval()
+    prefix = torch.randn(2, 4, 3)
+    prefix_code = _prefix_code()
     indices_by_scale = _indices()
     changed_indices = [indices.clone() for indices in indices_by_scale]
     changed_indices[0][:, 0] = (changed_indices[0][:, 0] + 1) % 4
 
-    logits = model(indices_by_scale)
-    changed_logits = model(changed_indices)
+    logits = model(indices_by_scale, prefix=prefix, prefix_code=prefix_code)
+    changed_logits = model(changed_indices, prefix=prefix, prefix_code=prefix_code)
 
     torch.testing.assert_close(logits[0], changed_logits[0])
     assert not torch.equal(logits[1], changed_logits[1])
+
+
+def test_teacher_forced_logits_match_stepwise_prediction() -> None:
+    model = _build_model(num_layers=1).eval()
+    prefix = torch.randn(2, 4, 3)
+    prefix_code = _prefix_code()
+    indices_by_scale = _indices()
+
+    teacher_forced_logits = model(
+        indices_by_scale, prefix=prefix, prefix_code=prefix_code
+    )
+    for scale_index, indices in enumerate(indices_by_scale):
+        for position in range(indices.shape[1]):
+            step_logits = model.predict_scale(
+                prefix,
+                prefix_code,
+                indices_by_scale[:scale_index],
+                indices[:, :position],
+            )
+            torch.testing.assert_close(
+                step_logits,
+                teacher_forced_logits[scale_index][:, position],
+            )

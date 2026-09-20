@@ -260,6 +260,7 @@ def main(config: DictConfig) -> None:
                 logits_by_scale = model(
                     prediction.targets_by_scale,
                     prefix=prediction.prefix,
+                    prefix_code=prediction.prefix_code,
                 )
             update_condition_metrics(
                 condition_metrics[condition_name],
@@ -286,6 +287,7 @@ def main(config: DictConfig) -> None:
                     tokenizer,
                     batch_size=prediction.target_ids.shape[0],
                     prefix=prediction.prefix,
+                    prefix_code=prediction.prefix_code,
                 )
                 for scale_index, (rollout_targets, true_targets) in enumerate(
                     zip(
@@ -303,18 +305,19 @@ def main(config: DictConfig) -> None:
                 dtype=torch.bfloat16,
                 enabled=device.type == "cuda",
             ):
+                final_scale_index = len(true_indices) - 1
                 reconstruction_logits = {
-                    "tokenizer": tokenizer.decode(true_indices),
-                    "first_scale_only": tokenizer.decode(
-                        [prediction.targets_by_scale[0]]
+                    "tokenizer": tokenizer.decode_scale(
+                        true_indices[-1], final_scale_index
                     ),
-                    "teacher_forced_argmax": tokenizer.decode(
-                        teacher_forced_indices
+                    "first_scale_only": tokenizer.decode_scale(true_indices[0], 0),
+                    "teacher_forced_argmax": tokenizer.decode_scale(
+                        teacher_forced_indices[-1], final_scale_index
                     ),
                 }
                 if batch_index < int(config.data.rollout_max_batches):
-                    reconstruction_logits["rollout_argmax"] = tokenizer.decode(
-                        rollout_indices
+                    reconstruction_logits["rollout_argmax"] = tokenizer.decode_scale(
+                        rollout_indices[-1], final_scale_index
                     )
             for name, logits in reconstruction_logits.items():
                 update_reconstruction_metrics(

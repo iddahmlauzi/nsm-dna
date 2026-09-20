@@ -19,25 +19,25 @@ from scripts.training.train_nsm import (
 def _build_tokenizer() -> VQVAE:
     return VQVAE(
         vocab_size=4,
-        context_length=4,
+        context_length=16,
         latent_length=4,
         embed_dim=8,
         quantization_dim=4,
         num_heads=2,
         scale_lengths=[1, 2, 4],
-        codebook_sizes=[4, 6, 8],
+        codebook_sizes=[4, 6, 256],
         decoder_num_layers=1,
         use_qk_norm=True,
     )
 
 
-def _build_nsm(max_prefix_length: int = 0) -> NSM:
+def _build_nsm(max_prefix_length: int = 4) -> NSM:
     return NSM(
         prefix_dim=4,
         model_dim=8,
         scale_lengths=[1, 2, 4],
-        codebook_sizes=[4, 6, 8],
-        codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(8, 4)],
+        codebook_sizes=[4, 6, 256],
+        codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(256, 4)],
         num_layers=1,
         num_heads=2,
         dropout=0.0,
@@ -179,13 +179,13 @@ def test_tokenizer_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
             "config": {
                 "model": {
                     "vocab_size": 4,
-                    "context_length": 4,
+                    "context_length": 16,
                     "latent_length": 4,
                     "embed_dim": 8,
                     "quantization_dim": 4,
                     "num_heads": 2,
                     "scale_lengths": [1, 2, 4],
-                    "codebook_sizes": [4, 6, 8],
+                    "codebook_sizes": [4, 6, 256],
                     "decoder_num_layers": 1,
                     "use_qk_norm": True,
                     "bias": False,
@@ -231,15 +231,20 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     tokenizer = _build_tokenizer().eval()
     tokenizer.requires_grad_(False)
     model = _build_nsm()
-    input_ids = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
+    input_ids = torch.arange(2 * 32).reshape(2, 32) % 4
     scale_weights = build_scale_loss_weights(
         tokenizer.scale_lengths,
         scale_loss_alpha=0.25,
         device=torch.device("cpu"),
     )
 
-    indices_by_scale = tokenizer.encode_indices(input_ids)
-    logits_by_scale = model(indices_by_scale)
+    prediction = prepare_block_predictions(tokenizer, input_ids)[0]
+    indices_by_scale = prediction.targets_by_scale
+    logits_by_scale = model(
+        indices_by_scale,
+        prefix=prediction.prefix,
+        prefix_code=prediction.prefix_code,
+    )
     loss, _ = compute_next_scale_loss(
         logits_by_scale,
         indices_by_scale,
@@ -251,7 +256,7 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     assert [logits.shape for logits in logits_by_scale] == [
         (2, 1, 4),
         (2, 2, 6),
-        (2, 4, 8),
+        (2, 4, 256),
     ]
     assert all(parameter.grad is None for parameter in tokenizer.parameters())
     assert any(parameter.grad is not None for parameter in model.parameters())
@@ -259,9 +264,9 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
 
 def test_block_prediction_uses_first_block_as_prefix_and_second_as_target() -> None:
     tokenizer = _build_tokenizer().eval()
-    input_ids = torch.arange(2 * 8).reshape(2, 8) % 4
-    prefix_ids = input_ids[:, :4]
-    target_ids = input_ids[:, 4:]
+    input_ids = torch.arange(2 * 32).reshape(2, 32) % 4
+    prefix_ids = input_ids[:, :16]
+    target_ids = input_ids[:, 16:]
 
     block_predictions = prepare_block_predictions(tokenizer, input_ids)
     assert len(block_predictions) == 1
@@ -269,6 +274,9 @@ def test_block_prediction_uses_first_block_as_prefix_and_second_as_target() -> N
     prediction = block_predictions[0]
     torch.testing.assert_close(prediction.target_ids, target_ids)
     torch.testing.assert_close(prediction.prefix, tokenizer.encode(prefix_ids))
+    torch.testing.assert_close(
+        prediction.prefix_code, tokenizer.encode_indices(prefix_ids)[0]
+    )
 
     expected_targets = tokenizer.encode_indices(target_ids)
     for actual, expected in zip(prediction.targets_by_scale, expected_targets):
@@ -281,7 +289,7 @@ def test_default_config_matches_fixed_hierarchy_recipe() -> None:
 
     assert config.run.resume_from is None
     assert config.tokenizer_checkpoint.endswith(
-        "vqvae-256-progressive/checkpoints/best.pt"
+        "vqvae-256-continuous-final/checkpoints/best.pt"
     )
     assert config.data.subset_directory.endswith("gtdb/500M_subset")
     assert config.data.sequence_length == 512
@@ -313,7 +321,7 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
     tokenizer = _build_tokenizer().eval()
     tokenizer.requires_grad_(False)
     model = _build_nsm(max_prefix_length=4)
-    input_ids = torch.arange(2 * 8).reshape(2, 8) % 4
+    input_ids = torch.arange(2 * 32).reshape(2, 32) % 4
     scale_weights = build_scale_loss_weights(
         tokenizer.scale_lengths,
         scale_loss_alpha=0.25,
@@ -346,34 +354,36 @@ def test_rollout_feeds_each_prediction_back_into_the_hierarchy() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.device_anchor = torch.nn.Parameter(torch.zeros(()))
-            self.inputs: list[list[torch.Tensor]] = []
+            self.inputs: list[tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]] = []
 
-        def forward(
+        def predict_scale(
             self,
-            indices_by_scale: list[torch.Tensor],
-            *,
-            prefix: torch.Tensor | None,
-        ) -> list[torch.Tensor]:
+            prefix: torch.Tensor,
+            prefix_code: torch.Tensor,
+            completed_scales: list[torch.Tensor],
+            current_codes: torch.Tensor,
+        ) -> torch.Tensor:
             del prefix
-            self.inputs.append([indices.clone() for indices in indices_by_scale])
+            self.inputs.append(
+                (
+                    prefix_code.clone(),
+                    [indices.clone() for indices in completed_scales],
+                    current_codes.clone(),
+                )
+            )
             call_index = len(self.inputs) - 1
-            logits_by_scale = []
-            for scale_length, codebook_size in zip(
-                tokenizer.scale_lengths,
-                codebook_sizes,
-                strict=True,
-            ):
-                logits = torch.full((2, scale_length, codebook_size), -1.0)
-                logits[..., (call_index + 1) % codebook_size] = 1.0
-                logits_by_scale.append(logits)
-            return logits_by_scale
+            codebook_size = codebook_sizes[len(completed_scales)]
+            logits = torch.full((2, codebook_size), -1.0)
+            logits[:, (call_index + 1) % codebook_size] = 1.0
+            return logits
 
     model = StubModel()
     predicted_indices_by_scale = rollout_hierarchy(
         model,
         tokenizer,
         batch_size=2,
-        prefix=None,
+        prefix=torch.zeros(2, 4, 4),
+        prefix_code=torch.tensor([[1], [2]]),
     )
 
     assert [indices.shape for indices in predicted_indices_by_scale] == [
@@ -385,8 +395,9 @@ def test_rollout_feeds_each_prediction_back_into_the_hierarchy() -> None:
         predicted_indices_by_scale[0],
         torch.ones(2, 1, dtype=torch.long),
     )
-    torch.testing.assert_close(model.inputs[1][0], predicted_indices_by_scale[0])
+    torch.testing.assert_close(model.inputs[0][0], torch.tensor([[1], [2]]))
+    torch.testing.assert_close(model.inputs[1][1][0], predicted_indices_by_scale[0])
     torch.testing.assert_close(
-        model.inputs[2][1][:, :1],
+        model.inputs[2][2],
         predicted_indices_by_scale[1][:, :1],
     )

@@ -23,10 +23,19 @@ def test_window_encoder_extracts_final_first_scale_memory_state() -> None:
             indices_by_scale: list[torch.Tensor],
             *,
             prefix: torch.Tensor,
+            prefix_code: torch.Tensor,
         ) -> torch.Tensor:
-            del indices_by_scale, prefix
+            del indices_by_scale, prefix, prefix_code
             return torch.tensor(
-                [[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]
+                [
+                    [
+                        [1.0, 2.0],
+                        [3.0, 4.0],
+                        [9.0, 10.0],
+                        [5.0, 6.0],
+                        [7.0, 8.0],
+                    ]
+                ]
             )
 
     encoder = NSMWindowEncoder(StubModel(), StubTokenizer())

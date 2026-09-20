@@ -104,8 +104,8 @@ class EMACodebook(nn.Module):
         return self.codebook_hits.float().mean()
 
 
-class MultiscaleResidualVectorQuantizer(nn.Module):
-    """Multiscale residual vector quantizer."""
+class MultiscaleVectorQuantizer(nn.Module):
+    """Quantize independent pooled views of one encoder latent."""
 
     def __init__(
         self,
@@ -114,23 +114,15 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         quantization_dim: int,
         *,
         latent_length: int,
-        # Codebook updates and quantization loss
-        commitment_cost: float = 0.25,
         decay: float = 0.99,
         eps: float = 1e-5,
     ) -> None:
         super().__init__()
 
-        if len(scale_lengths) != len(codebook_sizes):
-            raise ValueError("Each scale length must have one codebook size.")
-        if scale_lengths[-1] != latent_length:
-            raise ValueError("The final scale length must equal the latent length.")
-
         self.scale_lengths = list(scale_lengths)
         self.codebook_sizes = list(codebook_sizes)
         self.quantization_dim = quantization_dim
         self.latent_length = latent_length
-        self.commitment_cost = commitment_cost
 
         self.codebooks = nn.ModuleList(
             EMACodebook(
@@ -164,32 +156,16 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
 
     def _upsample_to_full_length(
         self,
-        quantized: Float[Tensor, "batch quantization_dim scale_length"],
+        quantized: Float[Tensor, "batch scale_length quantization_dim"],
         scale_index: int,
-    ) -> Float[Tensor, "batch quantization_dim length"]:
+    ) -> Float[Tensor, "batch length quantization_dim"]:
         """Repeat each scale vector across its corresponding latent block."""
         scale_length = self.scale_lengths[scale_index]
         if scale_length == self.latent_length:
             return quantized
 
         repeats_per_position = self.latent_length // scale_length
-        return quantized.repeat_interleave(repeats_per_position, dim=-1)
-
-    def _prepare_scale_contribution(
-        self,
-        quantized_at_scale: Float[
-            Tensor,
-            "batch scale_length quantization_dim",
-        ],
-        scale_index: int,
-    ) -> Float[Tensor, "batch length quantization_dim"]:
-        """Expand one scale's quantized vectors to the full latent length."""
-        quantized_at_scale = einx.id("b l d -> b d l", quantized_at_scale)
-        scale_contribution = self._upsample_to_full_length(
-            quantized_at_scale,
-            scale_index,
-        )
-        return einx.id("b d l -> b l d", scale_contribution)
+        return quantized.repeat_interleave(repeats_per_position, dim=1)
 
     def forward(
         self,
@@ -197,31 +173,21 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         *,
         include_partial_reconstruction: bool = False,
     ) -> tuple[
-        Float[Tensor, "batch length quantization_dim"],
         Float[Tensor, "batch length quantization_dim"] | None,
-        Float[Tensor, ""],
         list[Int[Tensor, "batch scale_length"]],
     ]:
-        """Quantize an encoder latent into cumulative multiscale contributions.
+        """Quantize pooled views of the continuous latent at coarse scales.
 
-        When partial reconstruction is enabled, the second return value is one
-        randomly selected non-final cumulative latent. The caller decodes that
-        latent and computes the auxiliary reconstruction loss against the input
-        tokens.
+        When partial reconstruction is enabled, return one randomly selected
+        scale latent for auxiliary reconstruction.
         """
         x = x.float()
-
-        # Quantize the encoder output without backpropagating through the residual
-        # hierarchy. The commitment loss and final STE provide encoder gradients.
-        detached_x = x.detach()
-        residual = detached_x
-        reconstruction = torch.zeros_like(residual)
 
         partial_scale_index = None
         if include_partial_reconstruction:
             partial_scale_index = torch.randint(
                 low=0,
-                high=len(self.scale_lengths) - 1,
+                high=len(self.scale_lengths),
                 size=(),
             ).item()
 
@@ -229,59 +195,50 @@ class MultiscaleResidualVectorQuantizer(nn.Module):
         partial_quantized_latent: Tensor | None = None
 
         for scale_index, codebook in enumerate(self.codebooks):
-            scaled_residual = self._resize_to_scale(residual, scale_index)
-            quantized_at_scale, scale_indices = codebook(scaled_residual)
+            pooled_latent = self._resize_to_scale(x, scale_index)
+            quantized_at_scale, scale_indices = codebook(pooled_latent)
             indices_by_scale.append(scale_indices)
 
-            scale_contribution = self._prepare_scale_contribution(
-                quantized_at_scale,
-                scale_index,
+            # Backpropagate reconstruction through the same pooling operation
+            # that produced the codebook input.
+            quantized_with_gradient = pooled_latent + (
+                quantized_at_scale - pooled_latent
+            ).detach()
+            scale_latent = self._upsample_to_full_length(
+                quantized_with_gradient, scale_index
             )
-            reconstruction = reconstruction + scale_contribution
-            residual = residual - scale_contribution
 
             if scale_index == partial_scale_index:
-                partial_quantized_latent = x + (reconstruction - x).detach()
+                partial_quantized_latent = scale_latent
 
-        commitment_loss = self.commitment_cost * F.mse_loss(
-            x,
-            reconstruction.detach(),
-        )
-        quantized_latent = x + (reconstruction - x).detach()
+        return partial_quantized_latent, indices_by_scale
 
-        return (
-            quantized_latent,
-            partial_quantized_latent,
-            commitment_loss,
-            indices_by_scale,
+    @torch.no_grad()
+    def indices_to_scale_latent(
+        self,
+        scale_indices: Int[Tensor, "batch scale_length"],
+        scale_index: int,
+    ) -> Float[Tensor, "batch length quantization_dim"]:
+        """Expand one scale's code vectors to the full latent length."""
+        codebook = self.codebooks[scale_index]
+        return self._upsample_to_full_length(
+            codebook.codebook[scale_indices], scale_index
         )
 
     @torch.no_grad()
-    def indices_to_cumulative_latents(
+    def indices_to_scale_latents(
         self,
         indices_by_scale: list[Int[Tensor, "batch scale_length"]],
     ) -> list[Float[Tensor, "batch length quantization_dim"]]:
-        """Reconstruct the latent after successively adding each scale."""
-        batch_size = indices_by_scale[0].shape[0]
-        reconstruction = self.codebooks[0].codebook.new_zeros(
-            batch_size,
-            self.latent_length,
-            self.quantization_dim,
-        )
-        cumulative_latents: list[Tensor] = []
+        """Expand each scale's codes without combining them with other scales."""
+        scale_latents: list[Tensor] = []
 
-        for scale_index, (codebook, scale_indices) in enumerate(
-            zip(self.codebooks, indices_by_scale)
-        ):
-            quantized_at_scale = codebook.codebook[scale_indices]
-            scale_contribution = self._prepare_scale_contribution(
-                quantized_at_scale,
-                scale_index,
+        for scale_index, scale_indices in enumerate(indices_by_scale):
+            scale_latents.append(
+                self.indices_to_scale_latent(scale_indices, scale_index)
             )
-            reconstruction = reconstruction + scale_contribution
-            cumulative_latents.append(reconstruction)
 
-        return cumulative_latents
+        return scale_latents
 
     @property
     def utilization_by_scale(self) -> list[Float[Tensor, ""]]:

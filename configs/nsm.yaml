@@ -1,4 +1,4 @@
-# Cumulative-scale NSM-DNA with autoregressive prediction within each scale.
+# Predict absolute scales from 64 prefix latents, its scale-1 code, and earlier target codes.
 
 run:
   seed: 0
@@ -6,13 +6,13 @@ run:
 
 # The checkpoint's stored model configuration is the source of truth for the
 # tokenizer architecture, scale lengths, and codebook sizes.
-tokenizer_checkpoint: ../runs/vqvae-256-progressive/checkpoints/best.pt
+tokenizer_checkpoint: ../runs/vqvae-256-continuous-final/checkpoints/best.pt
 
 wandb:
   enabled: true
   entity: nsm-dna
   project: nsm
-  name: nsm-256-cum-ar
+  name: nsm-256-prefix-scale1
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset

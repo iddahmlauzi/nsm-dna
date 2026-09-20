@@ -34,7 +34,8 @@ class BlockPredictionBatch:
     """Inputs and targets for predicting one block from its preceding blocks."""
 
     target_ids: Int[Tensor, "batch block_length"]
-    prefix: Float[Tensor, "batch prefix_length vq_dim"] | None
+    prefix: Float[Tensor, "batch prefix_length vq_dim"]
+    prefix_code: Int[Tensor, "batch 1"]
     targets_by_scale: list[Int[Tensor, "batch scale_length"]]
 
 
@@ -85,12 +86,14 @@ def prepare_block_predictions(
     prefix_ids = input_ids[:, :block_length]
     target_ids = input_ids[:, block_length:]
     prefix = tokenizer.encode(prefix_ids)
+    _, prefix_indices_by_scale = tokenizer.quantizer(prefix)
     indices_by_scale = tokenizer.encode_indices(target_ids)
 
     return [
         BlockPredictionBatch(
             target_ids=target_ids,
             prefix=prefix,
+            prefix_code=prefix_indices_by_scale[0],
             targets_by_scale=indices_by_scale,
         )
     ]
@@ -101,7 +104,8 @@ def rollout_hierarchy(
     model: NSM,
     tokenizer: VQVAE,
     batch_size: int,
-    prefix: Float[Tensor, "batch prefix_length vq_dim"] | None,
+    prefix: Float[Tensor, "batch prefix_length vq_dim"],
+    prefix_code: Int[Tensor, "batch 1"],
 ) -> list[Int[Tensor, "batch scale_length"]]:
     """Greedily generate every hierarchy code in coarse-to-fine order."""
     device = next(model.parameters()).device
@@ -117,10 +121,15 @@ def rollout_hierarchy(
 
     for scale_index, scale_length in enumerate(tokenizer.scale_lengths):
         for position in range(scale_length):
-            logits_by_scale = model(predicted_indices_by_scale, prefix=prefix)
-            predicted_indices_by_scale[scale_index][:, position] = logits_by_scale[
-                scale_index
-            ][:, position].argmax(dim=-1)
+            logits = model.predict_scale(
+                prefix,
+                prefix_code,
+                predicted_indices_by_scale[:scale_index],
+                predicted_indices_by_scale[scale_index][:, :position],
+            )
+            predicted_indices_by_scale[scale_index][:, position] = logits.argmax(
+                dim=-1
+            )
 
     return predicted_indices_by_scale
 
@@ -173,6 +182,7 @@ def evaluate(
                 logits_by_scale = model(
                     prediction.targets_by_scale,
                     prefix=prediction.prefix,
+                    prefix_code=prediction.prefix_code,
                 )
                 loss, _ = compute_next_scale_loss(
                     logits_by_scale,
@@ -180,16 +190,19 @@ def evaluate(
                     scale_loss_weights,
                 )
 
-                # Rollout predicts the first scale from the real prefix, then
-                # builds each later cumulative input from generated codes.
+                # Rollout predicts the first scale from the real prefix and its
+                # coarse code, then supplies generated target codes.
                 if batch_index < rollout_max_batches:
                     rollout_indices = rollout_hierarchy(
                         model,
                         tokenizer,
                         batch_size=prediction.target_ids.shape[0],
                         prefix=prediction.prefix,
+                        prefix_code=prediction.prefix_code,
                     )
-                    rollout_logits = tokenizer.decode(rollout_indices)
+                    rollout_logits = tokenizer.decode_scale(
+                        rollout_indices[-1], num_scales - 1
+                    )
                     rollout_nucleotide_loss = F.cross_entropy(
                         rollout_logits.flatten(0, 1),
                         prediction.target_ids.flatten(),
@@ -441,6 +454,7 @@ def main(config: DictConfig) -> None:
                         logits_by_scale = training_model(
                             prediction.targets_by_scale,
                             prefix=prediction.prefix,
+                            prefix_code=prediction.prefix_code,
                         )
                         loss, _ = compute_next_scale_loss(
                             logits_by_scale,

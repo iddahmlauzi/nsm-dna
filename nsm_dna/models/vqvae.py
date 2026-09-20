@@ -7,11 +7,11 @@ from omegaconf import OmegaConf
 from torch import Tensor
 
 from .autoencoder import Decoder, Encoder
-from .quantization import MultiscaleResidualVectorQuantizer
+from .quantization import MultiscaleVectorQuantizer
 
 
 class VQVAE(nn.Module):
-    """VQ-VAE with a multiscale residual quantization bottleneck."""
+    """VQ-VAE with quantized coarse views and a continuous final latent."""
 
     def __init__(
         self,
@@ -28,7 +28,6 @@ class VQVAE(nn.Module):
         use_qk_norm: bool = False,
         bias: bool = False,
         rope_base: float = 10000.0,
-        commitment_cost: float = 0.25,
         decay: float = 0.99,
         eps: float = 1e-5,
     ) -> None:
@@ -45,6 +44,8 @@ class VQVAE(nn.Module):
         self.rope_base = rope_base
         self.scale_lengths = list(scale_lengths)
         self.codebook_sizes = list(codebook_sizes)
+        if context_length != 4 * latent_length or codebook_sizes[-1] != 256:
+            raise ValueError("The final scale requires one code for each 4-mer.")
 
         self.encoder = Encoder(
             self.vocab_size,
@@ -55,12 +56,11 @@ class VQVAE(nn.Module):
             bias=bias,
         )
 
-        self.quantizer = MultiscaleResidualVectorQuantizer(
-            self.scale_lengths,
-            self.codebook_sizes,
+        self.quantizer = MultiscaleVectorQuantizer(
+            self.scale_lengths[:-1],
+            self.codebook_sizes[:-1],
             self.quantization_dim,
             latent_length=self.latent_length,
-            commitment_cost=commitment_cost,
             decay=decay,
             eps=eps,
         )
@@ -106,7 +106,6 @@ class VQVAE(nn.Module):
             codebook_sizes=list(config.codebook_sizes),
             bias=config.bias,
             rope_base=config.rope_base,
-            commitment_cost=config.commitment_cost,
             decay=config.decay,
             eps=config.eps,
         )
@@ -123,12 +122,36 @@ class VQVAE(nn.Module):
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> Float[Tensor, "batch latent_length quantization_dim"]:
-        """Encode DNA into the normalized continuous latent space.
-
-        VQ-VAE training quantizes this latent before reconstruction. NSM-DNA
-        uses the same latent directly when a completed block is prefix context.
-        """
+        """Encode DNA into the normalized 64-position continuous latent."""
         return self.encoder(token_ids)
+
+    @torch.no_grad()
+    def final_codebook_vectors(self) -> Float[Tensor, "256 quantization_dim"]:
+        """Enumerate the trained encoder vector for every possible 4-mer."""
+        fourmer_ids = torch.arange(
+            256, device=self.encoder.token_embedding.weight.device
+        )
+        token_ids = torch.stack(
+            [
+                (fourmer_ids // 64) % 4,
+                (fourmer_ids // 16) % 4,
+                (fourmer_ids // 4) % 4,
+                fourmer_ids % 4,
+            ],
+            dim=1,
+        )
+        return self.encode(token_ids)[:, 0]
+
+    def _final_indices(
+        self, token_ids: Int[Tensor, "batch length"]
+    ) -> Int[Tensor, "batch latent_length"]:
+        fourmers = token_ids.reshape(token_ids.shape[0], self.latent_length, 4)
+        return (
+            fourmers[:, :, 0] * 64
+            + fourmers[:, :, 1] * 16
+            + fourmers[:, :, 2] * 4
+            + fourmers[:, :, 3]
+        )
 
     def forward(
         self,
@@ -138,65 +161,59 @@ class VQVAE(nn.Module):
     ) -> tuple[
         Float[Tensor, "batch length vocab_size"],
         Float[Tensor, "batch length vocab_size"] | None,
-        Float[Tensor, ""],
         list[Int[Tensor, "batch scale_length"]],
     ]:
         latent = self.encode(token_ids)
-        (
-            quantized_latent,
-            partial_quantized_latent,
-            commitment_loss,
-            indices_by_scale,
-        ) = self.quantizer(
+        partial_quantized_latent, coarse_indices = self.quantizer(
             latent,
             include_partial_reconstruction=include_partial_reconstruction,
         )
-        logits = self.decoder(quantized_latent)
+        logits = self.decoder(latent)
 
         partial_logits = None
         if partial_quantized_latent is not None:
             partial_logits = self.decoder(partial_quantized_latent)
 
-        return logits, partial_logits, commitment_loss, indices_by_scale
+        return logits, partial_logits, [*coarse_indices, self._final_indices(token_ids)]
 
     @torch.no_grad()
     def encode_indices(
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> list[Int[Tensor, "batch scale_length"]]:
-        """Encode target blocks into discrete codebook indices at every scale.
-
-        These indices provide both teacher-forced hierarchy inputs and prediction
-        targets for stage-two NSM-DNA training.
-        """
+        """Encode a target block into independent code indices at every scale."""
         if self.training:
             raise RuntimeError("Call model.eval() before encoding sequences.")
 
         latent = self.encode(token_ids)
-        _, _, _, indices_by_scale = self.quantizer(latent)
-        return indices_by_scale
+        _, coarse_indices = self.quantizer(latent)
+        return [*coarse_indices, self._final_indices(token_ids)]
 
     @torch.no_grad()
-    def decode(
+    def decode_scale(
         self,
-        indices_by_scale: list[Int[Tensor, "batch scale_length"]],
+        scale_indices: Int[Tensor, "batch scale_length"],
+        scale_index: int,
     ) -> Float[Tensor, "batch length vocab_size"]:
-        """Decode a complete hierarchy of codebook indices into nucleotide logits."""
-        quantized_latent = self.quantizer.indices_to_cumulative_latents(
-            indices_by_scale
-        )[-1]
-        return self.decoder(quantized_latent)
+        """Decode one scale's absolute codes into nucleotide logits."""
+        if scale_index == len(self.scale_lengths) - 1:
+            scale_latent = self.final_codebook_vectors()[scale_indices]
+        else:
+            scale_latent = self.quantizer.indices_to_scale_latent(
+                scale_indices, scale_index
+            )
+        return self.decoder(scale_latent)
 
     @torch.no_grad()
-    def decode_cumulative(
+    def decode_scales(
         self,
         indices_by_scale: list[Int[Tensor, "batch scale_length"]],
     ) -> list[Float[Tensor, "batch length vocab_size"]]:
-        """Decode the reconstruction after each additional quantization scale."""
-        cumulative_latents = self.quantizer.indices_to_cumulative_latents(
-            indices_by_scale
-        )
-        return [self.decoder(latent) for latent in cumulative_latents]
+        """Decode each scale independently."""
+        return [
+            self.decode_scale(scale_indices, scale_index)
+            for scale_index, scale_indices in enumerate(indices_by_scale)
+        ]
 
     @property
     def utilization_by_scale(self) -> list[Float[Tensor, ""]]:

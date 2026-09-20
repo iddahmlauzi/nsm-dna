@@ -32,7 +32,7 @@ def evaluate(
     partial_reconstruction_weight: float,
     max_batches: int | None = None,
 ) -> dict[str, float]:
-    """Evaluate full and cumulative reconstruction without updating codebooks.
+    """Evaluate reconstruction at each independent scale without updating codebooks.
 
     Evaluate the entire data loader when max_batches is None.
     """
@@ -41,20 +41,18 @@ def evaluate(
     device = next(model.parameters()).device
 
     full_reconstruction_loss_sum = 0.0
-    commitment_loss_sum = 0.0
     correct_tokens = 0
     num_tokens = 0
     num_batches = 0
 
-    # Decoder quality after adding each successive scale.
+    # Decoder quality from each scale on its own.
     reconstruction_loss_sums_by_scale = [0.0] * len(model.scale_lengths)
     correct_tokens_by_scale = [0] * len(model.scale_lengths)
 
-    # Distance between each cumulative quantized latent and the encoder latent.
+    # Distance between each scale's expanded latent and the encoder latent.
     latent_mse_sums_by_scale = [0.0] * len(model.scale_lengths)
 
-    # Squared values used to measure the magnitude added by each scale.
-    contribution_squared_sums_by_scale = [0.0] * len(model.scale_lengths)
+    scale_latent_squared_sums_by_scale = [0.0] * len(model.scale_lengths)
 
     # Assignment frequencies used to calculate effective codebook size.
     code_counts_by_scale = [
@@ -76,22 +74,21 @@ def evaluate(
             dtype=torch.bfloat16,
             enabled=use_mixed_precision,
         ):
-            logits, _, commitment_loss, indices_by_scale = model(input_ids)
+            logits, _, indices_by_scale = model(input_ids)
             full_reconstruction_loss = F.cross_entropy(
                 logits.flatten(0, 1),
                 input_ids.flatten(),
             )
 
             encoder_latent = model.encode(input_ids)
-            cumulative_latents = model.quantizer.indices_to_cumulative_latents(
-                indices_by_scale
-            )
-            previous_latent = torch.zeros_like(cumulative_latents[0])
+            scale_latents = model.quantizer.indices_to_scale_latents(
+                indices_by_scale[:-1]
+            ) + [encoder_latent]
 
             encoder_latent_squared_sum += encoder_latent.float().square().sum().item()
             num_latent_values += encoder_latent.numel()
-            for scale_index, cumulative_latent in enumerate(cumulative_latents):
-                scale_logits = model.decoder(cumulative_latent)
+            for scale_index, scale_latent in enumerate(scale_latents):
+                scale_logits = model.decoder(scale_latent)
                 scale_reconstruction_loss = F.cross_entropy(
                     scale_logits.flatten(0, 1),
                     input_ids.flatten(),
@@ -103,15 +100,12 @@ def evaluate(
                     (scale_logits.argmax(dim=-1) == input_ids).sum().item()
                 )
                 latent_mse_sums_by_scale[scale_index] += F.mse_loss(
-                    cumulative_latent.float(),
+                    scale_latent.float(),
                     encoder_latent.float(),
                 ).item()
-
-                scale_contribution = cumulative_latent - previous_latent
-                contribution_squared_sums_by_scale[scale_index] += (
-                    scale_contribution.float().square().sum().item()
+                scale_latent_squared_sums_by_scale[scale_index] += (
+                    scale_latent.float().square().sum().item()
                 )
-                previous_latent = cumulative_latent
 
         for scale_index, scale_indices in enumerate(indices_by_scale):
             code_counts_by_scale[scale_index] += torch.bincount(
@@ -120,7 +114,6 @@ def evaluate(
             )
 
         full_reconstruction_loss_sum += full_reconstruction_loss.item()
-        commitment_loss_sum += commitment_loss.item()
         correct_tokens += (logits.argmax(dim=-1) == input_ids).sum().item()
         num_tokens += input_ids.numel()
         num_batches += 1
@@ -132,15 +125,12 @@ def evaluate(
     partial_reconstruction_loss = sum(
         reconstruction_loss_sums_by_scale[:-1]
     ) / ((len(model.scale_lengths) - 1) * num_batches)
-    commitment_loss = commitment_loss_sum / num_batches
     metrics = {
         "full_reconstruction_loss": full_reconstruction_loss,
         "partial_reconstruction_loss": partial_reconstruction_loss,
-        "commitment_loss": commitment_loss,
         "total_loss": (
             full_reconstruction_loss
             + partial_reconstruction_weight * partial_reconstruction_loss
-            + commitment_loss
         ),
         "accuracy": correct_tokens / num_tokens,
         "encoder_latent_rms": (encoder_latent_squared_sum / num_latent_values) ** 0.5,
@@ -154,35 +144,34 @@ def evaluate(
     for scale_index, (scale_length, loss_sum, scale_correct_tokens) in enumerate(
         scale_metrics
     ):
-        metrics[f"cumulative_reconstruction_loss_scale_{scale_length}"] = (
+        metrics[f"reconstruction_loss_scale_{scale_length}"] = (
             loss_sum / num_batches
         )
-        metrics[f"cumulative_accuracy_scale_{scale_length}"] = (
+        metrics[f"accuracy_scale_{scale_length}"] = (
             scale_correct_tokens / num_tokens
         )
-        metrics[f"cumulative_latent_mse_scale_{scale_length}"] = (
+        metrics[f"latent_mse_scale_{scale_length}"] = (
             latent_mse_sums_by_scale[scale_index] / num_batches
         )
-        contribution_squared_sum = contribution_squared_sums_by_scale[scale_index]
-        metrics[f"contribution_rms_scale_{scale_length}"] = (
-            contribution_squared_sum / num_latent_values
+        scale_latent_squared_sum = scale_latent_squared_sums_by_scale[scale_index]
+        metrics[f"scale_latent_rms_scale_{scale_length}"] = (
+            scale_latent_squared_sum / num_latent_values
         ) ** 0.5
 
         code_counts = code_counts_by_scale[scale_index].float()
         code_probabilities = code_counts[code_counts > 0] / code_counts.sum()
 
         # Perplexity is the effective number of codes used and remains informative
-        # after the cumulative ever-used utilization metric reaches 100%.
+        # after the ever-used utilization metric reaches 100%.
         metrics[f"codebook_perplexity_scale_{scale_length}"] = torch.exp(
             -(code_probabilities * code_probabilities.log()).sum()
         ).item()
+        if scale_index == len(model.scale_lengths) - 1:
+            codebook_vectors = model.final_codebook_vectors()
+        else:
+            codebook_vectors = model.quantizer.codebooks[scale_index].codebook
         metrics[f"codebook_rms_scale_{scale_length}"] = (
-            model.quantizer.codebooks[scale_index]
-            .codebook.float()
-            .square()
-            .mean()
-            .sqrt()
-            .item()
+            codebook_vectors.float().square().mean().sqrt().item()
         )
 
     return metrics
@@ -265,7 +254,6 @@ def main(config: DictConfig) -> None:
         use_qk_norm=config.model.use_qk_norm,
         bias=config.model.bias,
         rope_base=config.model.rope_base,
-        commitment_cost=config.model.commitment_cost,
         decay=config.model.decay,
         eps=config.model.eps,
     )
@@ -347,7 +335,6 @@ def main(config: DictConfig) -> None:
         optimizer.zero_grad(set_to_none=True)
         full_reconstruction_loss_sum = 0.0
         partial_reconstruction_loss_sum = 0.0
-        commitment_loss_sum = 0.0
 
         for micro_step in range(gradient_accumulation_steps):
             try:
@@ -374,7 +361,7 @@ def main(config: DictConfig) -> None:
                     dtype=torch.bfloat16,
                     enabled=use_mixed_precision,
                 ):
-                    full_logits, partial_logits, commitment_loss, _ = training_model(
+                    full_logits, partial_logits, _ = training_model(
                         input_ids,
                         include_partial_reconstruction=True,
                     )
@@ -391,7 +378,6 @@ def main(config: DictConfig) -> None:
                         full_reconstruction_loss
                         + partial_reconstruction_weight
                         * partial_reconstruction_loss
-                        + commitment_loss
                     )
                     accumulated_loss = loss / gradient_accumulation_steps
                 accumulated_loss.backward()
@@ -401,9 +387,6 @@ def main(config: DictConfig) -> None:
             )
             partial_reconstruction_loss_sum += (
                 partial_reconstruction_loss.item() / gradient_accumulation_steps
-            )
-            commitment_loss_sum += (
-                commitment_loss.item() / gradient_accumulation_steps
             )
 
         # Limit unusually large parameter updates before the optimizer step.
@@ -422,7 +405,6 @@ def main(config: DictConfig) -> None:
                 [
                     full_reconstruction_loss_sum,
                     partial_reconstruction_loss_sum,
-                    commitment_loss_sum,
                 ],
                 device=device,
             )
@@ -434,13 +416,11 @@ def main(config: DictConfig) -> None:
                 (
                     full_reconstruction_loss_value,
                     partial_reconstruction_loss_value,
-                    commitment_loss_value,
                 ) = loss_sums.tolist()
                 total_loss_value = (
                     full_reconstruction_loss_value
                     + partial_reconstruction_weight
                     * partial_reconstruction_loss_value
-                    + commitment_loss_value
                 )
                 global_utilization = model.global_utilization.item()
                 progress_bar.set_postfix(
@@ -450,7 +430,6 @@ def main(config: DictConfig) -> None:
                     partial_reconstruction_loss=(
                         f"{partial_reconstruction_loss_value:.4f}"
                     ),
-                    commitment_loss=f"{commitment_loss_value:.4f}",
                     total_loss=f"{total_loss_value:.4f}",
                 )
 
@@ -463,7 +442,6 @@ def main(config: DictConfig) -> None:
                             "train/partial_reconstruction_loss": (
                                 partial_reconstruction_loss_value
                             ),
-                            "train/commitment_loss": commitment_loss_value,
                             "train/total_loss": total_loss_value,
                             "train/gradient_norm": gradient_norm.item(),
                             "train/learning_rate": learning_rate,
@@ -488,8 +466,6 @@ def main(config: DictConfig) -> None:
                     f"{validation_metrics['full_reconstruction_loss']:.4f}, "
                     f"partial reconstruction loss "
                     f"{validation_metrics['partial_reconstruction_loss']:.4f}, "
-                    f"commitment loss "
-                    f"{validation_metrics['commitment_loss']:.4f}, "
                     f"total loss {validation_metrics['total_loss']:.4f}, "
                     f"accuracy {validation_metrics['accuracy']:.2%}"
                 )
@@ -528,14 +504,14 @@ def main(config: DictConfig) -> None:
                     f"step {step} codebook utilization by scale: {utilization_by_scale}"
                 )
 
-                cumulative_accuracies = ", ".join(
+                scale_accuracies = ", ".join(
                     f"{scale_length}: "
-                    f"{validation_metrics[f'cumulative_accuracy_scale_{scale_length}']:.2%}"
+                    f"{validation_metrics[f'accuracy_scale_{scale_length}']:.2%}"
                     for scale_length in config.model.scale_lengths
                 )
                 tqdm.write(
-                    f"step {step} cumulative validation accuracy by scale: "
-                    f"{cumulative_accuracies}"
+                    f"step {step} validation accuracy by scale: "
+                    f"{scale_accuracies}"
                 )
 
                 if wandb_run is not None:
@@ -546,9 +522,6 @@ def main(config: DictConfig) -> None:
                         "validation/partial_reconstruction_loss": validation_metrics[
                             "partial_reconstruction_loss"
                         ],
-                        "validation/commitment_loss": validation_metrics[
-                            "commitment_loss"
-                        ],
                         "validation/total_loss": validation_metrics["total_loss"],
                         "validation/accuracy": validation_metrics["accuracy"],
                         "validation/encoder_latent_rms": validation_metrics[
@@ -557,10 +530,10 @@ def main(config: DictConfig) -> None:
                         "validation/best_reconstruction_loss": best_validation_loss,
                     }
                     scale_metric_names = {
-                        "reconstruction_loss": "cumulative_reconstruction_loss",
-                        "accuracy": "cumulative_accuracy",
-                        "latent_mse": "cumulative_latent_mse",
-                        "contribution_rms": "contribution_rms",
+                        "reconstruction_loss": "reconstruction_loss",
+                        "accuracy": "accuracy",
+                        "latent_mse": "latent_mse",
+                        "scale_latent_rms": "scale_latent_rms",
                         "codebook_perplexity": "codebook_perplexity",
                         "codebook_rms": "codebook_rms",
                     }
@@ -577,9 +550,10 @@ def main(config: DictConfig) -> None:
                                 ]
                             )
 
-                        wandb_metrics[f"{section}/utilization"] = scale_utilizations[
-                            scale_length
-                        ]
+                        if scale_length in scale_utilizations:
+                            wandb_metrics[f"{section}/utilization"] = (
+                                scale_utilizations[scale_length]
+                            )
 
                     wandb_run.log(wandb_metrics, step=step)
 

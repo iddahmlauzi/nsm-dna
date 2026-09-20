@@ -16,7 +16,7 @@ from tqdm import tqdm
 from nsm_dna.data import encode_sequence
 from nsm_dna.models.next_scale import NSM
 from nsm_dna.models.vqvae import VQVAE
-from scripts.training.train_nsm import BlockPredictionBatch, prepare_block_predictions
+from scripts.training.train_nsm import prepare_block_predictions
 
 PREDICTION_COLUMNS = (
     "study_id",
@@ -97,6 +97,8 @@ def score_token_ids(
     Float[Tensor, "batch"],
 ]:
     """Return per-scale hierarchy scores and the decoder score."""
+    if input_ids.shape[1] != 2 * tokenizer.context_length:
+        raise ValueError("NSM scoring requires one prefix block and one target block.")
     predicted_scale_lengths = tokenizer.scale_lengths
     hierarchy_scores = torch.zeros(
         input_ids.shape[0],
@@ -107,20 +109,7 @@ def score_token_ids(
     decoder_scores = torch.zeros(
         input_ids.shape[0], device=input_ids.device, dtype=torch.float64
     )
-    if input_ids.shape[1] == tokenizer.context_length:
-        target_ids = input_ids
-        indices_by_scale = tokenizer.encode_indices(target_ids)
-        predictions = [
-            BlockPredictionBatch(
-                target_ids=target_ids,
-                prefix=None,
-                targets_by_scale=indices_by_scale,
-            )
-        ]
-    else:
-        predictions = prepare_block_predictions(tokenizer, input_ids)
-
-    for prediction in predictions:
+    for prediction in prepare_block_predictions(tokenizer, input_ids):
         with torch.autocast(
             device_type=input_ids.device.type,
             dtype=torch.bfloat16,
@@ -129,8 +118,11 @@ def score_token_ids(
             logits_by_scale = model(
                 prediction.targets_by_scale,
                 prefix=prediction.prefix,
+                prefix_code=prediction.prefix_code,
             )
-            decoder_logits = tokenizer.decode(prediction.targets_by_scale)
+            decoder_logits = tokenizer.decode_scale(
+                prediction.targets_by_scale[-1], len(predicted_scale_lengths) - 1
+            )
 
         # Likelihood counts every predicted code once; the training loss's scale
         # weights do not enter the sequence score.
@@ -145,8 +137,7 @@ def score_token_ids(
                 .double()
             )
 
-        # The decoder supplies the probability of the observed nucleotides given
-        # the same complete hierarchy whose probability NSM-DNA assigned above.
+        # The final absolute scale supplies the decoder's nucleotide likelihood.
         nucleotide_log_probabilities = F.log_softmax(decoder_logits.float(), dim=-1)
         nucleotide_targets = prediction.target_ids
         decoder_scores += (
@@ -356,14 +347,14 @@ def main(config: DictConfig) -> None:
     )
     configured_prefix_length = config.prefix_length
     prefix_length = (
-        int(model.max_prefix_length)
+        int(tokenizer.context_length)
         if configured_prefix_length is None
         else int(configured_prefix_length)
     )
-    if not 0 <= prefix_length <= model.max_prefix_length:
+    if prefix_length != tokenizer.context_length:
         raise ValueError(
-            f"Evaluation prefix length {prefix_length} must be between 0 and "
-            f"the model maximum of {model.max_prefix_length}."
+            f"Evaluation prefix length must equal the tokenizer block length "
+            f"of {tokenizer.context_length} bases."
         )
     target_length = int(tokenizer.context_length)
     component_names = [f"scale_{length}" for length in tokenizer.scale_lengths]
