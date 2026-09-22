@@ -102,4 +102,4 @@ def test_default_config_uses_stable_transformer_training_settings() -> None:
     assert config.optimizer.beta_1 == 0.9
     assert config.optimizer.beta_2 == 0.95
     assert config.optimizer.weight_decay == 0.05
-    assert config.optimizer.gradient_accumulation_steps == 4
+    assert config.optimizer.gradient_accumulation_steps == 1

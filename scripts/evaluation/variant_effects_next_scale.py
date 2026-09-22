@@ -118,7 +118,6 @@ def score_token_ids(
             logits_by_scale = model(
                 prediction.targets_by_scale,
                 prefix=prediction.prefix,
-                prefix_code=prediction.prefix_code,
             )
             decoder_logits = tokenizer.decode_scale(
                 prediction.targets_by_scale[-1], len(predicted_scale_lengths) - 1

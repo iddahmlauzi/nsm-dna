@@ -35,7 +35,6 @@ class BlockPredictionBatch:
 
     target_ids: Int[Tensor, "batch block_length"]
     prefix: Float[Tensor, "batch prefix_length vq_dim"]
-    prefix_code: Int[Tensor, "batch 1"]
     targets_by_scale: list[Int[Tensor, "batch scale_length"]]
 
 
@@ -54,13 +53,38 @@ def build_scale_loss_weights(
     return scale_weights / scale_weights.sum()
 
 
+@torch.no_grad()
+def build_codebook_distance_matrices(
+    codebook_vectors: list[Tensor],
+) -> list[Tensor]:
+    """Measure code similarity within each tokenizer codebook."""
+    distance_matrices = []
+    for vectors in codebook_vectors:
+        distances = torch.cdist(vectors.float(), vectors.float())
+        off_diagonal = ~torch.eye(
+            vectors.shape[0],
+            dtype=torch.bool,
+            device=vectors.device,
+        )
+
+        # Codebooks can have different geometric scales. Setting their mean
+        # off-diagonal distance to one gives geometry_loss_weight the same
+        # interpretation at every hierarchy scale.
+        mean_distance = distances[off_diagonal].mean().clamp_min(1e-8)
+        distance_matrices.append(distances / mean_distance)
+
+    return distance_matrices
+
+
 def compute_next_scale_loss(
     logits_by_scale: list[Tensor],
     targets_by_scale: list[Tensor],
     scale_loss_weights: Tensor,
-) -> tuple[Tensor, Tensor]:
-    """Compute cross-entropy at each scale and their configured weighted mean."""
-    losses_by_scale = torch.stack(
+    codebook_distances_by_scale: list[Tensor],
+    geometry_loss_weight: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Combine exact-code classification with geometry-aware supervision."""
+    cross_entropy_by_scale = torch.stack(
         [
             F.cross_entropy(
                 scale_logits.flatten(0, 1),
@@ -72,8 +96,33 @@ def compute_next_scale_loss(
             )
         ]
     )
+
+    geometry_loss_by_scale = torch.stack(
+        [
+            (
+                scale_logits.float().softmax(dim=-1)
+                * codebook_distances[scale_targets]
+            )
+            .sum(dim=-1)
+            .mean()
+            for scale_logits, scale_targets, codebook_distances in zip(
+                logits_by_scale,
+                targets_by_scale,
+                codebook_distances_by_scale,
+                strict=True,
+            )
+        ]
+    )
+
+    # Cross-entropy identifies the exact target. Expected codebook distance gives
+    # every alternative code a different penalty, so nearby mistakes provide a
+    # better training signal than geometrically unrelated mistakes.
+    losses_by_scale = (
+        cross_entropy_by_scale
+        + geometry_loss_weight * geometry_loss_by_scale
+    )
     loss = (losses_by_scale * scale_loss_weights).sum()
-    return loss, losses_by_scale
+    return loss, cross_entropy_by_scale, geometry_loss_by_scale
 
 
 @torch.no_grad()
@@ -86,14 +135,12 @@ def prepare_block_predictions(
     prefix_ids = input_ids[:, :block_length]
     target_ids = input_ids[:, block_length:]
     prefix = tokenizer.encode(prefix_ids)
-    _, prefix_indices_by_scale = tokenizer.quantizer(prefix)
     indices_by_scale = tokenizer.encode_indices(target_ids)
 
     return [
         BlockPredictionBatch(
             target_ids=target_ids,
             prefix=prefix,
-            prefix_code=prefix_indices_by_scale[0],
             targets_by_scale=indices_by_scale,
         )
     ]
@@ -103,33 +150,14 @@ def prepare_block_predictions(
 def rollout_hierarchy(
     model: NSM,
     tokenizer: VQVAE,
-    batch_size: int,
     prefix: Float[Tensor, "batch prefix_length vq_dim"],
-    prefix_code: Int[Tensor, "batch 1"],
 ) -> list[Int[Tensor, "batch scale_length"]]:
-    """Greedily generate every hierarchy code in coarse-to-fine order."""
-    device = next(model.parameters()).device
-    predicted_indices_by_scale = [
-        torch.zeros(
-            batch_size,
-            scale_length,
-            dtype=torch.long,
-            device=device,
-        )
-        for scale_length in tokenizer.scale_lengths
-    ]
+    """Greedily generate one complete scale at each coarse-to-fine step."""
+    predicted_indices_by_scale = []
 
-    for scale_index, scale_length in enumerate(tokenizer.scale_lengths):
-        for position in range(scale_length):
-            logits = model.predict_scale(
-                prefix,
-                prefix_code,
-                predicted_indices_by_scale[:scale_index],
-                predicted_indices_by_scale[scale_index][:, :position],
-            )
-            predicted_indices_by_scale[scale_index][:, position] = logits.argmax(
-                dim=-1
-            )
+    for _ in tokenizer.scale_lengths:
+        logits = model.predict_scale(prefix, predicted_indices_by_scale)
+        predicted_indices_by_scale.append(logits.argmax(dim=-1))
 
     return predicted_indices_by_scale
 
@@ -140,6 +168,8 @@ def evaluate(
     tokenizer: VQVAE,
     data_loader: DataLoader,
     scale_loss_weights: Tensor,
+    codebook_distances_by_scale: list[Tensor],
+    geometry_loss_weight: float,
     use_mixed_precision: bool,
     max_batches: int | None = None,
     rollout_max_batches: int = 0,
@@ -155,6 +185,9 @@ def evaluate(
     num_scales = len(predicted_scale_lengths)
 
     loss_sum = 0.0
+    cross_entropy_loss_sum = 0.0
+    geometry_loss_sum = 0.0
+    geometry_loss_sums_by_scale = [0.0] * num_scales
     correct_codes_by_scale = [0] * num_scales
     num_codes_by_scale = [0] * num_scales
     num_block_predictions = 0
@@ -177,28 +210,31 @@ def evaluate(
                 dtype=torch.bfloat16,
                 enabled=use_mixed_precision,
             ):
-                # Each scale sees completed earlier scales and teacher-forced
-                # earlier codes at its own scale, never its current code.
+                # Every scale is predicted in parallel from completed earlier
+                # scales, with all scale tasks packed into one transformer pass.
                 logits_by_scale = model(
                     prediction.targets_by_scale,
                     prefix=prediction.prefix,
-                    prefix_code=prediction.prefix_code,
                 )
-                loss, _ = compute_next_scale_loss(
+                (
+                    loss,
+                    cross_entropy_by_scale,
+                    geometry_loss_by_scale,
+                ) = compute_next_scale_loss(
                     logits_by_scale,
                     prediction.targets_by_scale,
                     scale_loss_weights,
+                    codebook_distances_by_scale,
+                    geometry_loss_weight,
                 )
 
-                # Rollout predicts the first scale from the real prefix and its
-                # coarse code, then supplies generated target codes.
+                # Rollout predicts the first scale from the real prefix, then
+                # supplies generated target codes.
                 if batch_index < rollout_max_batches:
                     rollout_indices = rollout_hierarchy(
                         model,
                         tokenizer,
-                        batch_size=prediction.target_ids.shape[0],
                         prefix=prediction.prefix,
-                        prefix_code=prediction.prefix_code,
                     )
                     rollout_logits = tokenizer.decode_scale(
                         rollout_indices[-1], num_scales - 1
@@ -222,6 +258,14 @@ def evaluate(
                 num_codes_by_scale[scale_index] += scale_targets.numel()
 
             loss_sum += loss.item()
+            cross_entropy_loss_sum += (
+                cross_entropy_by_scale * scale_loss_weights
+            ).sum().item()
+            geometry_loss_sum += (
+                geometry_loss_by_scale * scale_loss_weights
+            ).sum().item()
+            for scale_index, geometry_loss in enumerate(geometry_loss_by_scale):
+                geometry_loss_sums_by_scale[scale_index] += geometry_loss.item()
             num_block_predictions += 1
 
             if batch_index < rollout_max_batches:
@@ -240,12 +284,17 @@ def evaluate(
     total_codes = sum(num_codes_by_scale)
     metrics = {
         "loss": loss_sum / num_block_predictions,
+        "cross_entropy_loss": cross_entropy_loss_sum / num_block_predictions,
+        "geometry_loss": geometry_loss_sum / num_block_predictions,
         "accuracy": total_correct_codes / total_codes,
     }
 
     for scale_index, scale_length in enumerate(predicted_scale_lengths):
         metrics[f"accuracy_scale_{scale_length}"] = (
             correct_codes_by_scale[scale_index] / num_codes_by_scale[scale_index]
+        )
+        metrics[f"geometry_loss_scale_{scale_length}"] = (
+            geometry_loss_sums_by_scale[scale_index] / num_block_predictions
         )
 
     # Rollout loss averages the block-batch losses, while rollout accuracy pools
@@ -352,6 +401,10 @@ def main(config: DictConfig) -> None:
         config.optimizer.scale_loss_alpha,
         device,
     )
+    codebook_distances_by_scale = build_codebook_distance_matrices(
+        [codebook.codebook for codebook in tokenizer.quantizer.codebooks]
+    )
+    geometry_loss_weight = float(config.optimizer.geometry_loss_weight)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -415,6 +468,8 @@ def main(config: DictConfig) -> None:
 
         if should_log:
             mean_loss = torch.zeros((), device=device)
+            mean_cross_entropy_loss = torch.zeros((), device=device)
+            mean_geometry_loss = torch.zeros((), device=device)
             correct_codes = torch.zeros((), device=device, dtype=torch.long)
             num_codes = torch.zeros((), device=device, dtype=torch.long)
 
@@ -454,18 +509,29 @@ def main(config: DictConfig) -> None:
                         logits_by_scale = training_model(
                             prediction.targets_by_scale,
                             prefix=prediction.prefix,
-                            prefix_code=prediction.prefix_code,
                         )
-                        loss, _ = compute_next_scale_loss(
+                        (
+                            loss,
+                            cross_entropy_by_scale,
+                            geometry_loss_by_scale,
+                        ) = compute_next_scale_loss(
                             logits_by_scale,
                             prediction.targets_by_scale,
                             scale_loss_weights,
+                            codebook_distances_by_scale,
+                            geometry_loss_weight,
                         )
                         accumulated_loss = loss / num_predictions_per_step
                     accumulated_loss.backward()
 
                 if should_log:
                     mean_loss += loss.detach() / num_predictions_per_step
+                    mean_cross_entropy_loss += (
+                        cross_entropy_by_scale.detach() * scale_loss_weights
+                    ).sum() / num_predictions_per_step
+                    mean_geometry_loss += (
+                        geometry_loss_by_scale.detach() * scale_loss_weights
+                    ).sum() / num_predictions_per_step
 
                     with torch.no_grad():
                         for scale_logits, scale_targets in zip(
@@ -492,11 +558,15 @@ def main(config: DictConfig) -> None:
             if distributed_environment.is_distributed:
                 for values in (
                     mean_loss,
+                    mean_cross_entropy_loss,
+                    mean_geometry_loss,
                     correct_codes,
                     num_codes,
                 ):
                     dist.all_reduce(values, op=dist.ReduceOp.SUM)
                 mean_loss /= distributed_environment.world_size
+                mean_cross_entropy_loss /= distributed_environment.world_size
+                mean_geometry_loss /= distributed_environment.world_size
 
             if distributed_environment.is_main_process:
                 accuracy = (correct_codes / num_codes).item()
@@ -509,6 +579,10 @@ def main(config: DictConfig) -> None:
                 if wandb_run is not None:
                     wandb_metrics = {
                         "train/loss": mean_loss.item(),
+                        "train/cross_entropy_loss": (
+                            mean_cross_entropy_loss.item()
+                        ),
+                        "train/geometry_loss": mean_geometry_loss.item(),
                         "train/accuracy": accuracy,
                         "train/gradient_norm": gradient_norm.item(),
                         "train/learning_rate": learning_rate,
@@ -523,6 +597,8 @@ def main(config: DictConfig) -> None:
                     tokenizer,
                     validation_loader,
                     scale_loss_weights,
+                    codebook_distances_by_scale,
+                    geometry_loss_weight,
                     use_mixed_precision,
                     max_batches=config.evaluation.max_batches,
                     rollout_max_batches=config.evaluation.rollout_max_batches,
@@ -552,6 +628,12 @@ def main(config: DictConfig) -> None:
                 if wandb_run is not None:
                     wandb_metrics = {
                         "validation/loss": validation_metrics["loss"],
+                        "validation/cross_entropy_loss": validation_metrics[
+                            "cross_entropy_loss"
+                        ],
+                        "validation/geometry_loss": validation_metrics[
+                            "geometry_loss"
+                        ],
                         "validation/accuracy": validation_metrics["accuracy"],
                         "rollout/nucleotide_loss": validation_metrics[
                             "rollout_nucleotide_loss"
@@ -566,6 +648,11 @@ def main(config: DictConfig) -> None:
                         )
                         wandb_metrics[f"{scale_name}/validation_accuracy"] = (
                             validation_metrics[f"accuracy_scale_{scale_length}"]
+                        )
+                        wandb_metrics[f"{scale_name}/geometry_loss"] = (
+                            validation_metrics[
+                                f"geometry_loss_scale_{scale_length}"
+                            ]
                         )
 
                     wandb_run.log(wandb_metrics, step=step)

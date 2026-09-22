@@ -82,8 +82,8 @@ def evaluate(
 
             encoder_latent = model.encode(input_ids)
             scale_latents = model.quantizer.indices_to_scale_latents(
-                indices_by_scale[:-1]
-            ) + [encoder_latent]
+                indices_by_scale
+            )
 
             encoder_latent_squared_sum += encoder_latent.float().square().sum().item()
             num_latent_values += encoder_latent.numel()
@@ -166,10 +166,7 @@ def evaluate(
         metrics[f"codebook_perplexity_scale_{scale_length}"] = torch.exp(
             -(code_probabilities * code_probabilities.log()).sum()
         ).item()
-        if scale_index == len(model.scale_lengths) - 1:
-            codebook_vectors = model.final_codebook_vectors()
-        else:
-            codebook_vectors = model.quantizer.codebooks[scale_index].codebook
+        codebook_vectors = model.quantizer.codebooks[scale_index].codebook
         metrics[f"codebook_rms_scale_{scale_length}"] = (
             codebook_vectors.float().square().mean().sqrt().item()
         )
@@ -309,6 +306,7 @@ def main(config: DictConfig) -> None:
 
     # DDP synchronizes gradients. EMA codebook statistics are synchronized
     # separately inside the quantizer, so they do not need per-forward broadcasts.
+    # Only the randomly selected partial scale uses its downsampling path each step.
     training_model: VQVAE | DistributedDataParallel = model
     if distributed_environment.is_distributed:
         if device.type == "cuda":
@@ -316,9 +314,13 @@ def main(config: DictConfig) -> None:
                 model,
                 device_ids=[distributed_environment.local_rank],
                 output_device=distributed_environment.local_rank,
+                find_unused_parameters=True,
             )
         else:
-            training_model = DistributedDataParallel(model)
+            training_model = DistributedDataParallel(
+                model,
+                find_unused_parameters=True,
+            )
 
     # Train the model.
     training_epoch = 0

@@ -2,7 +2,6 @@ import einx
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 from jaxtyping import Float, Int
 from torch import Tensor
 
@@ -104,8 +103,36 @@ class EMACodebook(nn.Module):
         return self.codebook_hits.float().mean()
 
 
+class _LearnedDownsamplingBlock(nn.Module):
+    """Combine each ordered pair of latent positions into one parent."""
+
+    def __init__(self, quantization_dim: int) -> None:
+        super().__init__()
+
+        self.convolution = nn.Conv1d(
+            in_channels=quantization_dim,
+            out_channels=quantization_dim,
+            kernel_size=2,
+            stride=2,
+            bias=False,
+        )
+        self.norm = nn.LayerNorm(
+            quantization_dim,
+            elementwise_affine=False,
+        )
+
+    def forward(
+        self,
+        latent: Float[Tensor, "batch length quantization_dim"],
+    ) -> Float[Tensor, "batch reduced_length quantization_dim"]:
+        latent = einx.id("b l d -> b d l", latent)
+        latent = self.convolution(latent)
+        latent = einx.id("b d l -> b l d", latent)
+        return self.norm(latent)
+
+
 class MultiscaleVectorQuantizer(nn.Module):
-    """Quantize independent pooled views of one encoder latent."""
+    """Quantize a learned coarse-to-fine hierarchy of encoder latents."""
 
     def __init__(
         self,
@@ -124,6 +151,14 @@ class MultiscaleVectorQuantizer(nn.Module):
         self.quantization_dim = quantization_dim
         self.latent_length = latent_length
 
+        # The encoder supplies scale 128 directly. Learned reductions then build
+        # the remaining hierarchy: 128 → 64 → 32 → 16 → 8 → 4 → 2 → 1.
+        self.downsampled_lengths = list(reversed(self.scale_lengths[:-1]))
+
+        self.downsamplers = nn.ModuleList(
+            _LearnedDownsamplingBlock(self.quantization_dim)
+            for _ in self.downsampled_lengths
+        )
         self.codebooks = nn.ModuleList(
             EMACodebook(
                 codebook_size,
@@ -134,25 +169,23 @@ class MultiscaleVectorQuantizer(nn.Module):
             for codebook_size in codebook_sizes
         )
 
-    def _resize_to_scale(
+    def _downsample_to_scales(
         self,
         latent: Float[Tensor, "batch length quantization_dim"],
-        scale_index: int,
-    ) -> Float[Tensor, "batch scale_length quantization_dim"]:
-        """Average equal, non-overlapping latent blocks into one scale."""
-        scale_length = self.scale_lengths[scale_index]
-        if scale_length == self.latent_length:
-            return latent
+    ) -> list[Float[Tensor, "batch scale_length quantization_dim"]]:
+        """Build every configured scale through ordered pairwise reductions."""
+        latents_by_length = {self.latent_length: latent}
+        current_latent = latent
 
-        # Area interpolation computes one mean for each contiguous latent block.
-        latent = einx.id("b l d -> b d l", latent)
-        resized_latent = F.interpolate(
-            latent,
-            size=scale_length,
-            mode="area",
-        )
+        for scale_length, downsampler in zip(
+            self.downsampled_lengths,
+            self.downsamplers,
+            strict=True,
+        ):
+            current_latent = downsampler(current_latent)
+            latents_by_length[scale_length] = current_latent
 
-        return einx.id("b d l -> b l d", resized_latent)
+        return [latents_by_length[length] for length in self.scale_lengths]
 
     def _upsample_to_full_length(
         self,
@@ -173,10 +206,11 @@ class MultiscaleVectorQuantizer(nn.Module):
         *,
         include_partial_reconstruction: bool = False,
     ) -> tuple[
+        Float[Tensor, "batch length quantization_dim"],
         Float[Tensor, "batch length quantization_dim"] | None,
         list[Int[Tensor, "batch scale_length"]],
     ]:
-        """Quantize pooled views of the continuous latent at coarse scales.
+        """Quantize learned views of the continuous latent at coarse scales.
 
         When partial reconstruction is enabled, return one randomly selected
         scale latent for auxiliary reconstruction.
@@ -187,31 +221,39 @@ class MultiscaleVectorQuantizer(nn.Module):
         if include_partial_reconstruction:
             partial_scale_index = torch.randint(
                 low=0,
-                high=len(self.scale_lengths),
+                high=len(self.scale_lengths) - 1,
                 size=(),
             ).item()
 
         indices_by_scale: list[Int[Tensor, "batch scale_length"]] = []
+        quantized_latents_by_scale: list[Tensor] = []
         partial_quantized_latent: Tensor | None = None
+        latents_by_scale = self._downsample_to_scales(x)
 
-        for scale_index, codebook in enumerate(self.codebooks):
-            pooled_latent = self._resize_to_scale(x, scale_index)
-            quantized_at_scale, scale_indices = codebook(pooled_latent)
+        for scale_index, (scale_latent, codebook) in enumerate(
+            zip(latents_by_scale, self.codebooks, strict=True)
+        ):
+            quantized_at_scale, scale_indices = codebook(scale_latent)
             indices_by_scale.append(scale_indices)
 
-            # Backpropagate reconstruction through the same pooling operation
+            # Backpropagate reconstruction through the learned downsampling path
             # that produced the codebook input.
-            quantized_with_gradient = pooled_latent + (
-                quantized_at_scale - pooled_latent
+            quantized_with_gradient = scale_latent + (
+                quantized_at_scale - scale_latent
             ).detach()
-            scale_latent = self._upsample_to_full_length(
+            expanded_quantized_latent = self._upsample_to_full_length(
                 quantized_with_gradient, scale_index
             )
+            quantized_latents_by_scale.append(expanded_quantized_latent)
 
             if scale_index == partial_scale_index:
-                partial_quantized_latent = scale_latent
+                partial_quantized_latent = expanded_quantized_latent
 
-        return partial_quantized_latent, indices_by_scale
+        return (
+            quantized_latents_by_scale[-1],
+            partial_quantized_latent,
+            indices_by_scale,
+        )
 
     @torch.no_grad()
     def indices_to_scale_latent(

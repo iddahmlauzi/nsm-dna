@@ -11,7 +11,7 @@ from .quantization import MultiscaleVectorQuantizer
 
 
 class VQVAE(nn.Module):
-    """VQ-VAE with quantized coarse views and a continuous final latent."""
+    """VQ-VAE with a learned codebook at every latent scale."""
 
     def __init__(
         self,
@@ -44,8 +44,10 @@ class VQVAE(nn.Module):
         self.rope_base = rope_base
         self.scale_lengths = list(scale_lengths)
         self.codebook_sizes = list(codebook_sizes)
-        if context_length != 4 * latent_length or codebook_sizes[-1] != 256:
-            raise ValueError("The final scale requires one code for each 4-mer.")
+        if context_length != 2 * latent_length or codebook_sizes[-1] != 16:
+            raise ValueError(
+                "The final scale requires one code for each dinucleotide."
+            )
 
         self.encoder = Encoder(
             self.vocab_size,
@@ -57,8 +59,8 @@ class VQVAE(nn.Module):
         )
 
         self.quantizer = MultiscaleVectorQuantizer(
-            self.scale_lengths[:-1],
-            self.codebook_sizes[:-1],
+            self.scale_lengths,
+            self.codebook_sizes,
             self.quantization_dim,
             latent_length=self.latent_length,
             decay=decay,
@@ -122,36 +124,8 @@ class VQVAE(nn.Module):
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> Float[Tensor, "batch latent_length quantization_dim"]:
-        """Encode DNA into the normalized 64-position continuous latent."""
+        """Encode DNA into the normalized continuous latent."""
         return self.encoder(token_ids)
-
-    @torch.no_grad()
-    def final_codebook_vectors(self) -> Float[Tensor, "256 quantization_dim"]:
-        """Enumerate the trained encoder vector for every possible 4-mer."""
-        fourmer_ids = torch.arange(
-            256, device=self.encoder.token_embedding.weight.device
-        )
-        token_ids = torch.stack(
-            [
-                (fourmer_ids // 64) % 4,
-                (fourmer_ids // 16) % 4,
-                (fourmer_ids // 4) % 4,
-                fourmer_ids % 4,
-            ],
-            dim=1,
-        )
-        return self.encode(token_ids)[:, 0]
-
-    def _final_indices(
-        self, token_ids: Int[Tensor, "batch length"]
-    ) -> Int[Tensor, "batch latent_length"]:
-        fourmers = token_ids.reshape(token_ids.shape[0], self.latent_length, 4)
-        return (
-            fourmers[:, :, 0] * 64
-            + fourmers[:, :, 1] * 16
-            + fourmers[:, :, 2] * 4
-            + fourmers[:, :, 3]
-        )
 
     def forward(
         self,
@@ -164,17 +138,17 @@ class VQVAE(nn.Module):
         list[Int[Tensor, "batch scale_length"]],
     ]:
         latent = self.encode(token_ids)
-        partial_quantized_latent, coarse_indices = self.quantizer(
+        quantized_latent, partial_quantized_latent, indices_by_scale = self.quantizer(
             latent,
             include_partial_reconstruction=include_partial_reconstruction,
         )
-        logits = self.decoder(latent)
+        logits = self.decoder(quantized_latent)
 
         partial_logits = None
         if partial_quantized_latent is not None:
             partial_logits = self.decoder(partial_quantized_latent)
 
-        return logits, partial_logits, [*coarse_indices, self._final_indices(token_ids)]
+        return logits, partial_logits, indices_by_scale
 
     @torch.no_grad()
     def encode_indices(
@@ -186,8 +160,8 @@ class VQVAE(nn.Module):
             raise RuntimeError("Call model.eval() before encoding sequences.")
 
         latent = self.encode(token_ids)
-        _, coarse_indices = self.quantizer(latent)
-        return [*coarse_indices, self._final_indices(token_ids)]
+        _, _, indices_by_scale = self.quantizer(latent)
+        return indices_by_scale
 
     @torch.no_grad()
     def decode_scale(
@@ -196,12 +170,9 @@ class VQVAE(nn.Module):
         scale_index: int,
     ) -> Float[Tensor, "batch length vocab_size"]:
         """Decode one scale's absolute codes into nucleotide logits."""
-        if scale_index == len(self.scale_lengths) - 1:
-            scale_latent = self.final_codebook_vectors()[scale_indices]
-        else:
-            scale_latent = self.quantizer.indices_to_scale_latent(
-                scale_indices, scale_index
-            )
+        scale_latent = self.quantizer.indices_to_scale_latent(
+            scale_indices, scale_index
+        )
         return self.decoder(scale_latent)
 
     @torch.no_grad()

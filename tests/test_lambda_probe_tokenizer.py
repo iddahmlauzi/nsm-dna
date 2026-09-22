@@ -6,7 +6,7 @@ from scripts.evaluation.lambda_probe_tokenizer import TokenizerWindowEncoder
 
 class _Quantizer(nn.Module):
     def forward(self, latent: torch.Tensor) -> tuple:
-        return latent + 1, None, None, None
+        return latent + 1, None, None
 
 
 class _Tokenizer(nn.Module):

@@ -8,6 +8,7 @@ from nsm_dna.models.next_scale import NSM
 from nsm_dna.models.vqvae import VQVAE
 from nsm_dna.training import calculate_training_steps
 from scripts.training.train_nsm import (
+    build_codebook_distance_matrices,
     build_scale_loss_weights,
     compute_next_scale_loss,
     evaluate,
@@ -19,13 +20,13 @@ from scripts.training.train_nsm import (
 def _build_tokenizer() -> VQVAE:
     return VQVAE(
         vocab_size=4,
-        context_length=16,
+        context_length=8,
         latent_length=4,
         embed_dim=8,
         quantization_dim=4,
         num_heads=2,
         scale_lengths=[1, 2, 4],
-        codebook_sizes=[4, 6, 256],
+        codebook_sizes=[4, 6, 16],
         decoder_num_layers=1,
         use_qk_norm=True,
     )
@@ -36,12 +37,18 @@ def _build_nsm(max_prefix_length: int = 4) -> NSM:
         prefix_dim=4,
         model_dim=8,
         scale_lengths=[1, 2, 4],
-        codebook_sizes=[4, 6, 256],
-        codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(256, 4)],
+        codebook_sizes=[4, 6, 16],
+        codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(16, 4)],
         num_layers=1,
         num_heads=2,
         dropout=0.0,
         max_prefix_length=max_prefix_length,
+    )
+
+
+def _codebook_distances(tokenizer: VQVAE) -> list[torch.Tensor]:
+    return build_codebook_distance_matrices(
+        [codebook.codebook for codebook in tokenizer.quantizer.codebooks]
     )
 
 
@@ -103,10 +110,19 @@ def test_next_scale_loss_includes_and_aligns_every_scale() -> None:
     ]
     scale_weights = torch.tensor([0.2, 0.3, 0.5])
 
-    loss, losses_by_scale = compute_next_scale_loss(
-        logits_by_scale,
-        targets_by_scale,
-        scale_weights,
+    codebook_distances = [
+        torch.ones(codebook_size, codebook_size)
+        - torch.eye(codebook_size)
+        for codebook_size in [2, 4, 4]
+    ]
+    loss, cross_entropy_by_scale, geometry_loss_by_scale = (
+        compute_next_scale_loss(
+            logits_by_scale,
+            targets_by_scale,
+            scale_weights,
+            codebook_distances,
+            geometry_loss_weight=0.1,
+        )
     )
 
     expected_losses = torch.stack(
@@ -122,8 +138,12 @@ def test_next_scale_loss_includes_and_aligns_every_scale() -> None:
         ]
     )
 
-    torch.testing.assert_close(losses_by_scale, expected_losses)
-    torch.testing.assert_close(loss, torch.sum(expected_losses * scale_weights))
+    expected_combined_losses = expected_losses + 0.1 * geometry_loss_by_scale
+    torch.testing.assert_close(cross_entropy_by_scale, expected_losses)
+    torch.testing.assert_close(
+        loss,
+        torch.sum(expected_combined_losses * scale_weights),
+    )
 
 
 def test_next_scale_loss_matches_original_position_weighting() -> None:
@@ -143,10 +163,12 @@ def test_next_scale_loss_matches_original_position_weighting() -> None:
         device=torch.device("cpu"),
     )
 
-    loss, _ = compute_next_scale_loss(
+    loss, _, _ = compute_next_scale_loss(
         logits_by_scale,
         targets_by_scale,
         scale_weights,
+        [torch.zeros(4, 4) for _ in scale_lengths],
+        geometry_loss_weight=0.0,
     )
 
     normalization = sum(
@@ -171,6 +193,40 @@ def test_next_scale_loss_matches_original_position_weighting() -> None:
     torch.testing.assert_close(loss, expected_loss)
 
 
+def test_geometry_loss_prefers_probability_on_nearby_codes() -> None:
+    target = [torch.tensor([[0]])]
+    distances = [
+        torch.tensor(
+            [
+                [0.0, 1.0, 3.0],
+                [1.0, 0.0, 2.0],
+                [3.0, 2.0, 0.0],
+            ]
+        )
+    ]
+    near_logits = [torch.tensor([[[0.0, 2.0, 0.0]]])]
+    far_logits = [torch.tensor([[[0.0, 0.0, 2.0]]])]
+
+    near_loss, near_cross_entropy, near_geometry = compute_next_scale_loss(
+        near_logits,
+        target,
+        torch.ones(1),
+        distances,
+        geometry_loss_weight=1.0,
+    )
+    far_loss, far_cross_entropy, far_geometry = compute_next_scale_loss(
+        far_logits,
+        target,
+        torch.ones(1),
+        distances,
+        geometry_loss_weight=1.0,
+    )
+
+    torch.testing.assert_close(near_cross_entropy, far_cross_entropy)
+    assert near_geometry.item() < far_geometry.item()
+    assert near_loss.item() < far_loss.item()
+
+
 def test_tokenizer_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
     tokenizer = _build_tokenizer()
     checkpoint_path = tmp_path / "tokenizer.pt"
@@ -179,13 +235,13 @@ def test_tokenizer_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
             "config": {
                 "model": {
                     "vocab_size": 4,
-                    "context_length": 16,
+                    "context_length": 8,
                     "latent_length": 4,
                     "embed_dim": 8,
                     "quantization_dim": 4,
                     "num_heads": 2,
                     "scale_lengths": [1, 2, 4],
-                    "codebook_sizes": [4, 6, 256],
+                    "codebook_sizes": [4, 6, 16],
                     "decoder_num_layers": 1,
                     "use_qk_norm": True,
                     "bias": False,
@@ -231,7 +287,7 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     tokenizer = _build_tokenizer().eval()
     tokenizer.requires_grad_(False)
     model = _build_nsm()
-    input_ids = torch.arange(2 * 32).reshape(2, 32) % 4
+    input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
     scale_weights = build_scale_loss_weights(
         tokenizer.scale_lengths,
         scale_loss_alpha=0.25,
@@ -243,12 +299,13 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     logits_by_scale = model(
         indices_by_scale,
         prefix=prediction.prefix,
-        prefix_code=prediction.prefix_code,
     )
-    loss, _ = compute_next_scale_loss(
+    loss, _, _ = compute_next_scale_loss(
         logits_by_scale,
         indices_by_scale,
         scale_weights,
+        _codebook_distances(tokenizer),
+        geometry_loss_weight=0.1,
     )
     loss.backward()
 
@@ -256,7 +313,7 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     assert [logits.shape for logits in logits_by_scale] == [
         (2, 1, 4),
         (2, 2, 6),
-        (2, 4, 256),
+        (2, 4, 16),
     ]
     assert all(parameter.grad is None for parameter in tokenizer.parameters())
     assert any(parameter.grad is not None for parameter in model.parameters())
@@ -264,9 +321,9 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
 
 def test_block_prediction_uses_first_block_as_prefix_and_second_as_target() -> None:
     tokenizer = _build_tokenizer().eval()
-    input_ids = torch.arange(2 * 32).reshape(2, 32) % 4
-    prefix_ids = input_ids[:, :16]
-    target_ids = input_ids[:, 16:]
+    input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
+    prefix_ids = input_ids[:, :8]
+    target_ids = input_ids[:, 8:]
 
     block_predictions = prepare_block_predictions(tokenizer, input_ids)
     assert len(block_predictions) == 1
@@ -274,9 +331,6 @@ def test_block_prediction_uses_first_block_as_prefix_and_second_as_target() -> N
     prediction = block_predictions[0]
     torch.testing.assert_close(prediction.target_ids, target_ids)
     torch.testing.assert_close(prediction.prefix, tokenizer.encode(prefix_ids))
-    torch.testing.assert_close(
-        prediction.prefix_code, tokenizer.encode_indices(prefix_ids)[0]
-    )
 
     expected_targets = tokenizer.encode_indices(target_ids)
     for actual, expected in zip(prediction.targets_by_scale, expected_targets):
@@ -289,8 +343,9 @@ def test_default_config_matches_fixed_hierarchy_recipe() -> None:
 
     assert config.run.resume_from is None
     assert config.tokenizer_checkpoint.endswith(
-        "vqvae-256-continuous-final/checkpoints/best.pt"
+        "vqvae-256-learned-hierarchy-dinucleotide-final/checkpoints/best.pt"
     )
+    assert config.wandb.name == "nsm-256-packed-next-scale-learned-hierarchy"
     assert config.data.subset_directory.endswith("gtdb/500M_subset")
     assert config.data.sequence_length == 512
     assert config.data.train_batch_size == 64
@@ -306,6 +361,7 @@ def test_default_config_matches_fixed_hierarchy_recipe() -> None:
     assert config.optimizer.beta_2 == 0.95
     assert config.optimizer.weight_decay == 0.05
     assert config.optimizer.gradient_accumulation_steps == 1
+    assert config.optimizer.geometry_loss_weight == 0.1
     assert (
         config.data.sequence_length
         * config.data.train_batch_size
@@ -321,7 +377,7 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
     tokenizer = _build_tokenizer().eval()
     tokenizer.requires_grad_(False)
     model = _build_nsm(max_prefix_length=4)
-    input_ids = torch.arange(2 * 32).reshape(2, 32) % 4
+    input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
     scale_weights = build_scale_loss_weights(
         tokenizer.scale_lengths,
         scale_loss_alpha=0.25,
@@ -333,12 +389,16 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
         tokenizer,
         data_loader=[{"input_ids": input_ids}],
         scale_loss_weights=scale_weights,
+        codebook_distances_by_scale=_codebook_distances(tokenizer),
+        geometry_loss_weight=0.1,
         use_mixed_precision=False,
         rollout_max_batches=1,
     )
 
     assert model.training is True
     assert metrics["loss"] > 0
+    assert metrics["cross_entropy_loss"] > 0
+    assert metrics["geometry_loss"] > 0
     assert 0 <= metrics["accuracy"] <= 1
     assert metrics["rollout_nucleotide_loss"] > 0
     assert 0 <= metrics["rollout_nucleotide_accuracy"] <= 1
@@ -354,36 +414,32 @@ def test_rollout_feeds_each_prediction_back_into_the_hierarchy() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.device_anchor = torch.nn.Parameter(torch.zeros(()))
-            self.inputs: list[tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]] = []
+            self.inputs: list[tuple[torch.Tensor, list[torch.Tensor]]] = []
 
         def predict_scale(
             self,
             prefix: torch.Tensor,
-            prefix_code: torch.Tensor,
             completed_scales: list[torch.Tensor],
-            current_codes: torch.Tensor,
         ) -> torch.Tensor:
-            del prefix
             self.inputs.append(
                 (
-                    prefix_code.clone(),
+                    prefix.clone(),
                     [indices.clone() for indices in completed_scales],
-                    current_codes.clone(),
                 )
             )
             call_index = len(self.inputs) - 1
-            codebook_size = codebook_sizes[len(completed_scales)]
-            logits = torch.full((2, codebook_size), -1.0)
-            logits[:, (call_index + 1) % codebook_size] = 1.0
+            scale_index = len(completed_scales)
+            codebook_size = codebook_sizes[scale_index]
+            scale_length = tokenizer.scale_lengths[scale_index]
+            logits = torch.full((2, scale_length, codebook_size), -1.0)
+            logits[:, :, (call_index + 1) % codebook_size] = 1.0
             return logits
 
     model = StubModel()
     predicted_indices_by_scale = rollout_hierarchy(
         model,
         tokenizer,
-        batch_size=2,
         prefix=torch.zeros(2, 4, 4),
-        prefix_code=torch.tensor([[1], [2]]),
     )
 
     assert [indices.shape for indices in predicted_indices_by_scale] == [
@@ -395,9 +451,9 @@ def test_rollout_feeds_each_prediction_back_into_the_hierarchy() -> None:
         predicted_indices_by_scale[0],
         torch.ones(2, 1, dtype=torch.long),
     )
-    torch.testing.assert_close(model.inputs[0][0], torch.tensor([[1], [2]]))
+    torch.testing.assert_close(model.inputs[0][0], torch.zeros(2, 4, 4))
     torch.testing.assert_close(model.inputs[1][1][0], predicted_indices_by_scale[0])
     torch.testing.assert_close(
-        model.inputs[2][2],
-        predicted_indices_by_scale[1][:, :1],
+        model.inputs[2][1][1],
+        predicted_indices_by_scale[1],
     )

@@ -5,69 +5,83 @@ from nsm_dna.models.vqvae import VQVAE
 from scripts.training.train_vqvae import evaluate
 
 
-def test_each_scale_quantizes_the_original_latent() -> None:
+def test_learned_downsampling_preserves_left_right_order() -> None:
     quantizer = MultiscaleVectorQuantizer(
-        scale_lengths=[1, 2],
-        codebook_sizes=[2, 2],
-        quantization_dim=1,
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[2, 2, 2],
+        quantization_dim=2,
         latent_length=4,
     ).eval()
     with torch.no_grad():
-        quantizer.codebooks[0].codebook.copy_(torch.tensor([[5.0], [100.0]]))
-        for codebook in quantizer.codebooks[1:]:
-            codebook.codebook.copy_(torch.tensor([[0.0], [10.0]]))
+        first_downsampler = quantizer.downsamplers[0].convolution
+        first_downsampler.weight.zero_()
+        first_downsampler.weight[0, 0, 0] = 1.0
+        first_downsampler.weight[1, 0, 1] = 1.0
 
-    latent = torch.tensor([[[0.0], [0.0], [10.0], [10.0]]])
-    _, indices = quantizer(latent)
-    scale_latents = quantizer.indices_to_scale_latents(indices)
+    latent = torch.tensor([[[1.0, 0.0], [3.0, 0.0], [2.0, 0.0], [4.0, 0.0]]])
+    swapped_latent = latent.clone()
+    swapped_latent[:, :2] = latent[:, :2].flip(dims=[1])
 
-    torch.testing.assert_close(indices[0], torch.tensor([[0]]))
-    torch.testing.assert_close(indices[1], torch.tensor([[0, 1]]))
-    torch.testing.assert_close(scale_latents[0], torch.full_like(latent, 5.0))
-    torch.testing.assert_close(scale_latents[1], latent)
+    scale_two_latent = quantizer._downsample_to_scales(latent)[1]
+    swapped_scale_two_latent = quantizer._downsample_to_scales(swapped_latent)[1]
+
+    assert not torch.allclose(
+        scale_two_latent[:, 0],
+        swapped_scale_two_latent[:, 0],
+    )
+    torch.testing.assert_close(
+        scale_two_latent[:, 1],
+        swapped_scale_two_latent[:, 1],
+    )
 
 
-def test_partial_reconstruction_gradient_flows_through_pooling() -> None:
+def test_partial_reconstruction_gradient_flows_through_learned_downsampling(
+    monkeypatch,
+) -> None:
     quantizer = MultiscaleVectorQuantizer(
-        scale_lengths=[1],
-        codebook_sizes=[2],
-        quantization_dim=1,
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[2, 2, 2],
+        quantization_dim=4,
         latent_length=4,
     ).eval()
-    latent = torch.randn(1, 4, 1, requires_grad=True)
+    latent = torch.randn(1, 4, 4, requires_grad=True)
 
-    partial_latent, _ = quantizer(
+    monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: torch.tensor(0))
+    _, partial_latent, _ = quantizer(
         latent, include_partial_reconstruction=True
     )
     assert partial_latent is not None
-    partial_latent.sum().backward()
+    partial_latent[..., 0].sum().backward()
 
-    torch.testing.assert_close(latent.grad, torch.ones_like(latent))
+    assert latent.grad is not None
+    assert latent.grad.count_nonzero() > 0
+    assert all(
+        downsampler.convolution.weight.grad is not None
+        and downsampler.convolution.weight.grad.count_nonzero() > 0
+        for downsampler in quantizer.downsamplers
+    )
 
 
 def test_vqvae_decodes_each_scale_independently() -> None:
     model = VQVAE(
         vocab_size=4,
         context_length=8,
-        latent_length=2,
+        latent_length=4,
         embed_dim=8,
         quantization_dim=4,
         num_heads=2,
-        scale_lengths=[1, 2],
-        codebook_sizes=[4, 256],
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[4, 4, 16],
     ).eval()
     token_ids = torch.tensor([[0, 1, 2, 3, 3, 2, 1, 0]])
 
     with torch.no_grad():
         logits, _, indices = model(token_ids)
         scale_logits = model.decode_scales(indices)
-        latent = model.encode(token_ids)
-        final_vectors = model.final_codebook_vectors()[indices[-1]]
 
-    assert len(scale_logits) == 2
+    assert len(scale_logits) == 3
     assert all(value.shape == logits.shape for value in scale_logits)
     torch.testing.assert_close(scale_logits[-1], logits)
-    torch.testing.assert_close(final_vectors, latent)
     torch.testing.assert_close(model.decode_scale(indices[0], 0), scale_logits[0])
 
 
@@ -75,12 +89,12 @@ def test_validation_reports_independent_scale_reconstruction() -> None:
     model = VQVAE(
         vocab_size=4,
         context_length=8,
-        latent_length=2,
+        latent_length=4,
         embed_dim=8,
         quantization_dim=4,
         num_heads=2,
-        scale_lengths=[1, 2],
-        codebook_sizes=[4, 256],
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[4, 4, 16],
     )
     batch = {"input_ids": torch.tensor([[0, 1, 2, 3, 3, 2, 1, 0]])}
 
@@ -93,8 +107,9 @@ def test_validation_reports_independent_scale_reconstruction() -> None:
 
     assert "accuracy_scale_1" in metrics
     assert "accuracy_scale_2" in metrics
+    assert "accuracy_scale_4" in metrics
     assert "scale_latent_rms_scale_1" in metrics
-    assert metrics["accuracy_scale_2"] == metrics["accuracy"]
+    assert metrics["accuracy_scale_4"] == metrics["accuracy"]
     assert abs(
-        metrics["reconstruction_loss_scale_2"] - metrics["full_reconstruction_loss"]
+        metrics["reconstruction_loss_scale_4"] - metrics["full_reconstruction_loss"]
     ) < 1e-6

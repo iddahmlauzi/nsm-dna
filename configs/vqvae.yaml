@@ -8,7 +8,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: vqvae
-  name: vqvae-256-continuous-final
+  name: vqvae-256-learned-hierarchy-dinucleotide-final
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -22,9 +22,9 @@ data:
 model:
   vocab_size: 4
   context_length: 256
-  # The encoder combines each non-overlapping group of four nucleotides into one
-  # latent position before multiscale quantization.
-  latent_length: 64
+  # The encoder combines each non-overlapping nucleotide pair into one latent
+  # position before multiscale quantization.
+  latent_length: 128
   embed_dim: 128
   # A smaller vector gives each finite codebook fewer independently varying
   # values to approximate during nearest-code lookup.
@@ -32,10 +32,10 @@ model:
   num_heads: 4
   # RoPE is applied only in the decoder.
   rope_base: 10_000
-  # Coarse scales quantize pooled views of the continuous latent. At length 64,
-  # the decoder reads the latent directly; its 256 codes are the 256 4-mers.
-  scale_lengths: [1, 2, 4, 8, 16, 32, 64]
-  codebook_sizes: [32, 32, 64, 128, 128, 256, 256]
+  # Every scale is quantized after recursively applying learned stride-2
+  # convolutions. The final length-128 scale uses 16 codes for dinucleotides.
+  scale_lengths: [1, 2, 4, 8, 16, 32, 64, 128]
+  codebook_sizes: [32, 32, 64, 64, 128, 128, 128, 16]
 
   decoder_num_layers: 4
   use_qk_norm: true

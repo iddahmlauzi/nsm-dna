@@ -260,7 +260,6 @@ def main(config: DictConfig) -> None:
                 logits_by_scale = model(
                     prediction.targets_by_scale,
                     prefix=prediction.prefix,
-                    prefix_code=prediction.prefix_code,
                 )
             update_condition_metrics(
                 condition_metrics[condition_name],
@@ -285,9 +284,7 @@ def main(config: DictConfig) -> None:
                 rollout_indices = rollout_hierarchy(
                     model,
                     tokenizer,
-                    batch_size=prediction.target_ids.shape[0],
                     prefix=prediction.prefix,
-                    prefix_code=prediction.prefix_code,
                 )
                 for scale_index, (rollout_targets, true_targets) in enumerate(
                     zip(

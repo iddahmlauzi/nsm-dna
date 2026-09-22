@@ -1,4 +1,4 @@
-# Predict absolute scales from 64 prefix latents, its scale-1 code, and earlier target codes.
+# Predict each target scale in parallel from 128 prefix latents and earlier scales.
 
 run:
   seed: 0
@@ -6,13 +6,13 @@ run:
 
 # The checkpoint's stored model configuration is the source of truth for the
 # tokenizer architecture, scale lengths, and codebook sizes.
-tokenizer_checkpoint: ../runs/vqvae-256-continuous-final/checkpoints/best.pt
+tokenizer_checkpoint: ../runs/vqvae-256-learned-hierarchy-dinucleotide-final/checkpoints/best.pt
 
 wandb:
   enabled: true
   entity: nsm-dna
   project: nsm
-  name: nsm-256-prefix-scale1
+  name: nsm-256-packed-next-scale-learned-hierarchy
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -52,6 +52,9 @@ optimizer:
 
   # A scale's loss share is proportional to length ** (1 - alpha).
   scale_loss_alpha: 1
+  # Codebook distances are normalized to mean one within each scale. This term
+  # gives nearby incorrect codes a smaller penalty while preserving exact-code CE.
+  geometry_loss_weight: 0.1
 
 mixed_precision:
   enabled: true

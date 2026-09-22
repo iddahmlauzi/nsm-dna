@@ -34,7 +34,7 @@ class TokenizerWindowEncoder(nn.Module):
             enabled=input_ids.device.type == "cuda",
         ):
             pre_quant = self.tokenizer.encode(input_ids)
-            pre_decode, _, _, _ = self.tokenizer.quantizer(pre_quant)
+            pre_decode, _, _ = self.tokenizer.quantizer(pre_quant)
 
         return torch.cat(
             [pre_quant.float().mean(dim=1), pre_decode.float().mean(dim=1)],

@@ -41,13 +41,10 @@ class NSMWindowEncoder(nn.Module):
             enabled=input_ids.device.type == "cuda",
         ):
             prefix = self.tokenizer.encode(prefix_ids)
-            prefix_code = self.tokenizer.encode_indices(prefix_ids)[0]
             targets_by_scale = self.tokenizer.encode_indices(target_ids)
-            hidden_states = self.model.encode(
-                targets_by_scale, prefix=prefix, prefix_code=prefix_code
-            )
+            hidden_states = self.model.encode(targets_by_scale, prefix=prefix)
 
-        memory_token_index = prefix.shape[1] + 1
+        memory_token_index = prefix.shape[1]
         return hidden_states[:, memory_token_index].float()
 
 
