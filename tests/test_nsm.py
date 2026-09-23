@@ -19,7 +19,8 @@ def _build_model(
         model_dim=8,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[4, 5, 6],
-        codebook_vectors=[torch.randn(4, 3), torch.randn(5, 3), torch.randn(6, 3)],
+        target_length=12,
+        vocab_size=4,
         num_layers=num_layers,
         num_heads=2,
         dropout=0.0,
@@ -27,35 +28,30 @@ def _build_model(
     )
 
 
-def _indices() -> list[torch.Tensor]:
+def _scale_vectors() -> list[torch.Tensor]:
     return [
-        torch.tensor([[1], [2]]),
-        torch.tensor([[2, 3], [3, 4]]),
-        torch.tensor([[3, 4, 5, 0], [4, 5, 0, 1]]),
+        torch.randn(2, 1, 3),
+        torch.randn(2, 2, 3),
+        torch.randn(2, 4, 3),
     ]
 
 
 def test_nsm_from_checkpoint_restores_model_and_step(tmp_path: Path) -> None:
-    codebook_vectors = [torch.randn(4, 3), torch.randn(5, 3)]
     tokenizer = SimpleNamespace(
         quantization_dim=3,
         latent_length=2,
         scale_lengths=[1, 2],
         codebook_sizes=[4, 5],
         context_length=4,
-        quantizer=SimpleNamespace(
-            codebooks=[
-                SimpleNamespace(codebook=codebook_vectors[0]),
-                SimpleNamespace(codebook=codebook_vectors[1]),
-            ]
-        ),
+        vocab_size=4,
     )
     model = NSM(
         prefix_dim=tokenizer.quantization_dim,
         model_dim=8,
         scale_lengths=tokenizer.scale_lengths,
         codebook_sizes=tokenizer.codebook_sizes,
-        codebook_vectors=codebook_vectors,
+        target_length=tokenizer.context_length,
+        vocab_size=4,
         num_layers=1,
         num_heads=2,
         dropout=0.0,
@@ -128,22 +124,20 @@ def test_multiscale_output_head_starts_as_linear_classifiers() -> None:
         torch.testing.assert_close(actual, expected)
 
 
-def test_scale_inputs_repeat_prior_scale_codes_to_the_target_length() -> None:
+def test_scale_inputs_repeat_prior_scale_vectors_to_the_target_length() -> None:
     model = _build_model(num_layers=0)
-    indices_by_scale = _indices()
+    vectors_by_scale = _scale_vectors()
 
     inputs = model._build_scale_inputs(
-        indices_by_scale[:-1],
+        vectors_by_scale[:-1],
         batch_size=2,
     )
-    first_codes = model.codebook_vectors_0[indices_by_scale[0]]
-    second_codes = model.codebook_vectors_1[indices_by_scale[1]]
     expected_inputs = torch.cat(
         [
             model.bos.expand(2, 1, -1) + model.scale_embedding.weight[0],
-            model.input_projection(first_codes).repeat_interleave(2, dim=1)
+            model.input_projection(vectors_by_scale[0]).repeat_interleave(2, dim=1)
             + model.scale_embedding.weight[1],
-            model.input_projection(second_codes).repeat_interleave(2, dim=1)
+            model.input_projection(vectors_by_scale[1]).repeat_interleave(2, dim=1)
             + model.scale_embedding.weight[2],
         ],
         dim=1,
@@ -151,15 +145,34 @@ def test_scale_inputs_repeat_prior_scale_codes_to_the_target_length() -> None:
     torch.testing.assert_close(inputs, expected_inputs)
 
 
-def test_attention_is_bidirectional_within_each_scale_block() -> None:
+def test_next_scale_loss_backpropagates_to_context_vectors() -> None:
+    model = _build_model()
+    vectors_by_scale = [
+        vectors.requires_grad_() for vectors in _scale_vectors()[:-1]
+    ]
+
+    logits_by_scale = model(
+        vectors_by_scale,
+        prefix=torch.randn(2, 4, 3),
+    )
+    loss = sum(logits.square().mean() for logits in logits_by_scale)
+    loss.backward()
+
+    assert all(
+        vectors.grad is not None and vectors.grad.count_nonzero() > 0
+        for vectors in vectors_by_scale
+    )
+
+
+def test_attention_is_markovian_between_scale_blocks() -> None:
     model = _build_model()
     expected_mask = torch.tensor(
         [
             [True, True, False, False, False],
             [True, True, False, False, False],
             [True, True, True, False, False],
-            [True, True, True, True, True],
-            [True, True, True, True, True],
+            [True, True, False, True, True],
+            [True, True, False, True, True],
         ]
     ).reshape(1, 1, 5, 5)
 
@@ -172,7 +185,8 @@ def test_prefix_is_visible_to_every_causal_hierarchy_position() -> None:
         model_dim=8,
         scale_lengths=[1, 2],
         codebook_sizes=[4, 5],
-        codebook_vectors=[torch.randn(4, 3), torch.randn(5, 3)],
+        target_length=4,
+        vocab_size=4,
         num_layers=1,
         num_heads=2,
         dropout=0.0,
@@ -184,8 +198,8 @@ def test_prefix_is_visible_to_every_causal_hierarchy_position() -> None:
             [True, True, False, False, False],
             [True, True, False, False, False],
             [True, True, True, False, False],
-            [True, True, True, True, True],
-            [True, True, True, True, True],
+            [True, True, False, True, True],
+            [True, True, False, True, True],
         ]
     ).reshape(1, 1, 5, 5)
 
@@ -201,6 +215,10 @@ def test_rope_positions_are_centers_in_the_finest_scale_coordinates() -> None:
     torch.testing.assert_close(
         model.prefix_positions,
         torch.tensor([-4.0, -3.0, -2.0, -1.0]),
+    )
+    torch.testing.assert_close(
+        model.nucleotide_positions,
+        (torch.arange(12) + 0.5) / 3 - 0.5,
     )
 
 
@@ -222,7 +240,8 @@ def test_nsm_scales_residual_projection_initialization() -> None:
         model_dim=64,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
-        codebook_vectors=[torch.randn(8, 8) for _ in range(3)],
+        target_length=8,
+        vocab_size=4,
         num_layers=num_layers,
         num_heads=4,
         dropout=0.0,
@@ -242,11 +261,11 @@ def test_nsm_scales_residual_projection_initialization() -> None:
 
 def test_nsm_predicts_every_codebook_including_scale_one() -> None:
     model = _build_model(num_layers=0)
-    indices_by_scale = _indices()
+    vectors_by_scale = _scale_vectors()
     prefix = torch.randn(2, 4, 3)
 
-    logits = model(indices_by_scale[:-1], prefix=prefix)
-    expected_hidden_states = model.encode(indices_by_scale[:-1], prefix=prefix)
+    logits = model(vectors_by_scale[:-1], prefix=prefix)
+    expected_hidden_states = model.encode(vectors_by_scale[:-1], prefix=prefix)
     expected_logits = model.output_head(expected_hidden_states[:, 4:])
 
     assert [value.shape for value in logits] == [
@@ -261,7 +280,7 @@ def test_nsm_predicts_every_codebook_including_scale_one() -> None:
 def test_first_scale_uses_the_learned_bos_input() -> None:
     model = _build_model(num_layers=0)
     prefix = torch.randn(2, 4, 3)
-    hidden_states = model.encode(_indices()[:-1], prefix=prefix)
+    hidden_states = model.encode(_scale_vectors()[:-1], prefix=prefix)
 
     torch.testing.assert_close(
         hidden_states[:, 4:5],
@@ -274,10 +293,10 @@ def test_first_scale_uses_the_learned_bos_input() -> None:
 def test_nsm_returns_prefix_and_hierarchy_hidden_states() -> None:
     model = _build_model(num_layers=0, max_prefix_length=4)
     prefix = torch.randn(2, 4, 3)
-    indices_by_scale = _indices()
+    vectors_by_scale = _scale_vectors()
 
-    hidden_states = model.encode(indices_by_scale[:-1], prefix=prefix)
-    logits = model(indices_by_scale[:-1], prefix=prefix)
+    hidden_states = model.encode(vectors_by_scale[:-1], prefix=prefix)
+    logits = model(vectors_by_scale[:-1], prefix=prefix)
 
     assert hidden_states.shape == (2, 11, 8)
     assert [value.shape for value in logits] == [
@@ -294,12 +313,15 @@ def test_a_scale_cannot_change_its_own_or_earlier_logits() -> None:
     torch.manual_seed(0)
     model = _build_model(num_layers=2).eval()
     prefix = torch.randn(2, 4, 3)
-    indices_by_scale = _indices()
-    changed_indices = [indices.clone() for indices in indices_by_scale]
-    changed_indices[1][:, 0] = (changed_indices[1][:, 0] + 1) % 5
+    vectors_by_scale = _scale_vectors()
+    changed_vectors = [vectors.clone() for vectors in vectors_by_scale]
+    changed_vectors[1][:, 0] += 1
 
-    logits = model(indices_by_scale[:-1], prefix=prefix)
-    changed_logits = model(changed_indices[:-1], prefix=prefix)
+    logits = model(vectors_by_scale[:-1], prefix=prefix)
+    changed_logits = model(
+        changed_vectors[:-1],
+        prefix=prefix,
+    )
 
     # Scale 2 is only supplied as the input used to predict scale 4.
     torch.testing.assert_close(logits[0], changed_logits[0])
@@ -307,31 +329,63 @@ def test_a_scale_cannot_change_its_own_or_earlier_logits() -> None:
     assert not torch.equal(logits[2], changed_logits[2])
 
 
-def test_first_scale_is_predicted_without_supplying_its_code() -> None:
+def test_scale_inputs_do_not_skip_over_intermediate_scales() -> None:
     torch.manual_seed(0)
     model = _build_model(num_layers=1).eval()
     prefix = torch.randn(2, 4, 3)
-    indices_by_scale = _indices()
-    changed_indices = [indices.clone() for indices in indices_by_scale]
-    changed_indices[0][:, 0] = (changed_indices[0][:, 0] + 1) % 4
+    vectors_by_scale = _scale_vectors()
+    changed_vectors = [vectors.clone() for vectors in vectors_by_scale]
+    changed_vectors[0][:, 0] += 1
 
-    logits = model(indices_by_scale[:-1], prefix=prefix)
-    changed_logits = model(changed_indices[:-1], prefix=prefix)
+    logits = model(vectors_by_scale[:-1], prefix=prefix)
+    changed_logits = model(
+        changed_vectors[:-1],
+        prefix=prefix,
+    )
 
     torch.testing.assert_close(logits[0], changed_logits[0])
     assert not torch.equal(logits[1], changed_logits[1])
+    torch.testing.assert_close(logits[2], changed_logits[2])
+
+
+def test_nucleotide_prediction_uses_upsampled_final_scale() -> None:
+    torch.manual_seed(0)
+    model = _build_model(num_layers=0).eval()
+    prefix = torch.randn(2, 4, 3)
+    vectors_by_scale = _scale_vectors()
+    changed_final_vectors = vectors_by_scale[-1].clone()
+    changed_final_vectors[:, 0] += 1
+
+    nucleotide_logits = model.predict_nucleotides(
+        vectors_by_scale[-1],
+        prefix=prefix,
+    )
+    changed_nucleotide_logits = model.predict_nucleotides(
+        changed_final_vectors,
+        prefix=prefix,
+    )
+
+    assert nucleotide_logits.shape == (2, 12, 4)
+    assert not torch.equal(
+        nucleotide_logits[:, :3],
+        changed_nucleotide_logits[:, :3],
+    )
+    torch.testing.assert_close(
+        nucleotide_logits[:, 3:],
+        changed_nucleotide_logits[:, 3:],
+    )
 
 
 def test_packed_teacher_forcing_matches_scale_by_scale_prediction() -> None:
     model = _build_model(num_layers=1).eval()
     prefix = torch.randn(2, 4, 3)
-    indices_by_scale = _indices()
+    vectors_by_scale = _scale_vectors()
 
-    teacher_forced_logits = model(indices_by_scale[:-1], prefix=prefix)
-    for scale_index in range(len(indices_by_scale)):
+    teacher_forced_logits = model(vectors_by_scale[:-1], prefix=prefix)
+    for scale_index in range(len(vectors_by_scale)):
         scale_logits = model.predict_scale(
             prefix,
-            indices_by_scale[:scale_index],
+            vectors_by_scale[:scale_index],
         )
         torch.testing.assert_close(
             scale_logits,

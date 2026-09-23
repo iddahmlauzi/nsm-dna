@@ -1,48 +1,60 @@
-# Predict each target scale in parallel from 128 prefix latents and earlier scales.
+# Train the tokenizer and NSM-DNA jointly from nucleotide sequence.
 
 run:
   seed: 0
   resume_from: null
 
-# The checkpoint's stored model configuration is the source of truth for the
-# tokenizer architecture, scale lengths, and codebook sizes.
-tokenizer_checkpoint: ../runs/vqvae-256-learned-hierarchy-dinucleotide-final/checkpoints/best.pt
-
 wandb:
   enabled: true
   entity: nsm-dna
-  project: nsm
-  name: nsm-256-packed-next-scale-learned-hierarchy
+  project: end-to-end
+  name: nsm-dna-end-to-end-triplet
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
   train_split: train
   validation_split: validation
-  sequence_length: 512
-  # Four GPUs at batch 64 process 131,072 bases per optimizer update.
-  train_batch_size: 64
-  validation_batch_size: 8
+  # One 384-base prefix block followed by one 384-base target block.
+  sequence_length: 768
+  train_batch_size: 32
+  validation_batch_size: 32
   num_workers: 3
   shuffle_buffer_size: 10_000
 
+tokenizer:
+  vocab_size: 4
+  context_length: 384
+  latent_length: 128
+  embed_dim: 128
+  quantization_dim: 16
+  num_heads: 4
+  rope_base: 10_000
+  scale_lengths: [1, 2, 4, 8, 16, 32, 64, 128]
+  codebook_sizes: [32, 32, 64, 64, 128, 128, 128, 21]
+  decoder_num_layers: 4
+  use_qk_norm: true
+  bias: false
+
 model:
-  # Match the width, depth, and head count of the GPT-2 small backbone.
   model_dim: 768
   num_layers: 12
   num_heads: 12
   dropout: 0.1
   bias: false
-
   use_qk_norm: true
   rope_base: 10_000
-
   head_num_blocks: 2
   head_hidden_multiplier: 2.0
+
+objective:
+  # Each step also reconstructs from one randomly sampled non-final scale.
+  partial_reconstruction_weight: 0.25
+  # Alpha 1 gives every hierarchy scale equal weight.
+  scale_loss_alpha: 1
 
 optimizer:
   learning_rate: 5e-4
   min_learning_rate: 1e-5
-  # Five percent of the 38,150 optimizer steps across ten epochs.
   warmup_steps: 1_907
   beta_1: 0.9
   beta_2: 0.95
@@ -50,35 +62,19 @@ optimizer:
   max_gradient_norm: 1.0
   gradient_accumulation_steps: 1
 
-  # A scale's loss share is proportional to length ** (1 - alpha).
-  scale_loss_alpha: 1
-  # Codebook distances are normalized to mean one within each scale. This term
-  # gives nearby incorrect codes a smaller penalty while preserving exact-code CE.
-  geometry_loss_weight: 0.5
-
 mixed_precision:
   enabled: true
 
 training:
   num_epochs: 10
-  # Set an integer here to override the epoch-derived training length.
   max_steps: null
   log_interval: 10
-  # Coarse errors affect every later scale, so corrupt them more often. The
-  # probabilities correspond to context scales [1, 2, 4, 8, 16, 32, 64].
-  # Replacements are sampled from the five nearest codebook neighbors, while
-  # prediction targets remain clean.
-  context_corruption_probabilities: [0.30, 0.25, 0.20, 0.15, 0.10, 0.075, 0.05]
-  context_neighbor_count: 5
 
 evaluation:
   interval: 1_000
   max_batches: 10
-  # Greedy scale rollout is substantially more expensive than teacher forcing.
-  rollout_max_batches: 1
 
 checkpoint:
-  # Overwrite the same recovery checkpoint throughout training.
   interval: 5_000
 
 hydra:

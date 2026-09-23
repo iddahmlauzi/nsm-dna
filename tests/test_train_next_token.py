@@ -87,7 +87,7 @@ def test_default_config_uses_local_checkpoint_recovery() -> None:
     config = OmegaConf.load(config_path)
 
     assert "huggingface" not in config.checkpoint
-    assert config.checkpoint.recovery_interval == 5000
+    assert config.checkpoint.interval == 5000
     assert config.wandb.run_id is None
 
 
@@ -98,7 +98,7 @@ def test_default_config_uses_stable_transformer_training_settings() -> None:
     assert config.model.dropout == 0.0
     assert config.model.bias is False
     assert config.model.use_qk_norm is True
-    assert config.optimizer.warmup_steps == 1907
+    assert config.optimizer.warmup_steps == 954
     assert config.optimizer.beta_1 == 0.9
     assert config.optimizer.beta_2 == 0.95
     assert config.optimizer.weight_decay == 0.05

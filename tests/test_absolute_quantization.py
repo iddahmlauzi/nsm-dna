@@ -47,7 +47,7 @@ def test_partial_reconstruction_gradient_flows_through_learned_downsampling(
     latent = torch.randn(1, 4, 4, requires_grad=True)
 
     monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: torch.tensor(0))
-    _, partial_latent, _ = quantizer(
+    _, partial_latent, _, _ = quantizer(
         latent, include_partial_reconstruction=True
     )
     assert partial_latent is not None
@@ -76,7 +76,7 @@ def test_vqvae_decodes_each_scale_independently() -> None:
     token_ids = torch.tensor([[0, 1, 2, 3, 3, 2, 1, 0]])
 
     with torch.no_grad():
-        logits, _, indices = model(token_ids)
+        logits, _, indices, _ = model(token_ids)
         scale_logits = model.decode_scales(indices)
 
     assert len(scale_logits) == 3

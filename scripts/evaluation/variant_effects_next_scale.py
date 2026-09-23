@@ -16,7 +16,6 @@ from tqdm import tqdm
 from nsm_dna.data import encode_sequence
 from nsm_dna.models.next_scale import NSM
 from nsm_dna.models.vqvae import VQVAE
-from scripts.training.train_nsm import prepare_block_predictions
 
 PREDICTION_COLUMNS = (
     "study_id",
@@ -106,45 +105,43 @@ def score_token_ids(
         device=input_ids.device,
         dtype=torch.float64,
     )
-    decoder_scores = torch.zeros(
-        input_ids.shape[0], device=input_ids.device, dtype=torch.float64
-    )
-    for prediction in prepare_block_predictions(tokenizer, input_ids):
-        with torch.autocast(
-            device_type=input_ids.device.type,
-            dtype=torch.bfloat16,
-            enabled=input_ids.device.type == "cuda",
-        ):
-            logits_by_scale = model(
-                prediction.targets_by_scale[:-1],
-                prefix=prediction.prefix,
-            )
-            decoder_logits = tokenizer.decode_scale(
-                prediction.targets_by_scale[-1], len(predicted_scale_lengths) - 1
-            )
+    prefix_ids, target_ids = input_ids.split(tokenizer.context_length, dim=1)
+    prefix = tokenizer.encode(prefix_ids)
+    target_indices = tokenizer.encode_indices(target_ids)
+    target_vectors = [
+        tokenizer.quantizer.indices_to_vectors(indices, scale_index)
+        for scale_index, indices in enumerate(target_indices)
+    ]
+    with torch.autocast(
+        device_type=input_ids.device.type,
+        dtype=torch.bfloat16,
+        enabled=input_ids.device.type == "cuda",
+    ):
+        logits_by_scale = model(target_vectors[:-1], prefix=prefix)
+        decoder_logits = tokenizer.decode_scale(
+            target_indices[-1], len(predicted_scale_lengths) - 1
+        )
 
-        # Likelihood counts every predicted code once; the training loss's scale
-        # weights do not enter the sequence score.
-        for scale_index, (scale_logits, scale_targets) in enumerate(
-            zip(logits_by_scale, prediction.targets_by_scale)
-        ):
-            log_probabilities = F.log_softmax(scale_logits.float(), dim=-1)
-            hierarchy_scores[:, scale_index] += (
-                log_probabilities.gather(-1, scale_targets.unsqueeze(-1))
-                .squeeze(-1)
-                .sum(1)
-                .double()
-            )
-
-        # The final absolute scale supplies the decoder's nucleotide likelihood.
-        nucleotide_log_probabilities = F.log_softmax(decoder_logits.float(), dim=-1)
-        nucleotide_targets = prediction.target_ids
-        decoder_scores += (
-            nucleotide_log_probabilities.gather(-1, nucleotide_targets.unsqueeze(-1))
+    # Likelihood counts every predicted code once; training weights do not enter
+    # the sequence score.
+    for scale_index, (scale_logits, scale_targets) in enumerate(
+        zip(logits_by_scale, target_indices, strict=True)
+    ):
+        log_probabilities = F.log_softmax(scale_logits.float(), dim=-1)
+        hierarchy_scores[:, scale_index] = (
+            log_probabilities.gather(-1, scale_targets.unsqueeze(-1))
             .squeeze(-1)
             .sum(1)
             .double()
         )
+
+    nucleotide_log_probabilities = F.log_softmax(decoder_logits.float(), dim=-1)
+    decoder_scores = (
+        nucleotide_log_probabilities.gather(-1, target_ids.unsqueeze(-1))
+        .squeeze(-1)
+        .sum(1)
+        .double()
+    )
 
     return hierarchy_scores, decoder_scores
 

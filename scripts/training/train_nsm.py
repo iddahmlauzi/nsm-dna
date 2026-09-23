@@ -2,14 +2,12 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
-import einx
 import hydra
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
 from hydra.core.hydra_config import HydraConfig
-from jaxtyping import Float, Int
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel
@@ -17,8 +15,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from nsm_dna.data import collate_dna_sequences, load_gtdb_dataset
-from nsm_dna.models.next_scale import NSM
-from nsm_dna.models.vqvae import VQVAE
+from nsm_dna.models.end_to_end import NSMDNA, NSMDNAOutput
 from nsm_dna.training import (
     build_learning_rate_scheduler,
     calculate_training_steps,
@@ -27,15 +24,16 @@ from nsm_dna.training import (
     load_training_checkpoint,
     save_training_checkpoint,
 )
+from nsm_dna.triplet_analysis import assign_triplets, code_table_rows
 
 
-@dataclass(frozen=True)
-class BlockPredictionBatch:
-    """Inputs and targets for predicting one block from its preceding blocks."""
-
-    target_ids: Int[Tensor, "batch block_length"]
-    prefix: Float[Tensor, "batch prefix_length vq_dim"]
-    targets_by_scale: list[Int[Tensor, "batch scale_length"]]
+@dataclass
+class Losses:
+    total: Tensor
+    reconstruction: Tensor
+    partial_reconstruction: Tensor
+    hierarchy: Tensor
+    nucleotide: Tensor
 
 
 def build_scale_loss_weights(
@@ -43,361 +41,223 @@ def build_scale_loss_weights(
     scale_loss_alpha: float,
     device: torch.device,
 ) -> Tensor:
-    """Return each scale's share of the total next-scale loss.
-
-    Alpha 1 gives every scale equal weight. Alpha 0 gives every code position
-    equal weight, so longer scales receive a proportionally larger share.
-    """
+    """Weight scales equally at alpha 1 and positions equally at alpha 0."""
     lengths = torch.tensor(scale_lengths, dtype=torch.float32, device=device)
-    scale_weights = lengths.pow(1.0 - scale_loss_alpha)
-    return scale_weights / scale_weights.sum()
+    weights = lengths.pow(1.0 - scale_loss_alpha)
+    return weights / weights.sum()
 
 
-@torch.no_grad()
-def build_codebook_distance_matrices(
-    codebook_vectors: list[Tensor],
-) -> list[Tensor]:
-    """Measure code similarity within each tokenizer codebook."""
-    distance_matrices = []
-    for vectors in codebook_vectors:
-        distances = torch.cdist(vectors.float(), vectors.float())
-        off_diagonal = ~torch.eye(
-            vectors.shape[0],
-            dtype=torch.bool,
-            device=vectors.device,
-        )
-
-        # Codebooks can have different geometric scales. Setting their mean
-        # off-diagonal distance to one gives geometry_loss_weight the same
-        # interpretation at every hierarchy scale.
-        mean_distance = distances[off_diagonal].mean().clamp_min(1e-8)
-        distance_matrices.append(distances / mean_distance)
-
-    return distance_matrices
-
-
-@torch.no_grad()
-def build_codebook_neighbor_tables(
-    codebook_distances_by_scale: list[Tensor],
-    neighbor_count: int,
-) -> list[Tensor]:
-    """Return the nearest alternative code IDs for every code at each scale."""
-    neighbor_tables = []
-    for distances in codebook_distances_by_scale:
-        distances = distances.clone()
-        distances.fill_diagonal_(torch.inf)
-        neighbor_tables.append(
-            distances.topk(neighbor_count, largest=False).indices
-        )
-    return neighbor_tables
-
-
-@torch.no_grad()
-def corrupt_context_indices(
-    context_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
-    neighbor_tables_by_scale: list[Int[Tensor, "codebook_size neighbor"]],
-    corruption_probabilities: list[float],
-) -> list[Int[Tensor, "batch scale_length"]]:
-    """Replace selected context codes with nearby codes from the same codebook."""
-    corrupted_context = []
-    for context_indices, neighbor_table, corruption_probability in zip(
-        context_indices_by_scale,
-        neighbor_tables_by_scale,
-        corruption_probabilities,
-        strict=True,
-    ):
-        neighbor_rank = torch.randint(
-            neighbor_table.shape[1],
-            context_indices.shape,
-            device=context_indices.device,
-        )
-        replacement_indices = neighbor_table[context_indices].gather(
-            dim=-1,
-            index=neighbor_rank.unsqueeze(-1),
-        ).squeeze(-1)
-        corruption_mask = torch.rand(
-            context_indices.shape,
-            device=context_indices.device,
-        ) < corruption_probability
-
-        # Inference errors are valid but incorrect code IDs. Nearby-code
-        # replacement exposes the model to that failure mode while preserving
-        # the tokenizer's discrete input representation.
-        corrupted_context.append(
-            torch.where(
-                corruption_mask,
-                replacement_indices,
-                context_indices,
-            )
-        )
-
-    return corrupted_context
-
-
-def compute_next_scale_loss(
-    logits_by_scale: list[Tensor],
-    targets_by_scale: list[Tensor],
+def compute_losses(
+    output: NSMDNAOutput,
+    target_ids: Tensor,
     scale_loss_weights: Tensor,
-    codebook_distances_by_scale: list[Tensor],
-    geometry_loss_weight: float,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Combine exact-code classification with geometry-aware supervision."""
-    cross_entropy_by_scale = torch.stack(
-        [
-            F.cross_entropy(
-                scale_logits.flatten(0, 1),
-                scale_targets.flatten(),
-            )
-            for scale_logits, scale_targets in zip(
-                logits_by_scale,
-                targets_by_scale,
-            )
-        ]
+    partial_reconstruction_weight: float,
+) -> Losses:
+    reconstruction = F.cross_entropy(
+        output.reconstruction_logits.flatten(0, 1),
+        target_ids.flatten(),
     )
-
-    geometry_loss_by_scale = torch.stack(
+    partial_reconstruction = (
+        F.cross_entropy(
+            output.partial_reconstruction_logits.flatten(0, 1),
+            target_ids.flatten(),
+        )
+        if output.partial_reconstruction_logits is not None
+        else reconstruction.new_zeros(())
+    )
+    hierarchy_by_scale = torch.stack(
         [
-            (
-                scale_logits.float().softmax(dim=-1)
-                * codebook_distances[scale_targets]
-            )
-            .sum(dim=-1)
-            .mean()
-            for scale_logits, scale_targets, codebook_distances in zip(
-                logits_by_scale,
-                targets_by_scale,
-                codebook_distances_by_scale,
+            F.cross_entropy(logits.flatten(0, 1), targets.flatten())
+            for logits, targets in zip(
+                output.hierarchy_logits,
+                output.target_indices,
                 strict=True,
             )
         ]
     )
-
-    # Cross-entropy identifies the exact target. Expected codebook distance gives
-    # every alternative code a different penalty, so nearby mistakes provide a
-    # better training signal than geometrically unrelated mistakes.
-    losses_by_scale = (
-        cross_entropy_by_scale
-        + geometry_loss_weight * geometry_loss_by_scale
+    hierarchy = (hierarchy_by_scale * scale_loss_weights).sum()
+    nucleotide = F.cross_entropy(
+        output.nucleotide_logits.flatten(0, 1),
+        target_ids.flatten(),
     )
-    loss = (losses_by_scale * scale_loss_weights).sum()
-    return loss, cross_entropy_by_scale, geometry_loss_by_scale
+    total = (
+        reconstruction
+        + partial_reconstruction_weight * partial_reconstruction
+        + hierarchy
+        + nucleotide
+    )
+    return Losses(
+        total=total,
+        reconstruction=reconstruction,
+        partial_reconstruction=partial_reconstruction,
+        hierarchy=hierarchy,
+        nucleotide=nucleotide,
+    )
 
 
-@torch.no_grad()
-def prepare_block_predictions(
-    tokenizer: VQVAE,
-    input_ids: Int[Tensor, "batch sequence_length"],
-) -> list[BlockPredictionBatch]:
-    """Create one task that predicts the second block from the first block."""
-    block_length = tokenizer.context_length
-    prefix_ids = input_ids[:, :block_length]
-    target_ids = input_ids[:, block_length:]
-    prefix = tokenizer.encode(prefix_ids)
-    indices_by_scale = tokenizer.encode_indices(target_ids)
-
-    return [
-        BlockPredictionBatch(
-            target_ids=target_ids,
-            prefix=prefix,
-            targets_by_scale=indices_by_scale,
-        )
-    ]
-
-
-@torch.no_grad()
-def rollout_hierarchy(
-    model: NSM,
-    tokenizer: VQVAE,
-    prefix: Float[Tensor, "batch prefix_length vq_dim"],
-) -> list[Int[Tensor, "batch scale_length"]]:
-    """Greedily generate one complete scale at each coarse-to-fine step."""
-    predicted_indices_by_scale = []
-
-    for _ in tokenizer.scale_lengths:
-        logits = model.predict_scale(prefix, predicted_indices_by_scale)
-        predicted_indices_by_scale.append(logits.argmax(dim=-1))
-
-    return predicted_indices_by_scale
+def split_blocks(input_ids: Tensor, block_length: int) -> tuple[Tensor, Tensor]:
+    """Split each sequence into one prefix block and one target block."""
+    return input_ids[:, :block_length], input_ids[:, block_length:]
 
 
 @torch.no_grad()
 def evaluate(
-    model: NSM,
-    tokenizer: VQVAE,
+    model: NSMDNA,
     data_loader: DataLoader,
     scale_loss_weights: Tensor,
-    codebook_distances_by_scale: list[Tensor],
-    geometry_loss_weight: float,
+    partial_reconstruction_weight: float,
     use_mixed_precision: bool,
     max_batches: int | None = None,
-    rollout_max_batches: int = 0,
 ) -> dict[str, float]:
-    """Evaluate teacher-forced predictions and optional greedy rollouts.
-
-    Evaluate the entire data loader when max_batches is None.
-    """
     was_training = model.training
     model.eval()
     device = next(model.parameters()).device
-    predicted_scale_lengths = tokenizer.scale_lengths
-    num_scales = len(predicted_scale_lengths)
-
-    loss_sum = 0.0
-    cross_entropy_loss_sum = 0.0
-    geometry_loss_sum = 0.0
-    geometry_loss_sums_by_scale = [0.0] * num_scales
-    correct_codes_by_scale = [0] * num_scales
-    num_codes_by_scale = [0] * num_scales
-    num_block_predictions = 0
-    rollout_nucleotide_loss_sum = 0.0
-    rollout_correct_nucleotides = 0
-    rollout_num_nucleotides = 0
-    num_rollouts = 0
+    loss_sums = torch.zeros(5, device=device)
+    correct_reconstructions = 0
+    correct_nucleotides = 0
+    num_nucleotides = 0
+    correct_codes_by_scale = [0] * len(model.tokenizer.scale_lengths)
+    num_codes_by_scale = [0] * len(model.tokenizer.scale_lengths)
+    code_counts_by_scale = [
+        torch.zeros(codebook_size, dtype=torch.long, device=device)
+        for codebook_size in model.tokenizer.codebook_sizes
+    ]
+    num_batches = 0
 
     for batch_index, batch in enumerate(data_loader):
         if max_batches is not None and batch_index == max_batches:
             break
 
         input_ids = batch["input_ids"].to(device)
-
-        # Evaluate each tokenizer-sized block separately. Later blocks use the
-        # encoded real preceding blocks as prefix context.
-        for prediction in prepare_block_predictions(tokenizer, input_ids):
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.bfloat16,
-                enabled=use_mixed_precision,
-            ):
-                # Every scale is predicted in parallel from completed earlier
-                # scales, with all scale tasks packed into one transformer pass.
-                logits_by_scale = model(
-                    prediction.targets_by_scale[:-1],
-                    prefix=prediction.prefix,
-                )
-                (
-                    loss,
-                    cross_entropy_by_scale,
-                    geometry_loss_by_scale,
-                ) = compute_next_scale_loss(
-                    logits_by_scale,
-                    prediction.targets_by_scale,
-                    scale_loss_weights,
-                    codebook_distances_by_scale,
-                    geometry_loss_weight,
-                )
-
-                # Rollout predicts the first scale from the real prefix, then
-                # supplies generated target codes.
-                if batch_index < rollout_max_batches:
-                    rollout_indices = rollout_hierarchy(
-                        model,
-                        tokenizer,
-                        prefix=prediction.prefix,
+        prefix_ids, target_ids = split_blocks(
+            input_ids,
+            model.tokenizer.context_length,
+        )
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=use_mixed_precision,
+        ):
+            output = model(
+                prefix_ids,
+                target_ids,
+                include_partial_reconstruction=False,
+            )
+            losses = compute_losses(
+                output,
+                target_ids,
+                scale_loss_weights,
+                partial_reconstruction_weight,
+            )
+            if len(output.target_indices) > 1:
+                partial_losses = [
+                    F.cross_entropy(
+                        logits.flatten(0, 1),
+                        target_ids.flatten(),
                     )
-                    rollout_logits = tokenizer.decode_scale(
-                        rollout_indices[-1], num_scales - 1
+                    for logits in model.tokenizer.decode_scales(
+                        output.target_indices[:-1]
                     )
-                    rollout_nucleotide_loss = F.cross_entropy(
-                        rollout_logits.flatten(0, 1),
-                        prediction.target_ids.flatten(),
-                    )
-
-            # Pool exact code matches by scale across all evaluated blocks.
-            for scale_index, (scale_logits, scale_targets) in enumerate(
-                zip(
-                    logits_by_scale,
-                    prediction.targets_by_scale,
-                    strict=True,
+                ]
+                losses.partial_reconstruction = torch.stack(partial_losses).mean()
+                losses.total += (
+                    partial_reconstruction_weight
+                    * losses.partial_reconstruction
                 )
-            ):
-                predictions_at_scale = scale_logits.argmax(dim=-1)
-                correct_at_scale = predictions_at_scale == scale_targets
-                correct_codes_by_scale[scale_index] += correct_at_scale.sum().item()
-                num_codes_by_scale[scale_index] += scale_targets.numel()
 
-            loss_sum += loss.item()
-            cross_entropy_loss_sum += (
-                cross_entropy_by_scale * scale_loss_weights
+        loss_sums += torch.stack(
+            [
+                losses.total,
+                losses.reconstruction,
+                losses.partial_reconstruction,
+                losses.hierarchy,
+                losses.nucleotide,
+            ]
+        )
+        correct_reconstructions += (
+            output.reconstruction_logits.argmax(dim=-1) == target_ids
+        ).sum().item()
+        correct_nucleotides += (
+            output.nucleotide_logits.argmax(dim=-1) == target_ids
+        ).sum().item()
+        scale_predictions = zip(
+            output.hierarchy_logits,
+            output.target_indices,
+            strict=True,
+        )
+        for scale_index, (logits, targets) in enumerate(scale_predictions):
+            correct_codes_by_scale[scale_index] += (
+                logits.argmax(dim=-1) == targets
             ).sum().item()
-            geometry_loss_sum += (
-                geometry_loss_by_scale * scale_loss_weights
-            ).sum().item()
-            for scale_index, geometry_loss in enumerate(geometry_loss_by_scale):
-                geometry_loss_sums_by_scale[scale_index] += geometry_loss.item()
-            num_block_predictions += 1
-
-            if batch_index < rollout_max_batches:
-                rollout_nucleotide_loss_sum += rollout_nucleotide_loss.item()
-                rollout_correct_nucleotides += (
-                    (rollout_logits.argmax(dim=-1) == prediction.target_ids)
-                    .sum()
-                    .item()
-                )
-                rollout_num_nucleotides += prediction.target_ids.numel()
-                num_rollouts += 1
+            num_codes_by_scale[scale_index] += targets.numel()
+            code_counts_by_scale[scale_index] += torch.bincount(
+                targets.flatten(),
+                minlength=model.tokenizer.codebook_sizes[scale_index],
+            )
+        num_nucleotides += target_ids.numel()
+        num_batches += 1
 
     model.train(was_training)
-
-    total_correct_codes = sum(correct_codes_by_scale)
-    total_codes = sum(num_codes_by_scale)
+    mean_losses = loss_sums / num_batches
     metrics = {
-        "loss": loss_sum / num_block_predictions,
-        "cross_entropy_loss": cross_entropy_loss_sum / num_block_predictions,
-        "geometry_loss": geometry_loss_sum / num_block_predictions,
-        "accuracy": total_correct_codes / total_codes,
+        "loss": mean_losses[0].item(),
+        "reconstruction_loss": mean_losses[1].item(),
+        "partial_reconstruction_loss": mean_losses[2].item(),
+        "hierarchy_loss": mean_losses[3].item(),
+        "nucleotide_loss": mean_losses[4].item(),
+        "reconstruction_accuracy": correct_reconstructions / num_nucleotides,
+        "hierarchy_accuracy": (
+            sum(correct_codes_by_scale) / sum(num_codes_by_scale)
+        ),
+        "nucleotide_accuracy": correct_nucleotides / num_nucleotides,
     }
-
-    for scale_index, scale_length in enumerate(predicted_scale_lengths):
-        metrics[f"accuracy_scale_{scale_length}"] = (
-            correct_codes_by_scale[scale_index] / num_codes_by_scale[scale_index]
+    for scale_number, (scale_length, codebook_size) in enumerate(
+        zip(
+            model.tokenizer.scale_lengths,
+            model.tokenizer.codebook_sizes,
+            strict=True,
+        ),
+        start=1,
+    ):
+        counts = code_counts_by_scale[scale_number - 1].float()
+        probabilities = counts[counts > 0] / counts.sum()
+        perplexity = torch.exp(-(probabilities * probabilities.log()).sum()).item()
+        section = f"scale_{scale_number:02d}_length_{scale_length}"
+        # Normalize the effective number of used codes so every scale is on a
+        # comparable zero-to-one range despite different codebook sizes.
+        metrics[f"{section}/codebook_usage"] = perplexity / codebook_size
+        metrics[f"{section}/prediction_accuracy"] = (
+            correct_codes_by_scale[scale_number - 1]
+            / num_codes_by_scale[scale_number - 1]
         )
-        metrics[f"geometry_loss_scale_{scale_length}"] = (
-            geometry_loss_sums_by_scale[scale_index] / num_block_predictions
-        )
-
-    # Rollout loss averages the block-batch losses, while rollout accuracy pools
-    # every decoded nucleotide position.
-    if num_rollouts > 0:
-        metrics["rollout_nucleotide_loss"] = rollout_nucleotide_loss_sum / num_rollouts
-        metrics["rollout_nucleotide_accuracy"] = (
-            rollout_correct_nucleotides / rollout_num_nucleotides
-        )
-
     return metrics
 
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="nsm")
 def main(config: DictConfig) -> None:
-    distributed_environment = initialize_distributed_training()
-    torch.manual_seed(config.run.seed + distributed_environment.rank)
+    distributed = initialize_distributed_training()
+    torch.manual_seed(config.run.seed + distributed.rank)
+    device = distributed.device
     run_directory = Path(HydraConfig.get().runtime.output_dir)
-    device = distributed_environment.device
     sequence_length = int(config.data.sequence_length)
     total_steps = calculate_training_steps(
         config,
-        distributed_environment.world_size,
+        distributed.world_size,
         sequence_length,
     )
-    if distributed_environment.is_main_process:
+
+    model = NSMDNA.from_config(config).to(device)
+    block_length = model.tokenizer.context_length
+    if sequence_length != 2 * block_length:
+        raise ValueError("data.sequence_length must contain two tokenizer blocks.")
+
+    if distributed.is_main_process:
+        num_parameters = sum(parameter.numel() for parameter in model.parameters())
         print(f"training for {total_steps:,} optimizer steps")
+        print(f"NSM-DNA parameters: {num_parameters / 1e6:.2f}M")
 
-    # The tokenizer checkpoint owns every tokenizer architectural choice. Keeping
-    # those settings out of this config prevents stage 2 from silently rebuilding
-    # a tokenizer that differs from the one that produced its code targets.
-    tokenizer_checkpoint_path = Path(config.tokenizer_checkpoint)
-    tokenizer = VQVAE.from_checkpoint(
-        tokenizer_checkpoint_path,
-        device,
-        frozen=True,
-    )
-    if sequence_length % tokenizer.context_length != 0:
-        raise ValueError(
-            "data.sequence_length must be divisible by the tokenizer context length."
-        )
-
-    # Create the experiment logger.
     wandb_run = None
-    if config.wandb.enabled and distributed_environment.is_main_process:
+    if config.wandb.enabled and distributed.is_main_process:
         wandb_run = wandb.init(
             entity=config.wandb.entity,
             project=config.wandb.project,
@@ -406,71 +266,37 @@ def main(config: DictConfig) -> None:
             dir=run_directory,
         )
 
-    # Create the dataset and data loader.
     train_dataset = load_gtdb_dataset(
         subset_directory=Path(config.data.subset_directory),
         split=config.data.train_split,
         context_length=sequence_length,
         shuffle_buffer_size=config.data.shuffle_buffer_size,
         seed=config.run.seed,
-        rank=distributed_environment.rank,
-        world_size=distributed_environment.world_size,
-    )
-
-    # Keep DataLoader iterator seeding separate from the model's random state.
-    train_generator = torch.Generator().manual_seed(
-        config.run.seed + distributed_environment.rank
+        rank=distributed.rank,
+        world_size=distributed.world_size,
     )
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.data.train_batch_size,
         collate_fn=collate_dna_sequences,
         num_workers=config.data.num_workers,
-        generator=train_generator,
+        generator=torch.Generator().manual_seed(config.run.seed + distributed.rank),
     )
 
     validation_loader = None
-    if distributed_environment.is_main_process:
+    if distributed.is_main_process:
         validation_dataset = load_gtdb_dataset(
             subset_directory=Path(config.data.subset_directory),
             split=config.data.validation_split,
             context_length=sequence_length,
         )
-        validation_generator = torch.Generator().manual_seed(config.run.seed)
         validation_loader = DataLoader(
             validation_dataset,
             batch_size=config.data.validation_batch_size,
             collate_fn=collate_dna_sequences,
             num_workers=config.data.num_workers,
-            generator=validation_generator,
+            generator=torch.Generator().manual_seed(config.run.seed),
         )
-
-    model = NSM.from_config(config, tokenizer).to(device)
-    use_mixed_precision = config.mixed_precision.enabled and device.type == "cuda"
-
-    num_parameters = sum(parameter.numel() for parameter in model.parameters())
-    if distributed_environment.is_main_process:
-        print(f"NSM-DNA parameters: {num_parameters / 1e6:.2f}M")
-        if wandb_run is not None:
-            wandb_run.summary["model/parameters"] = num_parameters
-
-    scale_loss_weights = build_scale_loss_weights(
-        tokenizer.scale_lengths,
-        config.optimizer.scale_loss_alpha,
-        device,
-    )
-    codebook_distances_by_scale = build_codebook_distance_matrices(
-        [codebook.codebook for codebook in tokenizer.quantizer.codebooks]
-    )
-    codebook_neighbor_tables = build_codebook_neighbor_tables(
-        codebook_distances_by_scale,
-        int(config.training.context_neighbor_count),
-    )
-    geometry_loss_weight = float(config.optimizer.geometry_loss_weight)
-    context_corruption_probabilities = [
-        float(probability)
-        for probability in config.training.context_corruption_probabilities
-    ]
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -486,8 +312,6 @@ def main(config: DictConfig) -> None:
         min_learning_rate=config.optimizer.min_learning_rate,
     )
 
-    # Resume only the stage-two model and optimizer. The tokenizer is always
-    # restored independently from the checkpoint named in tokenizer_checkpoint.
     start_step = 0
     best_validation_loss = float("inf")
     if config.run.resume_from is not None:
@@ -499,45 +323,42 @@ def main(config: DictConfig) -> None:
             scheduler,
             device,
         )
-        if distributed_environment.is_main_process:
+        if distributed.is_main_process:
             print(f"resumed from checkpoint: {checkpoint_path} (step {start_step})")
 
-    training_model: NSM | DistributedDataParallel = model
-    if distributed_environment.is_distributed:
+    training_model: NSMDNA | DistributedDataParallel = model
+    if distributed.is_distributed:
+        ddp_options = {"broadcast_buffers": False}
         if device.type == "cuda":
-            training_model = DistributedDataParallel(
-                model,
-                device_ids=[distributed_environment.local_rank],
-                output_device=distributed_environment.local_rank,
-                broadcast_buffers=False,
+            ddp_options.update(
+                device_ids=[distributed.local_rank],
+                output_device=distributed.local_rank,
             )
-        else:
-            training_model = DistributedDataParallel(
-                model,
-                broadcast_buffers=False,
-            )
+        training_model = DistributedDataParallel(model, **ddp_options)
 
-    # Train the stage-two model while the tokenizer supplies fixed inputs and
-    # targets. Only NSM parameters are owned by the optimizer.
+    scale_loss_weights = build_scale_loss_weights(
+        model.tokenizer.scale_lengths,
+        config.objective.scale_loss_alpha,
+        device,
+    )
+    partial_reconstruction_weight = float(
+        config.objective.partial_reconstruction_weight
+    )
+    use_mixed_precision = config.mixed_precision.enabled and device.type == "cuda"
+    gradient_accumulation_steps = int(config.optimizer.gradient_accumulation_steps)
     training_epoch = 0
     train_iterator = iter(train_loader)
     progress_bar = tqdm(
         range(start_step + 1, total_steps + 1),
         desc="Training",
-        disable=not distributed_environment.is_main_process,
+        disable=not distributed.is_main_process,
     )
-    gradient_accumulation_steps = config.optimizer.gradient_accumulation_steps
 
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
         should_log = step % config.training.log_interval == 0
-
-        if should_log:
-            mean_loss = torch.zeros((), device=device)
-            mean_cross_entropy_loss = torch.zeros((), device=device)
-            mean_geometry_loss = torch.zeros((), device=device)
-            correct_codes = torch.zeros((), device=device, dtype=torch.long)
-            num_codes = torch.zeros((), device=device, dtype=torch.long)
+        loss_sums = torch.zeros(5, device=device)
+        nucleotide_counts = torch.zeros(3, dtype=torch.long, device=device)
 
         for micro_step in range(gradient_accumulation_steps):
             try:
@@ -549,71 +370,48 @@ def main(config: DictConfig) -> None:
                 batch = next(train_iterator)
 
             input_ids = batch["input_ids"].to(device)
-            block_predictions = prepare_block_predictions(tokenizer, input_ids)
-            num_predictions_per_step = gradient_accumulation_steps * len(
-                block_predictions
+            prefix_ids, target_ids = split_blocks(input_ids, block_length)
+            is_last_micro_step = micro_step == gradient_accumulation_steps - 1
+            synchronization = (
+                nullcontext()
+                if not distributed.is_distributed or is_last_micro_step
+                else training_model.no_sync()
             )
 
-            for block_index, prediction in enumerate(block_predictions):
-                is_last_prediction = (
-                    micro_step == gradient_accumulation_steps - 1
-                    and block_index == len(block_predictions) - 1
-                )
-                if distributed_environment.is_distributed and not is_last_prediction:
-                    synchronization_context = training_model.no_sync()
-                else:
-                    synchronization_context = nullcontext()
+            with synchronization:
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=use_mixed_precision,
+                ):
+                    output = training_model(prefix_ids, target_ids)
+                    losses = compute_losses(
+                        output,
+                        target_ids,
+                        scale_loss_weights,
+                        partial_reconstruction_weight,
+                    )
+                    accumulated_loss = losses.total / gradient_accumulation_steps
+                accumulated_loss.backward()
 
-                # Average every block prediction in the optimizer step and only
-                # synchronize DDP gradients on the final backward pass.
-                with synchronization_context:
-                    with torch.autocast(
-                        device_type=device.type,
-                        dtype=torch.bfloat16,
-                        enabled=use_mixed_precision,
-                    ):
-                        context_indices_by_scale = corrupt_context_indices(
-                            prediction.targets_by_scale[:-1],
-                            codebook_neighbor_tables[:-1],
-                            context_corruption_probabilities,
-                        )
-                        logits_by_scale = training_model(
-                            context_indices_by_scale,
-                            prefix=prediction.prefix,
-                        )
-                        (
-                            loss,
-                            cross_entropy_by_scale,
-                            geometry_loss_by_scale,
-                        ) = compute_next_scale_loss(
-                            logits_by_scale,
-                            prediction.targets_by_scale,
-                            scale_loss_weights,
-                            codebook_distances_by_scale,
-                            geometry_loss_weight,
-                        )
-                        accumulated_loss = loss / num_predictions_per_step
-                    accumulated_loss.backward()
-
-                if should_log:
-                    mean_loss += loss.detach() / num_predictions_per_step
-                    mean_cross_entropy_loss += (
-                        cross_entropy_by_scale.detach() * scale_loss_weights
-                    ).sum() / num_predictions_per_step
-                    mean_geometry_loss += (
-                        geometry_loss_by_scale.detach() * scale_loss_weights
-                    ).sum() / num_predictions_per_step
-
-                    with torch.no_grad():
-                        for scale_logits, scale_targets in zip(
-                            logits_by_scale,
-                            prediction.targets_by_scale,
-                            strict=True,
-                        ):
-                            correct_codes += (
-                                scale_logits.argmax(dim=-1) == scale_targets
-                            ).sum()
-                            num_codes += scale_targets.numel()
+            if should_log:
+                loss_sums += torch.stack(
+                    [
+                        losses.total.detach(),
+                        losses.reconstruction.detach(),
+                        losses.partial_reconstruction.detach(),
+                        losses.hierarchy.detach(),
+                        losses.nucleotide.detach(),
+                    ]
+                ) / gradient_accumulation_steps
+                with torch.no_grad():
+                    nucleotide_counts[0] += (
+                        output.reconstruction_logits.argmax(dim=-1) == target_ids
+                    ).sum()
+                    nucleotide_counts[1] += (
+                        output.nucleotide_logits.argmax(dim=-1) == target_ids
+                    ).sum()
+                    nucleotide_counts[2] += target_ids.numel()
 
         gradient_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(),
@@ -621,70 +419,55 @@ def main(config: DictConfig) -> None:
         )
         learning_rate = optimizer.param_groups[0]["lr"]
         optimizer.step()
-
-        # Set the learning rate that will be used by the next optimizer step.
         scheduler.step()
 
         if should_log:
-            if distributed_environment.is_distributed:
-                for values in (
-                    mean_loss,
-                    mean_cross_entropy_loss,
-                    mean_geometry_loss,
-                    correct_codes,
-                    num_codes,
-                ):
-                    dist.all_reduce(values, op=dist.ReduceOp.SUM)
-                mean_loss /= distributed_environment.world_size
-                mean_cross_entropy_loss /= distributed_environment.world_size
-                mean_geometry_loss /= distributed_environment.world_size
-
-            if distributed_environment.is_main_process:
-                accuracy = (correct_codes / num_codes).item()
-
-                progress_bar.set_postfix(
-                    loss=f"{mean_loss.item():.4f}",
-                    accuracy=f"{accuracy:.2%}",
-                )
-
+            if distributed.is_distributed:
+                dist.all_reduce(loss_sums, op=dist.ReduceOp.SUM)
+                dist.all_reduce(nucleotide_counts, op=dist.ReduceOp.SUM)
+                loss_sums /= distributed.world_size
+            if distributed.is_main_process:
+                progress_bar.set_postfix(loss=f"{loss_sums[0].item():.4f}")
                 if wandb_run is not None:
-                    wandb_metrics = {
-                        "train/loss": mean_loss.item(),
-                        "train/cross_entropy_loss": (
-                            mean_cross_entropy_loss.item()
-                        ),
-                        "train/geometry_loss": mean_geometry_loss.item(),
-                        "train/accuracy": accuracy,
-                        "train/gradient_norm": gradient_norm.item(),
-                        "train/learning_rate": learning_rate,
+                    names = (
+                        "loss",
+                        "reconstruction_loss",
+                        "partial_reconstruction_loss",
+                        "hierarchy_loss",
+                        "nucleotide_loss",
+                    )
+                    metrics = {
+                        f"train/{name}": value.item()
+                        for name, value in zip(names, loss_sums, strict=True)
                     }
-                    wandb_run.log(wandb_metrics, step=step)
+                    metrics["train/gradient_norm"] = gradient_norm.item()
+                    metrics["train/learning_rate"] = learning_rate
+                    metrics["train/reconstruction_accuracy"] = (
+                        nucleotide_counts[0] / nucleotide_counts[2]
+                    ).item()
+                    metrics["train/nucleotide_accuracy"] = (
+                        nucleotide_counts[1] / nucleotide_counts[2]
+                    ).item()
+                    wandb_run.log(metrics, step=step)
 
         if step % config.evaluation.interval == 0:
-            if distributed_environment.is_main_process:
+            if distributed.is_main_process:
                 assert validation_loader is not None
-                validation_metrics = evaluate(
+                metrics = evaluate(
                     model,
-                    tokenizer,
                     validation_loader,
                     scale_loss_weights,
-                    codebook_distances_by_scale,
-                    geometry_loss_weight,
+                    partial_reconstruction_weight,
                     use_mixed_precision,
                     max_batches=config.evaluation.max_batches,
-                    rollout_max_batches=config.evaluation.rollout_max_batches,
                 )
                 tqdm.write(
-                    f"step {step} validation: loss "
-                    f"{validation_metrics['loss']:.4f}, accuracy "
-                    f"{validation_metrics['accuracy']:.2%}, rollout accuracy "
-                    f"{validation_metrics['rollout_nucleotide_accuracy']:.2%}"
+                    f"step {step} validation: loss {metrics['loss']:.4f}, "
+                    f"nucleotide accuracy {metrics['nucleotide_accuracy']:.2%}"
                 )
-
-                validation_loss = validation_metrics["loss"]
-                if validation_loss < best_validation_loss:
-                    best_validation_loss = validation_loss
-                    best_checkpoint_path = save_training_checkpoint(
+                if metrics["loss"] < best_validation_loss:
+                    best_validation_loss = metrics["loss"]
+                    path = save_training_checkpoint(
                         run_directory,
                         model,
                         optimizer,
@@ -694,46 +477,34 @@ def main(config: DictConfig) -> None:
                         best_validation_loss,
                         checkpoint_name="best.pt",
                     )
-                    tqdm.write(f"saved best checkpoint: {best_checkpoint_path}")
-
+                    tqdm.write(f"saved best checkpoint: {path}")
                 if wandb_run is not None:
                     wandb_metrics = {
-                        "validation/loss": validation_metrics["loss"],
-                        "validation/cross_entropy_loss": validation_metrics[
-                            "cross_entropy_loss"
-                        ],
-                        "validation/geometry_loss": validation_metrics[
-                            "geometry_loss"
-                        ],
-                        "validation/accuracy": validation_metrics["accuracy"],
-                        "rollout/nucleotide_loss": validation_metrics[
-                            "rollout_nucleotide_loss"
-                        ],
-                        "rollout/nucleotide_accuracy": validation_metrics[
-                            "rollout_nucleotide_accuracy"
-                        ],
+                        (
+                            name
+                            if name.startswith("scale_")
+                            else f"validation/{name}"
+                        ): value
+                        for name, value in metrics.items()
                     }
-                    for scale_index, scale_length in enumerate(tokenizer.scale_lengths):
-                        scale_name = (
-                            f"scale_{scale_index + 1:02d}_length_{scale_length}"
-                        )
-                        wandb_metrics[f"{scale_name}/validation_accuracy"] = (
-                            validation_metrics[f"accuracy_scale_{scale_length}"]
-                        )
-                        wandb_metrics[f"{scale_name}/geometry_loss"] = (
-                            validation_metrics[
-                                f"geometry_loss_scale_{scale_length}"
-                            ]
-                        )
-
+                    triplet_assignments = assign_triplets(
+                        model.tokenizer,
+                        device,
+                    )
+                    wandb_metrics["tokenizer/triplet_assignments"] = wandb.Table(
+                        columns=["code", "triplets", "amino acids"],
+                        data=code_table_rows(
+                            triplet_assignments,
+                            model.tokenizer.codebook_sizes[-1],
+                        ),
+                    )
                     wandb_run.log(wandb_metrics, step=step)
-
-            if distributed_environment.is_distributed:
+            if distributed.is_distributed:
                 dist.barrier()
 
         if step % config.checkpoint.interval == 0:
-            if distributed_environment.is_main_process:
-                checkpoint_path = save_training_checkpoint(
+            if distributed.is_main_process:
+                path = save_training_checkpoint(
                     run_directory,
                     model,
                     optimizer,
@@ -743,15 +514,26 @@ def main(config: DictConfig) -> None:
                     best_validation_loss,
                     checkpoint_name="latest.pt",
                 )
-                tqdm.write(f"saved checkpoint: {checkpoint_path}")
-
-            if distributed_environment.is_distributed:
+                tqdm.write(f"saved checkpoint: {path}")
+            if distributed.is_distributed:
                 dist.barrier()
 
-    if wandb_run is not None:
-        wandb_run.finish()
+    if distributed.is_main_process:
+        path = save_training_checkpoint(
+            run_directory,
+            model,
+            optimizer,
+            scheduler,
+            config,
+            total_steps,
+            best_validation_loss,
+            checkpoint_name="final.pt",
+        )
+        tqdm.write(f"saved final checkpoint: {path}")
+        if wandb_run is not None:
+            wandb_run.finish()
 
-    if distributed_environment.is_distributed:
+    if distributed.is_distributed:
         dist.barrier()
     cleanup_distributed_training()
 

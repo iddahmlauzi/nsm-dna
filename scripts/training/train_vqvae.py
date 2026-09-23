@@ -74,7 +74,7 @@ def evaluate(
             dtype=torch.bfloat16,
             enabled=use_mixed_precision,
         ):
-            logits, _, indices_by_scale = model(input_ids)
+            logits, _, indices_by_scale, _ = model(input_ids)
             full_reconstruction_loss = F.cross_entropy(
                 logits.flatten(0, 1),
                 input_ids.flatten(),
@@ -243,31 +243,16 @@ def main(config: DictConfig) -> None:
         )
 
     # Create the model.
-    model = VQVAE(
-        vocab_size=config.model.vocab_size,
-        context_length=config.model.context_length,
-        latent_length=config.model.latent_length,
-        embed_dim=config.model.embed_dim,
-        quantization_dim=config.model.quantization_dim,
-        num_heads=config.model.num_heads,
-        scale_lengths=list(config.model.scale_lengths),
-        codebook_sizes=list(config.model.codebook_sizes),
-        decoder_num_layers=config.model.decoder_num_layers,
-        use_qk_norm=config.model.use_qk_norm,
-        bias=config.model.bias,
-        rope_base=config.model.rope_base,
-        decay=config.model.decay,
-        eps=config.model.eps,
-    )
+    model = VQVAE.from_config(config.model)
 
     device = distributed_environment.device
     model = model.to(device)
     use_mixed_precision = config.mixed_precision.enabled and device.type == "cuda"
 
-    # Report gradient-trained network parameters and EMA-trained codebooks.
-    network_parameters = sum(parameter.numel() for parameter in model.parameters())
+    # Report the learned codebook separately from the remaining model parameters.
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
     codebook_parameters = model.quantizer.num_codebook_parameters
-    total_parameters = network_parameters + codebook_parameters
+    network_parameters = total_parameters - codebook_parameters
     if distributed_environment.is_main_process:
         print(
             f"VQ-VAE parameters: {total_parameters / 1e6:.2f}M total "
@@ -368,7 +353,7 @@ def main(config: DictConfig) -> None:
                     dtype=torch.bfloat16,
                     enabled=use_mixed_precision,
                 ):
-                    full_logits, partial_logits, _ = training_model(
+                    full_logits, partial_logits, _, _ = training_model(
                         input_ids,
                         include_partial_reconstruction=True,
                     )

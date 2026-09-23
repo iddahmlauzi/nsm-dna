@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from nsm_dna.models.autoencoder import Decoder, Encoder
 from nsm_dna.models.common import RMSNorm
-from nsm_dna.models.quantization import MultiscaleVectorQuantizer
+from nsm_dna.models.quantization import Codebook, MultiscaleVectorQuantizer
 from nsm_dna.models.vqvae import VQVAE
 from scripts.training.train_vqvae import evaluate
 
@@ -42,6 +42,22 @@ def test_encoder_uses_configured_non_overlapping_sampling_factor() -> None:
     assert encoder.downsampler.stride == (3,)
 
 
+def test_codebook_uses_hard_assignments_with_soft_gradients() -> None:
+    codebook = Codebook(codebook_size=4, quantization_dim=3)
+    latent = torch.randn(2, 3, 3, requires_grad=True)
+
+    quantized, indices, assignments = codebook(latent)
+
+    expected_assignments = F.one_hot(indices, num_classes=4).float()
+    torch.testing.assert_close(assignments, expected_assignments)
+
+    quantized.square().sum().backward()
+    assert latent.grad is not None
+    assert latent.grad.count_nonzero() > 0
+    assert codebook.codebook.grad is not None
+    assert codebook.codebook.grad.count_nonzero() > 0
+
+
 def test_single_scale_triplet_vqvae() -> None:
     model = VQVAE(
         vocab_size=4,
@@ -55,7 +71,7 @@ def test_single_scale_triplet_vqvae() -> None:
     )
     batches = [{"input_ids": torch.randint(0, 4, (2, 9))}]
 
-    logits, partial_logits, indices_by_scale = model(
+    logits, partial_logits, indices_by_scale, assignments_by_scale = model(
         batches[0]["input_ids"], include_partial_reconstruction=True
     )
     metrics = evaluate(
@@ -68,6 +84,7 @@ def test_single_scale_triplet_vqvae() -> None:
     assert logits.shape == (2, 9, 4)
     assert partial_logits is None
     assert indices_by_scale[0].shape == (2, 3)
+    assert assignments_by_scale[0].shape == (2, 3, 21)
     assert metrics["partial_reconstruction_loss"] == 0.0
     assert metrics["total_loss"] == metrics["full_reconstruction_loss"]
 
@@ -137,7 +154,12 @@ def test_quantizer_builds_and_quantizes_every_scale() -> None:
     ).eval()
     latent = torch.randn(2, 4, 2)
 
-    quantized_latent, partial_latent, indices_by_scale = quantizer(latent)
+    (
+        quantized_latent,
+        partial_latent,
+        indices_by_scale,
+        assignments_by_scale,
+    ) = quantizer(latent)
 
     assert quantized_latent.shape == latent.shape
     assert partial_latent is None
@@ -145,6 +167,11 @@ def test_quantizer_builds_and_quantizes_every_scale() -> None:
         (2, 1),
         (2, 2),
         (2, 4),
+    ]
+    assert [assignments.shape for assignments in assignments_by_scale] == [
+        (2, 1, 4),
+        (2, 2, 6),
+        (2, 4, 8),
     ]
     assert [scale.shape for scale in quantizer._downsample_to_scales(latent)] == [
         (2, 1, 2),
@@ -159,7 +186,7 @@ def test_decode_scales_matches_full_reconstruction_at_final_scale() -> None:
         [[0, 1, 2, 3, 3, 2, 1, 0], [3, 2, 1, 0, 0, 1, 2, 3]]
     )
 
-    logits, partial_logits, indices_by_scale = model(token_ids)
+    logits, partial_logits, indices_by_scale, _ = model(token_ids)
     scale_logits = model.decode_scales(indices_by_scale)
 
     assert partial_logits is None
@@ -186,7 +213,7 @@ def test_partial_reconstruction_backpropagates_through_encoder() -> None:
         [[0, 1, 2, 3, 3, 2, 1, 0], [3, 2, 1, 0, 0, 1, 2, 3]]
     )
 
-    _, partial_logits, _ = model(
+    _, partial_logits, _, _ = model(
         token_ids,
         include_partial_reconstruction=True,
     )

@@ -41,9 +41,6 @@ model:
   use_qk_norm: true
   bias: false
 
-  decay: 0.99
-  eps: 1e-5
-
   # Each step also decodes one uniformly sampled non-final scale by itself.
   partial_reconstruction_weight: 0.25
 

@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
 from .autoencoder import Decoder, Encoder
@@ -28,8 +28,6 @@ class VQVAE(nn.Module):
         use_qk_norm: bool = False,
         bias: bool = False,
         rope_base: float = 10000.0,
-        decay: float = 0.99,
-        eps: float = 1e-5,
     ) -> None:
         super().__init__()
 
@@ -59,8 +57,6 @@ class VQVAE(nn.Module):
             self.codebook_sizes,
             self.quantization_dim,
             latent_length=self.latent_length,
-            decay=decay,
-            eps=eps,
         )
         self.decoder = Decoder(
             self.vocab_size,
@@ -73,6 +69,24 @@ class VQVAE(nn.Module):
             use_qk_norm=self.use_qk_norm,
             bias=bias,
             rope_base=self.rope_base,
+        )
+
+    @classmethod
+    def from_config(cls, config: DictConfig) -> "VQVAE":
+        """Build a tokenizer from its model configuration."""
+        return cls(
+            vocab_size=config.vocab_size,
+            context_length=config.context_length,
+            latent_length=config.latent_length,
+            embed_dim=config.embed_dim,
+            quantization_dim=config.quantization_dim,
+            num_heads=config.num_heads,
+            decoder_num_layers=config.decoder_num_layers,
+            use_qk_norm=config.use_qk_norm,
+            scale_lengths=list(config.scale_lengths),
+            codebook_sizes=list(config.codebook_sizes),
+            bias=config.bias,
+            rope_base=config.rope_base,
         )
 
     @classmethod
@@ -91,22 +105,7 @@ class VQVAE(nn.Module):
         )
         config = OmegaConf.create(checkpoint["config"]).model
 
-        model = cls(
-            vocab_size=config.vocab_size,
-            context_length=config.context_length,
-            latent_length=config.latent_length,
-            embed_dim=config.embed_dim,
-            quantization_dim=config.quantization_dim,
-            num_heads=config.num_heads,
-            decoder_num_layers=config.decoder_num_layers,
-            use_qk_norm=config.use_qk_norm,
-            scale_lengths=list(config.scale_lengths),
-            codebook_sizes=list(config.codebook_sizes),
-            bias=config.bias,
-            rope_base=config.rope_base,
-            decay=config.decay,
-            eps=config.eps,
-        )
+        model = cls.from_config(config)
         model.load_state_dict(checkpoint["model"])
         model = model.to(device)
 
@@ -132,11 +131,16 @@ class VQVAE(nn.Module):
         Float[Tensor, "batch length vocab_size"],
         Float[Tensor, "batch length vocab_size"] | None,
         list[Int[Tensor, "batch scale_length"]],
+        list[Float[Tensor, "batch scale_length codebook_size"]],
     ]:
         latent = self.encode(token_ids)
-        quantized_latent, partial_quantized_latent, indices_by_scale = self.quantizer(
-            latent,
-            include_partial_reconstruction=include_partial_reconstruction,
+        (
+            quantized_latent,
+            partial_quantized_latent,
+            indices_by_scale,
+            assignments_by_scale,
+        ) = self.quantizer(
+            latent, include_partial_reconstruction=include_partial_reconstruction
         )
         logits = self.decoder(quantized_latent)
 
@@ -144,7 +148,7 @@ class VQVAE(nn.Module):
         if partial_quantized_latent is not None:
             partial_logits = self.decoder(partial_quantized_latent)
 
-        return logits, partial_logits, indices_by_scale
+        return logits, partial_logits, indices_by_scale, assignments_by_scale
 
     @torch.no_grad()
     def encode_indices(
@@ -156,7 +160,7 @@ class VQVAE(nn.Module):
             raise RuntimeError("Call model.eval() before encoding sequences.")
 
         latent = self.encode(token_ids)
-        _, _, indices_by_scale = self.quantizer(latent)
+        _, _, indices_by_scale, _ = self.quantizer(latent)
         return indices_by_scale
 
     @torch.no_grad()

@@ -35,7 +35,7 @@ class TokenizerWindowEncoder(nn.Module):
             enabled=input_ids.device.type == "cuda",
         ):
             latent = self.tokenizer.encode(input_ids)
-            quantized_latent, _, _ = self.tokenizer.quantizer(latent)
+            quantized_latent, _, _, _ = self.tokenizer.quantizer(latent)
             hidden_states = self.tokenizer.decoder.encode(quantized_latent)
 
         return hidden_states.float().mean(dim=1)

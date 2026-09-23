@@ -42,7 +42,14 @@ class NSMWindowEncoder(nn.Module):
         ):
             prefix = self.tokenizer.encode(prefix_ids)
             targets_by_scale = self.tokenizer.encode_indices(target_ids)
-            hidden_states = self.model.encode(targets_by_scale[:-1], prefix=prefix)
+            vectors_by_scale = [
+                self.tokenizer.quantizer.indices_to_vectors(
+                    scale_targets,
+                    scale_index,
+                )
+                for scale_index, scale_targets in enumerate(targets_by_scale)
+            ]
+            hidden_states = self.model.encode(vectors_by_scale[:-1], prefix=prefix)
 
         prefix_states = hidden_states[:, : prefix.shape[1]]
         finest_scale_states = hidden_states[:, -self.model.scale_lengths[-1] :]

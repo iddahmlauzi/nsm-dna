@@ -9,7 +9,7 @@ from scripts.evaluation.lambda_probe_tokenizer import (
 
 class _Quantizer(nn.Module):
     def forward(self, latent: torch.Tensor) -> tuple:
-        return latent + 1, None, None
+        return latent + 1, None, None, None
 
 
 class _Decoder(nn.Module):

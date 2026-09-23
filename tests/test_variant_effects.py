@@ -10,7 +10,6 @@ from scripts.evaluation.variant_effects_next_scale import (
     target_block_window,
 )
 from scripts.evaluation.variant_effects_next_token import score_next_token_ids
-from scripts.training.train_nsm import prepare_block_predictions
 
 
 def _build_tokenizer() -> VQVAE:
@@ -71,7 +70,8 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
         model_dim=8,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[4, 6, 16],
-        codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(16, 4)],
+        target_length=8,
+        vocab_size=4,
         num_layers=1,
         num_heads=2,
         dropout=0.0,
@@ -79,32 +79,39 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
     ).eval()
     input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
 
-    hierarchy_scores, decoder_scores = score_token_ids(model, tokenizer, input_ids)
+    hierarchy_scores, decoder_scores = score_token_ids(
+        model,
+        tokenizer,
+        input_ids,
+    )
 
     expected_hierarchy_scores = torch.zeros(2, 3, dtype=torch.float64)
     expected_decoder_scores = torch.zeros(2, dtype=torch.float64)
-    for prediction in prepare_block_predictions(tokenizer, input_ids):
-        logits_by_scale = model(
-            prediction.targets_by_scale[:-1],
-            prefix=prediction.prefix,
-        )
-        for scale_index, (scale_logits, scale_targets) in enumerate(
-            zip(logits_by_scale, prediction.targets_by_scale)
-        ):
-            scale_losses = F.cross_entropy(
-                scale_logits.flatten(0, 1),
-                scale_targets.flatten(),
-                reduction="none",
-            ).reshape(scale_targets.shape)
-            expected_hierarchy_scores[:, scale_index] -= scale_losses.sum(1).double()
-
-        decoder_logits = tokenizer.decode_scale(prediction.targets_by_scale[-1], 2)
-        decoder_losses = F.cross_entropy(
-            decoder_logits.flatten(0, 1),
-            prediction.target_ids.flatten(),
+    prefix_ids, target_ids = input_ids.split(tokenizer.context_length, dim=1)
+    prefix = tokenizer.encode(prefix_ids)
+    target_indices = tokenizer.encode_indices(target_ids)
+    target_vectors = [
+        tokenizer.quantizer.indices_to_vectors(indices, scale_index)
+        for scale_index, indices in enumerate(target_indices)
+    ]
+    logits_by_scale = model(target_vectors[:-1], prefix=prefix)
+    for scale_index, (scale_logits, scale_targets) in enumerate(
+        zip(logits_by_scale, target_indices, strict=True)
+    ):
+        scale_losses = F.cross_entropy(
+            scale_logits.flatten(0, 1),
+            scale_targets.flatten(),
             reduction="none",
-        ).reshape(prediction.target_ids.shape)
-        expected_decoder_scores -= decoder_losses.sum(1).double()
+        ).reshape(scale_targets.shape)
+        expected_hierarchy_scores[:, scale_index] -= scale_losses.sum(1).double()
+
+    decoder_logits = tokenizer.decode_scale(target_indices[-1], 2)
+    decoder_losses = F.cross_entropy(
+        decoder_logits.flatten(0, 1),
+        target_ids.flatten(),
+        reduction="none",
+    ).reshape(target_ids.shape)
+    expected_decoder_scores -= decoder_losses.sum(1).double()
 
     torch.testing.assert_close(hierarchy_scores, expected_hierarchy_scores)
     torch.testing.assert_close(decoder_scores, expected_decoder_scores)
@@ -118,7 +125,8 @@ def test_sequence_score_requires_prefix() -> None:
         model_dim=8,
         scale_lengths=[1, 2, 4],
         codebook_sizes=[4, 6, 16],
-        codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(16, 4)],
+        target_length=8,
+        vocab_size=4,
         num_layers=1,
         num_heads=2,
         dropout=0.0,
