@@ -1,4 +1,4 @@
-# 39.3M-parameter next-nucleotide model over 256-base GTDB sequences.
+# GPT-2-small-sized next-nucleotide model over 512-base GTDB sequences.
 
 run:
   seed: 0
@@ -8,25 +8,25 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: next-token
-  name: next-token-256-40m-500m-10epochs
+  name: next-token-512-gpt2-small-500m-5epochs
   run_id: null
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
   train_split: train
   validation_split: validation
-  sequence_length: 256
+  sequence_length: 512
   # This is the per-GPU batch size.
-  train_batch_size: 128
-  validation_batch_size: 512
+  train_batch_size: 64
+  validation_batch_size: 256
   num_workers: 3
   shuffle_buffer_size: 10_000
 
 model:
   vocab_size: 4
-  model_dim: 640
-  num_layers: 8
-  num_heads: 10
+  model_dim: 768
+  num_layers: 12
+  num_heads: 12
   dropout: 0.0
   bias: false
   use_qk_norm: true
@@ -35,8 +35,8 @@ model:
 optimizer:
   learning_rate: 5e-4
   min_learning_rate: 1e-5
-  # Five percent of the 38,150 optimizer steps in this ten-epoch run.
-  warmup_steps: 1_907
+  # Five percent of the 19,075 optimizer steps in this five-epoch run.
+  warmup_steps: 954
   beta_1: 0.9
   beta_2: 0.95
   weight_decay: 0.05
@@ -47,7 +47,7 @@ mixed_precision:
   enabled: true
 
 training:
-  num_epochs: 10
+  num_epochs: 5
   # Set an integer here for a shorter diagnostic run.
   max_steps: null
   log_interval: 10
@@ -57,10 +57,8 @@ evaluation:
   max_batches: 10
 
 checkpoint:
-  # Save latest.pt at this cadence so an interrupted run loses at most 5,000
-  # completed optimizer steps.
-  recovery_interval: 5_000
-  milestone_interval: 10_000
+  # Overwrite the same recovery checkpoint throughout training.
+  interval: 5_000
 
 hydra:
   run:

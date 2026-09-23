@@ -332,28 +332,19 @@ def main(config: DictConfig) -> None:
             if distributed_environment.is_distributed:
                 dist.barrier()
 
-        checkpoints_to_save: list[tuple[str, str | None]] = []
-        if step % config.checkpoint.recovery_interval == 0:
-            checkpoints_to_save.append(("recovery", "latest.pt"))
-        if step % config.checkpoint.milestone_interval == 0:
-            checkpoints_to_save.append(("milestone", None))
-
-        if checkpoints_to_save:
+        if step % config.checkpoint.interval == 0:
             if distributed_environment.is_main_process:
-                for checkpoint_type, checkpoint_name in checkpoints_to_save:
-                    checkpoint_path = save_training_checkpoint(
-                        run_directory,
-                        model,
-                        optimizer,
-                        scheduler,
-                        config,
-                        step,
-                        best_validation_loss,
-                        checkpoint_name=checkpoint_name,
-                    )
-                    tqdm.write(
-                        f"saved {checkpoint_type} checkpoint: {checkpoint_path}"
-                    )
+                checkpoint_path = save_training_checkpoint(
+                    run_directory,
+                    model,
+                    optimizer,
+                    scheduler,
+                    config,
+                    step,
+                    best_validation_loss,
+                    checkpoint_name="latest.pt",
+                )
+                tqdm.write(f"saved checkpoint: {checkpoint_path}")
 
             if distributed_environment.is_distributed:
                 dist.barrier()

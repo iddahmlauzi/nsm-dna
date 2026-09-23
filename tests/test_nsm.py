@@ -245,8 +245,8 @@ def test_nsm_predicts_every_codebook_including_scale_one() -> None:
     indices_by_scale = _indices()
     prefix = torch.randn(2, 4, 3)
 
-    logits = model(indices_by_scale, prefix=prefix)
-    expected_hidden_states = model.encode(indices_by_scale, prefix=prefix)
+    logits = model(indices_by_scale[:-1], prefix=prefix)
+    expected_hidden_states = model.encode(indices_by_scale[:-1], prefix=prefix)
     expected_logits = model.output_head(expected_hidden_states[:, 4:])
 
     assert [value.shape for value in logits] == [
@@ -261,7 +261,7 @@ def test_nsm_predicts_every_codebook_including_scale_one() -> None:
 def test_first_scale_uses_the_learned_bos_input() -> None:
     model = _build_model(num_layers=0)
     prefix = torch.randn(2, 4, 3)
-    hidden_states = model.encode(_indices(), prefix=prefix)
+    hidden_states = model.encode(_indices()[:-1], prefix=prefix)
 
     torch.testing.assert_close(
         hidden_states[:, 4:5],
@@ -276,8 +276,8 @@ def test_nsm_returns_prefix_and_hierarchy_hidden_states() -> None:
     prefix = torch.randn(2, 4, 3)
     indices_by_scale = _indices()
 
-    hidden_states = model.encode(indices_by_scale, prefix=prefix)
-    logits = model(indices_by_scale, prefix=prefix)
+    hidden_states = model.encode(indices_by_scale[:-1], prefix=prefix)
+    logits = model(indices_by_scale[:-1], prefix=prefix)
 
     assert hidden_states.shape == (2, 11, 8)
     assert [value.shape for value in logits] == [
@@ -298,8 +298,8 @@ def test_a_scale_cannot_change_its_own_or_earlier_logits() -> None:
     changed_indices = [indices.clone() for indices in indices_by_scale]
     changed_indices[1][:, 0] = (changed_indices[1][:, 0] + 1) % 5
 
-    logits = model(indices_by_scale, prefix=prefix)
-    changed_logits = model(changed_indices, prefix=prefix)
+    logits = model(indices_by_scale[:-1], prefix=prefix)
+    changed_logits = model(changed_indices[:-1], prefix=prefix)
 
     # Scale 2 is only supplied as the input used to predict scale 4.
     torch.testing.assert_close(logits[0], changed_logits[0])
@@ -315,8 +315,8 @@ def test_first_scale_is_predicted_without_supplying_its_code() -> None:
     changed_indices = [indices.clone() for indices in indices_by_scale]
     changed_indices[0][:, 0] = (changed_indices[0][:, 0] + 1) % 4
 
-    logits = model(indices_by_scale, prefix=prefix)
-    changed_logits = model(changed_indices, prefix=prefix)
+    logits = model(indices_by_scale[:-1], prefix=prefix)
+    changed_logits = model(changed_indices[:-1], prefix=prefix)
 
     torch.testing.assert_close(logits[0], changed_logits[0])
     assert not torch.equal(logits[1], changed_logits[1])
@@ -327,7 +327,7 @@ def test_packed_teacher_forcing_matches_scale_by_scale_prediction() -> None:
     prefix = torch.randn(2, 4, 3)
     indices_by_scale = _indices()
 
-    teacher_forced_logits = model(indices_by_scale, prefix=prefix)
+    teacher_forced_logits = model(indices_by_scale[:-1], prefix=prefix)
     for scale_index in range(len(indices_by_scale)):
         scale_logits = model.predict_scale(
             prefix,

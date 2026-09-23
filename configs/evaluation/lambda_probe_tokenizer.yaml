@@ -1,10 +1,11 @@
-tokenizer_checkpoint: /workspace/runs/vqvae-128-block/checkpoints/final.pt
+tokenizer_checkpoint: /workspace/runs/vqvae-384-learned-hierarchy-triplet-final-20/checkpoints/best.pt
 dataset_directory: /workspace/datasets/lambda/LAMBDA/binary_segments_2k
-output_directory: /workspace/results/vqvae-128-block/lambda-probe-2k
+output_directory: /workspace/results/vqvae-384-learned-hierarchy-triplet-final-20/lambda-probe-decoder-frames
 
 expected_sequence_length: 2_000
 embedding_batch_size: 64
 device_ids: [0, 1, 2, 3]
+evaluate_three_layer_probe: true
 
 probe:
   seed: 42

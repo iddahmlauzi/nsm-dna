@@ -4,9 +4,10 @@ dataset_directory: /workspace/datasets/lambda/LAMBDA/binary_segments_2k
 output_directory: /workspace/results/nsm-9scale-scale1-memory/lambda-probe-2k-first-scale-memory
 
 expected_sequence_length: 2_000
-embedding_batch_size: 16
-device_ids: [0, 1]
-evaluate_random_model: true
+embedding_batch_size: 32
+device_ids: [0, 1, 2, 3]
+evaluate_random_model: false
+evaluate_three_layer_probe: false
 random_model_seed: 42
 
 probe:

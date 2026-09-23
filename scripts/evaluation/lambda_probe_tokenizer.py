@@ -3,15 +3,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import hydra
+import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
+from nsm_dna.data import encode_sequence
 from nsm_dna.models.vqvae import VQVAE
 from scripts.evaluation.lambda_probe_next_scale import (
     evaluate_probes,
-    extract_segment_embeddings,
-    segment_window_starts,
 )
 from scripts.evaluation.lambda_probe_next_token import (
     LambdaSplit,
@@ -21,7 +22,7 @@ from scripts.evaluation.lambda_probe_next_token import (
 
 
 class TokenizerWindowEncoder(nn.Module):
-    """Mean-pool VQ-VAE latents before quantization and before decoding."""
+    """Mean-pool decoder states immediately before nucleotide prediction."""
 
     def __init__(self, tokenizer: VQVAE) -> None:
         super().__init__()
@@ -33,59 +34,70 @@ class TokenizerWindowEncoder(nn.Module):
             dtype=torch.bfloat16,
             enabled=input_ids.device.type == "cuda",
         ):
-            pre_quant = self.tokenizer.encode(input_ids)
-            pre_decode, _, _ = self.tokenizer.quantizer(pre_quant)
+            latent = self.tokenizer.encode(input_ids)
+            quantized_latent, _, _ = self.tokenizer.quantizer(latent)
+            hidden_states = self.tokenizer.decoder.encode(quantized_latent)
 
-        return torch.cat(
-            [pre_quant.float().mean(dim=1), pre_decode.float().mean(dim=1)],
-            dim=1,
-        )
+        return hidden_states.float().mean(dim=1)
 
 
-def evaluate_tokenizer_representations(
+def frame_window_starts(
+    sequence_length: int,
+    window_length: int,
+    frame_offset: int,
+) -> list[int]:
+    """Return non-overlapping windows aligned to one triplet reading frame."""
+    return list(
+        range(frame_offset, sequence_length - window_length + 1, window_length)
+    )
+
+
+@torch.inference_mode()
+def extract_frame_embeddings(
     encoder: nn.Module,
     embed_dim: int,
     window_length: int,
-    splits: dict[str, LambdaSplit],
-    config: DictConfig,
-    output_directory: Path,
+    frame_offset: int,
+    sequences: list[str],
+    batch_size: int,
     device: torch.device,
-) -> dict[str, dict[str, object]]:
-    """Extract both tokenizer representations in one VQ-VAE pass."""
-    combined_embeddings = {
-        split_name: extract_segment_embeddings(
-            encoder,
-            2 * embed_dim,
-            window_length,
-            window_length,
-            split.sequences,
-            int(config.embedding_batch_size),
-            device,
-            description=f"tokenizer {split_name}",
+) -> np.ndarray:
+    """Pool decoder states over windows aligned to one reading frame."""
+    embeddings = np.empty((len(sequences), embed_dim), dtype=np.float32)
+    window_starts = frame_window_starts(
+        len(sequences[0]),
+        window_length,
+        frame_offset,
+    )
+
+    for start in tqdm(
+        range(0, len(sequences), batch_size),
+        desc=f"frame {frame_offset + 1}",
+        unit="batch",
+    ):
+        batch_sequences = sequences[start : start + batch_size]
+        batch_ids = torch.stack(
+            [encode_sequence(sequence) for sequence in batch_sequences]
         )
-        for split_name, split in splits.items()
-    }
-    representations = {
-        "pre_quant": {
-            split_name: embeddings[:, :embed_dim]
-            for split_name, embeddings in combined_embeddings.items()
-        },
-        "pre_decode": {
-            split_name: embeddings[:, embed_dim:]
-            for split_name, embeddings in combined_embeddings.items()
-        },
-    }
-    return {
-        representation_name: evaluate_probes(
-            f"trained_tokenizer_{representation_name}",
-            embeddings,
-            splits,
-            config,
-            output_directory,
-            device,
+        window_ids = torch.stack(
+            [
+                batch_ids[:, window_start : window_start + window_length]
+                for window_start in window_starts
+            ],
+            dim=1,
         )
-        for representation_name, embeddings in representations.items()
-    }
+        num_sequences, num_windows, _ = window_ids.shape
+        window_embeddings = encoder(
+            window_ids.reshape(num_sequences * num_windows, window_length).to(device)
+        )
+        embeddings[start : start + num_sequences] = (
+            window_embeddings.reshape(num_sequences, num_windows, embed_dim)
+            .mean(dim=1)
+            .cpu()
+            .numpy()
+        )
+
+    return embeddings
 
 
 def build_parallel_encoder(
@@ -128,21 +140,39 @@ def main(config: DictConfig) -> None:
     }
 
     tokenizer = VQVAE.from_checkpoint(checkpoint_path, device, frozen=True)
-    results = evaluate_tokenizer_representations(
-        build_parallel_encoder(tokenizer, device_ids),
-        tokenizer.quantization_dim,
-        tokenizer.context_length,
-        splits,
-        config,
-        output_directory,
-        device,
-    )
+    encoder = build_parallel_encoder(tokenizer, device_ids)
+    results = {}
+    for frame_offset in range(3):
+        embeddings = {
+            split_name: extract_frame_embeddings(
+                encoder,
+                tokenizer.embed_dim,
+                tokenizer.context_length,
+                frame_offset,
+                split.sequences,
+                int(config.embedding_batch_size),
+                device,
+            )
+            for split_name, split in splits.items()
+        }
+        frame_name = f"frame_{frame_offset + 1}"
+        results[frame_name] = evaluate_probes(
+            f"trained_tokenizer_decoder_{frame_name}",
+            embeddings,
+            splits,
+            config,
+            output_directory,
+            device,
+        )
 
-    window_starts = segment_window_starts(
-        int(config.expected_sequence_length),
-        tokenizer.context_length,
-        tokenizer.context_length,
-    )
+    window_starts_by_frame = {
+        f"frame_{frame_offset + 1}": frame_window_starts(
+            int(config.expected_sequence_length),
+            tokenizer.context_length,
+            frame_offset,
+        )
+        for frame_offset in range(3)
+    }
     metadata = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "tokenizer_checkpoint": str(checkpoint_path),
@@ -160,19 +190,14 @@ def main(config: DictConfig) -> None:
             }
             for name, path in split_paths.items()
         },
-        "representations": {
-            "pre_quant": (
-                "mean of continuous encoder latents before vector quantization "
-                "for each 128-base window, then mean across windows"
-            ),
-            "pre_decode": (
-                "mean of the complete multiscale quantized latent immediately "
-                "before the decoder for each 128-base window, then mean across windows"
-            ),
-        },
+        "representation": (
+            "mean of final normalized decoder hidden states immediately before "
+            "nucleotide projection, then mean across non-overlapping windows"
+        ),
+        "frame_offsets": [0, 1, 2],
         "window_length": tokenizer.context_length,
         "window_stride": tokenizer.context_length,
-        "window_starts": window_starts,
+        "window_starts_by_frame": window_starts_by_frame,
         "embedding_batch_size": int(config.embedding_batch_size),
         "device_ids": device_ids,
         "probe_config": OmegaConf.to_container(config.probe, resolve=True),

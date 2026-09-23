@@ -116,7 +116,7 @@ def score_token_ids(
             enabled=input_ids.device.type == "cuda",
         ):
             logits_by_scale = model(
-                prediction.targets_by_scale,
+                prediction.targets_by_scale[:-1],
                 prefix=prediction.prefix,
             )
             decoder_logits = tokenizer.decode_scale(

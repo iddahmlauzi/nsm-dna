@@ -49,12 +49,13 @@ def encode_regions(
 ) -> list[np.ndarray]:
     """Return one [region, window, scale_position] index array per scale."""
     window_length = model.context_length
-    windows_per_region = region_length // window_length
+    window_starts = range(0, region_length - window_length + 1, window_length)
+    windows_per_region = len(window_starts)
     windows = torch.stack(
         [
             encode_sequence(region["sequence"][start : start + window_length])
             for region in regions
-            for start in range(0, region_length, window_length)
+            for start in window_starts
         ]
     )
     indices_by_scale: list[list[np.ndarray]] = [[] for _ in model.scale_lengths]
@@ -326,8 +327,8 @@ def main(config: DictConfig) -> None:
         "num_regions": len(regions),
         "num_genomes": len(genomes),
         "control": (
-            "The same 256-bp windows are randomly regrouped into synthetic "
-            "8192-bp regions."
+            f"The same {model.context_length}-bp windows are randomly regrouped "
+            f"into synthetic {region_length}-bp regions."
         ),
         "scale_summaries": scale_summaries,
         "parent_to_child": transitions,

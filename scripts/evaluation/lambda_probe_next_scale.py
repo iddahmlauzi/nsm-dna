@@ -23,7 +23,7 @@ from scripts.evaluation.lambda_probe_next_token import (
 
 
 class NSMWindowEncoder(nn.Module):
-    """Extract the final first-scale memory state for one NSM window."""
+    """Pool the final prefix and finest-scale states for one NSM window."""
 
     def __init__(self, model: NSM, tokenizer: VQVAE) -> None:
         super().__init__()
@@ -42,10 +42,15 @@ class NSMWindowEncoder(nn.Module):
         ):
             prefix = self.tokenizer.encode(prefix_ids)
             targets_by_scale = self.tokenizer.encode_indices(target_ids)
-            hidden_states = self.model.encode(targets_by_scale, prefix=prefix)
+            hidden_states = self.model.encode(targets_by_scale[:-1], prefix=prefix)
 
-        memory_token_index = prefix.shape[1]
-        return hidden_states[:, memory_token_index].float()
+        prefix_states = hidden_states[:, : prefix.shape[1]]
+        finest_scale_states = hidden_states[:, -self.model.scale_lengths[-1] :]
+        return (
+            torch.cat([prefix_states, finest_scale_states], dim=1)
+            .mean(dim=1)
+            .float()
+        )
 
 
 def segment_window_starts(
@@ -73,7 +78,7 @@ def extract_segment_embeddings(
     *,
     description: str,
 ) -> np.ndarray:
-    """Average final first-scale memory states across each 2 kb segment."""
+    """Average pooled window states across each 2 kb segment."""
     embeddings = np.empty((len(sequences), model_dim), dtype=np.float32)
     window_starts = segment_window_starts(
         len(sequences[0]),
@@ -119,7 +124,7 @@ def evaluate_probes(
     output_directory: Path,
     device: torch.device,
 ) -> dict[str, object]:
-    """Fit the official linear and 3-layer LAMBDA probes."""
+    """Fit the requested LAMBDA probes."""
     linear_metrics, linear_predictions, linear_probabilities = fit_linear_probe(
         embeddings["train"],
         splits["train"].labels,
@@ -127,38 +132,37 @@ def evaluate_probes(
         splits["test"].labels,
         int(config.probe.seed),
     )
-    nn_metrics, nn_predictions, nn_probabilities, completed_epochs = (
-        fit_three_layer_probe(
-            embeddings["train"],
-            splits["train"].labels,
-            embeddings["validation"],
-            splits["validation"].labels,
-            embeddings["test"],
-            splits["test"].labels,
-            config.probe,
-            device,
-        )
-    )
-
     write_predictions(
         output_directory / "predictions" / f"{name}_linear.csv",
         splits["test"],
         linear_predictions,
         linear_probabilities,
     )
-    write_predictions(
-        output_directory / "predictions" / f"{name}_three_layer.csv",
-        splits["test"],
-        nn_predictions,
-        nn_probabilities,
-    )
-    return {
-        "linear_probe": linear_metrics,
-        "three_layer_probe": {
+    results = {"linear_probe": linear_metrics}
+    if bool(config.evaluate_three_layer_probe):
+        nn_metrics, nn_predictions, nn_probabilities, completed_epochs = (
+            fit_three_layer_probe(
+                embeddings["train"],
+                splits["train"].labels,
+                embeddings["validation"],
+                splits["validation"].labels,
+                embeddings["test"],
+                splits["test"].labels,
+                config.probe,
+                device,
+            )
+        )
+        write_predictions(
+            output_directory / "predictions" / f"{name}_three_layer.csv",
+            splits["test"],
+            nn_predictions,
+            nn_probabilities,
+        )
+        results["three_layer_probe"] = {
             **nn_metrics,
             "completed_epochs": completed_epochs,
-        },
-    }
+        }
+    return results
 
 
 def evaluate_representation(
@@ -295,12 +299,13 @@ def main(config: DictConfig) -> None:
             "linear_probe": (
                 trained_results["linear_probe"]["mcc"]
                 - random_results["linear_probe"]["mcc"]
-            ),
-            "three_layer_probe": (
+            )
+        }
+        if bool(config.evaluate_three_layer_probe):
+            results["delta_mcc"]["three_layer_probe"] = (
                 trained_results["three_layer_probe"]["mcc"]
                 - random_results["three_layer_probe"]["mcc"]
-            ),
-        }
+            )
     window_starts = segment_window_starts(
         int(config.expected_sequence_length),
         window_length,
@@ -325,9 +330,9 @@ def main(config: DictConfig) -> None:
             for name, path in split_paths.items()
         },
         "representation": (
-            "final normalized hierarchy BOS state after the last NSM "
-            "transformer layer, conditioned on the encoded prefix, then "
-            "mean across windows"
+            "mean of the final normalized prefix states and finest-scale "
+            "prediction states after the last NSM transformer layer, then "
+            "mean across seven overlapping windows"
         ),
         "window_length": window_length,
         "window_stride": stride,
@@ -335,6 +340,7 @@ def main(config: DictConfig) -> None:
         "embedding_batch_size": int(config.embedding_batch_size),
         "device_ids": device_ids,
         "evaluate_random_model": evaluate_random_model,
+        "evaluate_three_layer_probe": bool(config.evaluate_three_layer_probe),
         "random_model_seed": random_seed if evaluate_random_model else None,
         "probe_config": OmegaConf.to_container(config.probe, resolve=True),
         "results": results,

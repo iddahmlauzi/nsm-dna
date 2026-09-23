@@ -118,10 +118,11 @@ class Decoder(nn.Module):
         self.final_norm = LayerNorm(embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, vocab_size, bias=bias)
 
-    def forward(
+    def encode(
         self,
         x: Float[Tensor, "batch latent_length quantization_dim"],
-    ) -> Float[Tensor, "batch context_length vocab_size"]:
+    ) -> Float[Tensor, "batch context_length embed_dim"]:
+        """Return final normalized states before nucleotide prediction."""
         x = einx.id("b l d -> b d l", x)
         x = self.upsampler(x)
         x = einx.id("b d l -> b l d", x)
@@ -132,5 +133,10 @@ class Decoder(nn.Module):
                 rotary_embeddings=(self.rope_cosine, self.rope_sine),
                 is_causal=False,
             )
-        x = self.final_norm(x)
-        return self.out_proj(x)
+        return self.final_norm(x)
+
+    def forward(
+        self,
+        x: Float[Tensor, "batch latent_length quantization_dim"],
+    ) -> Float[Tensor, "batch context_length vocab_size"]:
+        return self.out_proj(self.encode(x))

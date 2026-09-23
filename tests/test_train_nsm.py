@@ -9,8 +9,10 @@ from nsm_dna.models.vqvae import VQVAE
 from nsm_dna.training import calculate_training_steps
 from scripts.training.train_nsm import (
     build_codebook_distance_matrices,
+    build_codebook_neighbor_tables,
     build_scale_loss_weights,
     compute_next_scale_loss,
+    corrupt_context_indices,
     evaluate,
     prepare_block_predictions,
     rollout_hierarchy,
@@ -227,6 +229,50 @@ def test_geometry_loss_prefers_probability_on_nearby_codes() -> None:
     assert near_loss.item() < far_loss.item()
 
 
+def test_noisy_context_replaces_codes_with_nearest_neighbors() -> None:
+    distance_matrices = [
+        torch.tensor(
+            [
+                [0.0, 1.0, 3.0],
+                [1.0, 0.0, 2.0],
+                [3.0, 2.0, 0.0],
+            ]
+        ),
+        torch.tensor(
+            [
+                [0.0, 1.0, 3.0],
+                [1.0, 0.0, 2.0],
+                [3.0, 2.0, 0.0],
+            ]
+        ),
+    ]
+    neighbor_tables = build_codebook_neighbor_tables(
+        distance_matrices,
+        neighbor_count=1,
+    )
+    clean_context = [
+        torch.tensor([[0, 1, 2]]),
+        torch.tensor([[2, 1, 0]]),
+    ]
+
+    corrupted_context = corrupt_context_indices(
+        clean_context,
+        neighbor_tables,
+        corruption_probabilities=[1.0, 0.0],
+    )
+
+    torch.testing.assert_close(
+        neighbor_tables[0],
+        torch.tensor([[1], [0], [1]]),
+    )
+    torch.testing.assert_close(
+        corrupted_context[0],
+        torch.tensor([[1, 0, 1]]),
+    )
+    torch.testing.assert_close(corrupted_context[1], clean_context[1])
+    torch.testing.assert_close(clean_context[0], torch.tensor([[0, 1, 2]]))
+
+
 def test_tokenizer_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
     tokenizer = _build_tokenizer()
     checkpoint_path = tmp_path / "tokenizer.pt"
@@ -297,7 +343,7 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     prediction = prepare_block_predictions(tokenizer, input_ids)[0]
     indices_by_scale = prediction.targets_by_scale
     logits_by_scale = model(
-        indices_by_scale,
+        indices_by_scale[:-1],
         prefix=prediction.prefix,
     )
     loss, _, _ = compute_next_scale_loss(
@@ -361,7 +407,7 @@ def test_default_config_matches_fixed_hierarchy_recipe() -> None:
     assert config.optimizer.beta_2 == 0.95
     assert config.optimizer.weight_decay == 0.05
     assert config.optimizer.gradient_accumulation_steps == 1
-    assert config.optimizer.geometry_loss_weight == 0.1
+    assert config.optimizer.geometry_loss_weight == 0.5
     assert (
         config.data.sequence_length
         * config.data.train_batch_size
@@ -370,6 +416,16 @@ def test_default_config_matches_fixed_hierarchy_recipe() -> None:
         == 131_072
     )
     assert config.training.num_epochs == 10
+    assert list(config.training.context_corruption_probabilities) == [
+        0.30,
+        0.25,
+        0.20,
+        0.15,
+        0.10,
+        0.075,
+        0.05,
+    ]
+    assert config.training.context_neighbor_count == 5
     assert config.checkpoint.interval == 5000
 
 
