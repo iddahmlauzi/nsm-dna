@@ -24,6 +24,7 @@ class VQVAE(nn.Module):
         scale_lengths: list[int],
         codebook_sizes: list[int],
         *,
+        third_base_scale: float = 1.0,
         decoder_num_layers: int = 1,
         use_qk_norm: bool = False,
         bias: bool = False,
@@ -39,6 +40,7 @@ class VQVAE(nn.Module):
         self.embed_dim = embed_dim
         self.quantization_dim = quantization_dim
         self.num_heads = num_heads
+        self.third_base_scale = third_base_scale
         self.decoder_num_layers = decoder_num_layers
         self.use_qk_norm = use_qk_norm
         self.rope_base = rope_base
@@ -51,6 +53,7 @@ class VQVAE(nn.Module):
             self.latent_length,
             self.embed_dim,
             self.quantization_dim,
+            third_base_scale=self.third_base_scale,
             bias=bias,
         )
 
@@ -98,6 +101,7 @@ class VQVAE(nn.Module):
             embed_dim=config.embed_dim,
             quantization_dim=config.quantization_dim,
             num_heads=config.num_heads,
+            third_base_scale=config.third_base_scale,
             decoder_num_layers=config.decoder_num_layers,
             use_qk_norm=config.use_qk_norm,
             scale_lengths=list(config.scale_lengths),

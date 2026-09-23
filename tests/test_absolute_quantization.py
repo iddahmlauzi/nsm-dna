@@ -47,9 +47,7 @@ def test_partial_reconstruction_gradient_flows_through_learned_downsampling(
     latent = torch.randn(1, 4, 4, requires_grad=True)
 
     monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: torch.tensor(0))
-    _, partial_latent, _ = quantizer(
-        latent, include_partial_reconstruction=True
-    )
+    _, partial_latent, _ = quantizer(latent, include_partial_reconstruction=True)
     assert partial_latent is not None
     partial_latent[..., 0].sum().backward()
 
@@ -110,6 +108,9 @@ def test_validation_reports_independent_scale_reconstruction() -> None:
     assert "accuracy_scale_4" in metrics
     assert "scale_latent_rms_scale_1" in metrics
     assert metrics["accuracy_scale_4"] == metrics["accuracy"]
-    assert abs(
-        metrics["reconstruction_loss_scale_4"] - metrics["full_reconstruction_loss"]
-    ) < 1e-6
+    assert (
+        abs(
+            metrics["reconstruction_loss_scale_4"] - metrics["full_reconstruction_loss"]
+        )
+        < 1e-6
+    )

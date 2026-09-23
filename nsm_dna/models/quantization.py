@@ -31,6 +31,17 @@ class EMACodebook(nn.Module):
             "codebook_hits", torch.zeros(codebook_size, dtype=torch.bool)
         )
 
+    @torch.no_grad()
+    def initialize(self, vectors: Float[Tensor, "codebook_size quantization_dim"]):
+        """Replace the codebook and reset its EMA state."""
+        if vectors.shape != self.codebook.shape:
+            raise ValueError("Initial vectors must match the codebook shape.")
+
+        self.codebook.copy_(vectors)
+        self.ema_counts.fill_(1)
+        self.ema_vector_sums.copy_(vectors)
+        self.codebook_hits.fill_(True)
+
     def _get_ema_decay(self) -> float:
         """Adjust EMA update strength for DDP's summed batch statistics."""
         world_size = (
@@ -238,9 +249,9 @@ class MultiscaleVectorQuantizer(nn.Module):
 
             # Backpropagate reconstruction through the learned downsampling path
             # that produced the codebook input.
-            quantized_with_gradient = scale_latent + (
-                quantized_at_scale - scale_latent
-            ).detach()
+            quantized_with_gradient = (
+                scale_latent + (quantized_at_scale - scale_latent).detach()
+            )
             expanded_quantized_latent = self._upsample_to_full_length(
                 quantized_with_gradient, scale_index
             )

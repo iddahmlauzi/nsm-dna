@@ -286,6 +286,7 @@ def test_tokenizer_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
                     "embed_dim": 8,
                     "quantization_dim": 4,
                     "num_heads": 2,
+                    "third_base_scale": 1.0,
                     "scale_lengths": [1, 2, 4],
                     "codebook_sizes": [4, 6, 16],
                     "decoder_num_layers": 1,

@@ -1,34 +1,12 @@
 """Show how a triplet tokenizer assigns the 64 DNA triplets."""
 
 import argparse
-import itertools
 from pathlib import Path
 
 import torch
 
-from nsm_dna.data import encode_sequence
 from nsm_dna.models.vqvae import VQVAE
-
-
-def assign_triplets(model: VQVAE, device: torch.device) -> dict[str, int]:
-    """Return the code selected for each possible A/C/G/T triplet."""
-    if model.context_length != 3 * model.latent_length:
-        raise ValueError("This analysis requires three bases per latent position.")
-
-    triplets = ["".join(bases) for bases in itertools.product("ACGT", repeat=3)]
-    repeats = model.context_length // 3
-    input_ids = torch.stack(
-        [encode_sequence(triplet * repeats) for triplet in triplets]
-    ).to(device)
-
-    indices = model.encode_indices(input_ids)[-1]
-    if not torch.all(indices == indices[:, :1]):
-        raise RuntimeError("A repeated triplet received different codes by position.")
-
-    return {
-        triplet: int(code)
-        for triplet, code in zip(triplets, indices[:, 0].cpu(), strict=True)
-    }
+from nsm_dna.triplet_analysis import assign_triplets
 
 
 def format_report(assignments: dict[str, int], codebook_size: int) -> str:

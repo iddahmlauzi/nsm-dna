@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from itertools import product
 from pathlib import Path
 
 import hydra
@@ -22,6 +23,84 @@ from nsm_dna.training import (
     load_training_checkpoint,
     save_training_checkpoint,
 )
+from nsm_dna.triplet_analysis import assign_triplets, code_table_rows
+
+
+def _log_to_wandb(
+    run: wandb.Run,
+    metrics: dict[str, object],
+    step: int,
+    *,
+    commit: bool = True,
+) -> None:
+    """Log monitoring data without allowing W&B failures to stop training."""
+    try:
+        run.log(metrics, step=step, commit=commit)
+    except Exception as error:
+        tqdm.write(f"W&B logging failed at step {step}: {error}")
+
+
+def _kmeans(
+    points: torch.Tensor,
+    num_clusters: int,
+    seed: int,
+) -> torch.Tensor:
+    """Cluster a small set of vectors with seeded k-means++ initialization."""
+    generator = torch.Generator(device=points.device).manual_seed(seed)
+    first_index = torch.randint(
+        len(points),
+        size=(),
+        generator=generator,
+        device=points.device,
+    )
+    centers = [points[first_index]]
+    closest_squared_distance = (points - centers[0]).square().sum(dim=-1)
+
+    for _ in range(1, num_clusters):
+        next_index = torch.multinomial(
+            closest_squared_distance,
+            num_samples=1,
+            generator=generator,
+        )
+        next_center = points[next_index].squeeze(0)
+        centers.append(next_center)
+        squared_distance = (points - next_center).square().sum(dim=-1)
+        closest_squared_distance = torch.minimum(
+            closest_squared_distance,
+            squared_distance,
+        )
+
+    centers = torch.stack(centers)
+    for _ in range(20):
+        assignments = torch.cdist(points, centers).argmin(dim=-1)
+        updated_centers = torch.stack(
+            [
+                points[assignments == cluster].mean(dim=0)
+                for cluster in range(num_clusters)
+            ]
+        )
+        if torch.allclose(updated_centers, centers):
+            break
+        centers = updated_centers
+
+    return centers
+
+
+@torch.no_grad()
+def reinitialize_finest_codebook(model: VQVAE, seed: int) -> None:
+    """Fit the finest codebook to the encoder's current triplet geometry."""
+    device = next(model.parameters()).device
+    sampling_factor = model.context_length // model.latent_length
+    triplets = torch.tensor(
+        list(product(range(model.vocab_size), repeat=sampling_factor)),
+        device=device,
+    )
+    input_ids = triplets.repeat(1, model.latent_length)
+    triplet_vectors = model.encode(input_ids)[:, 0].float()
+
+    codebook = model.quantizer.codebooks[-1]
+    centers = _kmeans(triplet_vectors, codebook.codebook_size, seed)
+    codebook.initialize(centers)
 
 
 @torch.no_grad()
@@ -81,9 +160,7 @@ def evaluate(
             )
 
             encoder_latent = model.encode(input_ids)
-            scale_latents = model.quantizer.indices_to_scale_latents(
-                indices_by_scale
-            )
+            scale_latents = model.quantizer.indices_to_scale_latents(indices_by_scale)
 
             encoder_latent_squared_sum += encoder_latent.float().square().sum().item()
             num_latent_values += encoder_latent.numel()
@@ -124,9 +201,7 @@ def evaluate(
     full_reconstruction_loss = full_reconstruction_loss_sum / num_batches
     num_partial_scales = len(model.scale_lengths) - 1
     partial_reconstruction_loss = (
-        sum(
-            reconstruction_loss_sums_by_scale[:-1]
-        ) / (num_partial_scales * num_batches)
+        sum(reconstruction_loss_sums_by_scale[:-1]) / (num_partial_scales * num_batches)
         if num_partial_scales > 0
         else 0.0
     )
@@ -149,12 +224,8 @@ def evaluate(
     for scale_index, (scale_length, loss_sum, scale_correct_tokens) in enumerate(
         scale_metrics
     ):
-        metrics[f"reconstruction_loss_scale_{scale_length}"] = (
-            loss_sum / num_batches
-        )
-        metrics[f"accuracy_scale_{scale_length}"] = (
-            scale_correct_tokens / num_tokens
-        )
+        metrics[f"reconstruction_loss_scale_{scale_length}"] = loss_sum / num_batches
+        metrics[f"accuracy_scale_{scale_length}"] = scale_correct_tokens / num_tokens
         metrics[f"latent_mse_scale_{scale_length}"] = (
             latent_mse_sums_by_scale[scale_index] / num_batches
         )
@@ -252,6 +323,7 @@ def main(config: DictConfig) -> None:
         num_heads=config.model.num_heads,
         scale_lengths=list(config.model.scale_lengths),
         codebook_sizes=list(config.model.codebook_sizes),
+        third_base_scale=config.model.third_base_scale,
         decoder_num_layers=config.model.decoder_num_layers,
         use_qk_norm=config.model.use_qk_norm,
         bias=config.model.bias,
@@ -337,6 +409,7 @@ def main(config: DictConfig) -> None:
     )
     gradient_accumulation_steps = config.optimizer.gradient_accumulation_steps
     partial_reconstruction_weight = config.model.partial_reconstruction_weight
+    codebook_reinitialization_step = config.training.reinitialize_codebook_step
 
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
@@ -386,8 +459,7 @@ def main(config: DictConfig) -> None:
                     )
                     loss = (
                         full_reconstruction_loss
-                        + partial_reconstruction_weight
-                        * partial_reconstruction_loss
+                        + partial_reconstruction_weight * partial_reconstruction_loss
                     )
                     accumulated_loss = loss / gradient_accumulation_steps
                 accumulated_loss.backward()
@@ -410,6 +482,11 @@ def main(config: DictConfig) -> None:
         # Set the learning rate that will be used by the next optimizer step.
         scheduler.step()
 
+        if step == codebook_reinitialization_step:
+            reinitialize_finest_codebook(model, config.run.seed)
+            if distributed_environment.is_main_process:
+                tqdm.write(f"reinitialized finest codebook at step {step}")
+
         if step % config.training.log_interval == 0:
             loss_sums = torch.tensor(
                 [
@@ -429,14 +506,11 @@ def main(config: DictConfig) -> None:
                 ) = loss_sums.tolist()
                 total_loss_value = (
                     full_reconstruction_loss_value
-                    + partial_reconstruction_weight
-                    * partial_reconstruction_loss_value
+                    + partial_reconstruction_weight * partial_reconstruction_loss_value
                 )
                 global_utilization = model.global_utilization.item()
                 progress_bar.set_postfix(
-                    full_reconstruction_loss=(
-                        f"{full_reconstruction_loss_value:.4f}"
-                    ),
+                    full_reconstruction_loss=(f"{full_reconstruction_loss_value:.4f}"),
                     partial_reconstruction_loss=(
                         f"{partial_reconstruction_loss_value:.4f}"
                     ),
@@ -444,7 +518,8 @@ def main(config: DictConfig) -> None:
                 )
 
                 if wandb_run is not None:
-                    wandb_run.log(
+                    _log_to_wandb(
+                        wandb_run,
                         {
                             "train/full_reconstruction_loss": (
                                 full_reconstruction_loss_value
@@ -457,7 +532,8 @@ def main(config: DictConfig) -> None:
                             "train/learning_rate": learning_rate,
                             "codebook/global_utilization": global_utilization,
                         },
-                        step=step,
+                        step,
+                        commit=step % config.evaluation.interval != 0,
                     )
 
         if step % config.evaluation.interval == 0:
@@ -520,8 +596,7 @@ def main(config: DictConfig) -> None:
                     for scale_length in config.model.scale_lengths
                 )
                 tqdm.write(
-                    f"step {step} validation accuracy by scale: "
-                    f"{scale_accuracies}"
+                    f"step {step} validation accuracy by scale: {scale_accuracies}"
                 )
 
                 if wandb_run is not None:
@@ -565,7 +640,25 @@ def main(config: DictConfig) -> None:
                                 scale_utilizations[scale_length]
                             )
 
-                    wandb_run.log(wandb_metrics, step=step)
+                    triplet_assignments = assign_triplets(model, device)
+                    triplet_table = wandb.Table(
+                        columns=["code", "triplets", "amino acids"],
+                        data=code_table_rows(
+                            triplet_assignments,
+                            model.codebook_sizes[-1],
+                        ),
+                    )
+                    _log_to_wandb(
+                        wandb_run,
+                        {"tokenizer/triplet_assignments": triplet_table},
+                        step,
+                        commit=False,
+                    )
+                    _log_to_wandb(
+                        wandb_run,
+                        wandb_metrics,
+                        step,
+                    )
 
             if distributed_environment.is_distributed:
                 dist.barrier()

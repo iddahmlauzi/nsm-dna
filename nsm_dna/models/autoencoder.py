@@ -1,6 +1,7 @@
 import einx
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from jaxtyping import Float, Int
 from torch import Tensor
 
@@ -28,11 +29,17 @@ class Encoder(nn.Module):
         latent_length: int,
         embed_dim: int,
         quantization_dim: int,
+        third_base_scale: float = 1.0,
         bias: bool = False,
     ) -> None:
         super().__init__()
 
         sampling_factor = _sampling_factor(context_length, latent_length)
+        if not 0.0 <= third_base_scale <= 1.0:
+            raise ValueError("third_base_scale must be between zero and one.")
+
+        self.sampling_factor = sampling_factor
+        self.third_base_scale = third_base_scale
 
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
 
@@ -48,6 +55,14 @@ class Encoder(nn.Module):
             stride=sampling_factor,
             bias=bias,
         )
+        self.core_norm = nn.LayerNorm(
+            quantization_dim,
+            elementwise_affine=False,
+        )
+        self.refinement_norm = nn.LayerNorm(
+            quantization_dim,
+            elementwise_affine=False,
+        )
 
         # Euclidean codebook distances grow with the magnitude of the latent
         # vectors. Normalize each vector so that magnitude cannot drift during
@@ -60,8 +75,20 @@ class Encoder(nn.Module):
     ) -> Float[Tensor, "batch latent_length quantization_dim"]:
         x = self.token_embedding(token_ids)
         x = einx.id("b l d -> b d l", x)
-        x = self.downsampler(x)
-        x = einx.id("b d l -> b l d", x)
+
+        if self.sampling_factor == 3:
+            weights = self.downsampler.weight
+            core = F.conv1d(x, weights[:, :, :2], stride=3)
+            refinement = F.conv1d(x[:, :, 2:], weights[:, :, 2:], stride=3)
+            core = self.core_norm(einx.id("b d l -> b l d", core))
+            refinement = self.refinement_norm(einx.id("b d l -> b l d", refinement))
+            x = core + self.third_base_scale * refinement
+            if self.downsampler.bias is not None:
+                x = x + self.downsampler.bias
+        else:
+            x = self.downsampler(x)
+            x = einx.id("b d l -> b l d", x)
+
         return self.norm(x)
 
 

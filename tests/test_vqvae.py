@@ -1,3 +1,5 @@
+from itertools import product
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,7 +8,7 @@ from nsm_dna.models.autoencoder import Decoder, Encoder
 from nsm_dna.models.common import RMSNorm
 from nsm_dna.models.quantization import MultiscaleVectorQuantizer
 from nsm_dna.models.vqvae import VQVAE
-from scripts.training.train_vqvae import evaluate
+from scripts.training.train_vqvae import evaluate, reinitialize_finest_codebook
 
 
 def _build_model(*, decoder_num_layers: int = 1) -> VQVAE:
@@ -42,6 +44,26 @@ def test_encoder_uses_configured_non_overlapping_sampling_factor() -> None:
     assert encoder.downsampler.stride == (3,)
 
 
+def test_zero_third_base_scale_preserves_the_first_two_base_representation() -> None:
+    encoder = Encoder(
+        vocab_size=4,
+        context_length=6,
+        latent_length=2,
+        embed_dim=4,
+        quantization_dim=3,
+        third_base_scale=0.0,
+    )
+    token_ids = torch.tensor(
+        [
+            [0, 1, 2, 3, 0, 1],
+            [0, 1, 3, 3, 0, 2],
+        ]
+    )
+
+    latent = encoder(token_ids)
+    torch.testing.assert_close(latent[0], latent[1])
+
+
 def test_single_scale_triplet_vqvae() -> None:
     model = VQVAE(
         vocab_size=4,
@@ -70,6 +92,25 @@ def test_single_scale_triplet_vqvae() -> None:
     assert indices_by_scale[0].shape == (2, 3)
     assert metrics["partial_reconstruction_loss"] == 0.0
     assert metrics["total_loss"] == metrics["full_reconstruction_loss"]
+
+
+def test_codebook_reinitialization_uses_every_code() -> None:
+    model = VQVAE(
+        vocab_size=4,
+        context_length=9,
+        latent_length=3,
+        embed_dim=8,
+        quantization_dim=16,
+        num_heads=2,
+        scale_lengths=[3],
+        codebook_sizes=[26],
+    ).eval()
+    reinitialize_finest_codebook(model, seed=0)
+    triplets = torch.tensor(list(product(range(4), repeat=3)))
+    input_ids = triplets.repeat(1, model.latent_length)
+    used_codes = model.encode_indices(input_ids)[-1].unique()
+
+    assert len(used_codes) == model.codebook_sizes[-1]
 
 
 def test_decoder_supplies_rope_to_attention() -> None:
@@ -155,9 +196,7 @@ def test_quantizer_builds_and_quantizes_every_scale() -> None:
 
 def test_decode_scales_matches_full_reconstruction_at_final_scale() -> None:
     model = _build_model().eval()
-    token_ids = torch.tensor(
-        [[0, 1, 2, 3, 3, 2, 1, 0], [3, 2, 1, 0, 0, 1, 2, 3]]
-    )
+    token_ids = torch.tensor([[0, 1, 2, 3, 3, 2, 1, 0], [3, 2, 1, 0, 0, 1, 2, 3]])
 
     logits, partial_logits, indices_by_scale = model(token_ids)
     scale_logits = model.decode_scales(indices_by_scale)
@@ -170,9 +209,7 @@ def test_decode_scales_matches_full_reconstruction_at_final_scale() -> None:
 
 def test_encode_returns_continuous_latents() -> None:
     model = _build_model().eval()
-    token_ids = torch.tensor(
-        [[0, 1, 2, 3, 3, 2, 1, 0], [3, 2, 1, 0, 0, 1, 2, 3]]
-    )
+    token_ids = torch.tensor([[0, 1, 2, 3, 3, 2, 1, 0], [3, 2, 1, 0, 0, 1, 2, 3]])
 
     latent = model.encode(token_ids)
 
@@ -182,9 +219,7 @@ def test_encode_returns_continuous_latents() -> None:
 
 def test_partial_reconstruction_backpropagates_through_encoder() -> None:
     model = _build_model()
-    token_ids = torch.tensor(
-        [[0, 1, 2, 3, 3, 2, 1, 0], [3, 2, 1, 0, 0, 1, 2, 3]]
-    )
+    token_ids = torch.tensor([[0, 1, 2, 3, 3, 2, 1, 0], [3, 2, 1, 0, 0, 1, 2, 3]])
 
     _, partial_logits, _ = model(
         token_ids,
