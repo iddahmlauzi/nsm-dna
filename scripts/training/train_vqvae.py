@@ -122,9 +122,14 @@ def evaluate(
         model.train()
 
     full_reconstruction_loss = full_reconstruction_loss_sum / num_batches
-    partial_reconstruction_loss = sum(
-        reconstruction_loss_sums_by_scale[:-1]
-    ) / ((len(model.scale_lengths) - 1) * num_batches)
+    num_partial_scales = len(model.scale_lengths) - 1
+    partial_reconstruction_loss = (
+        sum(
+            reconstruction_loss_sums_by_scale[:-1]
+        ) / (num_partial_scales * num_batches)
+        if num_partial_scales > 0
+        else 0.0
+    )
     metrics = {
         "full_reconstruction_loss": full_reconstruction_loss,
         "partial_reconstruction_loss": partial_reconstruction_loss,
@@ -367,14 +372,17 @@ def main(config: DictConfig) -> None:
                         input_ids,
                         include_partial_reconstruction=True,
                     )
-                    assert partial_logits is not None
                     full_reconstruction_loss = F.cross_entropy(
                         full_logits.flatten(0, 1),
                         input_ids.flatten(),
                     )
-                    partial_reconstruction_loss = F.cross_entropy(
-                        partial_logits.flatten(0, 1),
-                        input_ids.flatten(),
+                    partial_reconstruction_loss = (
+                        F.cross_entropy(
+                            partial_logits.flatten(0, 1),
+                            input_ids.flatten(),
+                        )
+                        if partial_logits is not None
+                        else full_reconstruction_loss.new_zeros(())
                     )
                     loss = (
                         full_reconstruction_loss

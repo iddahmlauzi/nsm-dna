@@ -24,21 +24,52 @@ def _build_model(*, decoder_num_layers: int = 1) -> VQVAE:
     )
 
 
-def test_encoder_uses_one_stride_two_sampler_for_dinucleotides() -> None:
+def test_encoder_uses_configured_non_overlapping_sampling_factor() -> None:
     encoder = Encoder(
         vocab_size=4,
-        context_length=8,
-        latent_length=4,
+        context_length=9,
+        latent_length=3,
         embed_dim=4,
         quantization_dim=2,
     )
-    token_ids = torch.tensor([[3, 1, 0, 2, 2, 0, 1, 3]])
+    token_ids = torch.tensor([[3, 1, 0, 2, 2, 0, 1, 3, 2]])
 
     latent = encoder(token_ids)
 
-    assert latent.shape == (1, 4, 2)
+    assert latent.shape == (1, 3, 2)
     assert isinstance(encoder.downsampler, nn.Conv1d)
-    assert encoder.downsampler.stride == (2,)
+    assert encoder.downsampler.kernel_size == (3,)
+    assert encoder.downsampler.stride == (3,)
+
+
+def test_single_scale_triplet_vqvae() -> None:
+    model = VQVAE(
+        vocab_size=4,
+        context_length=9,
+        latent_length=3,
+        embed_dim=8,
+        quantization_dim=4,
+        num_heads=2,
+        scale_lengths=[3],
+        codebook_sizes=[21],
+    )
+    batches = [{"input_ids": torch.randint(0, 4, (2, 9))}]
+
+    logits, partial_logits, indices_by_scale = model(
+        batches[0]["input_ids"], include_partial_reconstruction=True
+    )
+    metrics = evaluate(
+        model,
+        batches,
+        use_mixed_precision=False,
+        partial_reconstruction_weight=0.25,
+    )
+
+    assert logits.shape == (2, 9, 4)
+    assert partial_logits is None
+    assert indices_by_scale[0].shape == (2, 3)
+    assert metrics["partial_reconstruction_loss"] == 0.0
+    assert metrics["total_loss"] == metrics["full_reconstruction_loss"]
 
 
 def test_decoder_supplies_rope_to_attention() -> None:

@@ -69,7 +69,7 @@ def split_sequences(
     for sequence in examples["sequence"]:
         sequences.extend(
             sequence[start : start + context_length]
-            for start in range(0, len(sequence), context_length)
+            for start in range(0, len(sequence) - context_length + 1, context_length)
         )
 
     return {"sequence": sequences}

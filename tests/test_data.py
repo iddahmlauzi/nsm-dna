@@ -16,7 +16,7 @@ from nsm_dna.data import (
 class DNADataTest(unittest.TestCase):
     def test_splits_stored_sequences_at_the_context_length(self) -> None:
         examples = {
-            "sequence": ["AAAACCCC", "GGGGTTTT"],
+            "sequence": ["AAAACCCCAA", "GGGGTTTT"],
         }
 
         result = split_sequences(examples, context_length=4)

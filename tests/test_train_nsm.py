@@ -69,7 +69,7 @@ def test_training_steps_are_derived_from_epochs(tmp_path: Path) -> None:
         }
     )
 
-    assert calculate_training_steps(config, world_size=2, sequence_length=16) == 12
+    assert calculate_training_steps(config, world_size=2, sequence_length=16) == 9
 
     config.training.max_steps = 7
     assert calculate_training_steps(config, world_size=2, sequence_length=16) == 7

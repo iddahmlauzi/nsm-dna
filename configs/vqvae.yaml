@@ -1,4 +1,4 @@
-# Multiscale VQ-VAE tokenizer with independently quantized scales.
+# Multiscale VQ-VAE tokenizer with triplet compression at the finest scale.
 
 run:
   seed: 0
@@ -8,7 +8,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: vqvae
-  name: vqvae-256-learned-hierarchy-dinucleotide-final
+  name: vqvae-384-learned-hierarchy-triplet-final-20
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -21,9 +21,9 @@ data:
 
 model:
   vocab_size: 4
-  context_length: 256
-  # The encoder combines each non-overlapping nucleotide pair into one latent
-  # position before multiscale quantization.
+  context_length: 384
+  # The encoder combines each non-overlapping nucleotide triplet into one latent
+  # position before quantization.
   latent_length: 128
   embed_dim: 128
   # A smaller vector gives each finite codebook fewer independently varying
@@ -32,10 +32,10 @@ model:
   num_heads: 4
   # RoPE is applied only in the decoder.
   rope_base: 10_000
-  # Every scale is quantized after recursively applying learned stride-2
-  # convolutions. The final length-128 scale uses 16 codes for dinucleotides.
+  # Coarse scales are built through learned stride-2 convolutions. The final
+  # length-128 scale assigns each nucleotide triplet to one of 20 codes.
   scale_lengths: [1, 2, 4, 8, 16, 32, 64, 128]
-  codebook_sizes: [32, 32, 64, 64, 128, 128, 128, 16]
+  codebook_sizes: [32, 32, 64, 64, 128, 128, 128, 20]
 
   decoder_num_layers: 4
   use_qk_norm: true

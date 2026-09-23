@@ -212,13 +212,13 @@ class MultiscaleVectorQuantizer(nn.Module):
     ]:
         """Quantize learned views of the continuous latent at coarse scales.
 
-        When partial reconstruction is enabled, return one randomly selected
-        scale latent for auxiliary reconstruction.
+        When partial reconstruction is enabled and a non-final scale exists,
+        return one randomly selected scale latent for auxiliary reconstruction.
         """
         x = x.float()
 
         partial_scale_index = None
-        if include_partial_reconstruction:
+        if include_partial_reconstruction and len(self.scale_lengths) > 1:
             partial_scale_index = torch.randint(
                 low=0,
                 high=len(self.scale_lengths) - 1,

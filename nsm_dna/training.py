@@ -43,17 +43,17 @@ def calculate_training_steps(
     with stats_path.open() as handle:
         subset_stats = json.load(handle)
     split_stats = subset_stats["splits"][config.data.train_split]
-    num_training_bases = (
-        split_stats["chunks"] * subset_stats["selection"]["chunk_length"]
+    sequences_per_chunk = (
+        subset_stats["selection"]["chunk_length"] // sequence_length
     )
+    num_training_sequences = split_stats["chunks"] * sequences_per_chunk
 
-    bases_per_step = (
-        sequence_length
-        * config.data.train_batch_size
+    sequences_per_step = (
+        config.data.train_batch_size
         * world_size
         * config.optimizer.gradient_accumulation_steps
     )
-    steps_per_epoch = math.ceil(num_training_bases / bases_per_step)
+    steps_per_epoch = math.ceil(num_training_sequences / sequences_per_step)
     return int(config.training.num_epochs) * steps_per_epoch
 
 

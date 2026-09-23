@@ -44,10 +44,6 @@ class VQVAE(nn.Module):
         self.rope_base = rope_base
         self.scale_lengths = list(scale_lengths)
         self.codebook_sizes = list(codebook_sizes)
-        if context_length != 2 * latent_length or codebook_sizes[-1] != 16:
-            raise ValueError(
-                "The final scale requires one code for each dinucleotide."
-            )
 
         self.encoder = Encoder(
             self.vocab_size,
