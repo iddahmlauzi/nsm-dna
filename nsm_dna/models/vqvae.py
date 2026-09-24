@@ -127,6 +127,13 @@ class VQVAE(nn.Module):
         """Encode DNA into the normalized continuous latent."""
         return self.encoder(token_ids)
 
+    def encode_scales(
+        self,
+        token_ids: Int[Tensor, "batch length"],
+    ) -> list[Float[Tensor, "batch scale_length quantization_dim"]]:
+        """Encode DNA into the continuous latent at every hierarchy scale."""
+        return self.quantizer.downsample_to_scales(self.encode(token_ids).float())
+
     def forward(
         self,
         token_ids: Int[Tensor, "batch length"],

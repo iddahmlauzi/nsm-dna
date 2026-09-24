@@ -187,7 +187,7 @@ def test_quantizer_builds_and_quantizes_every_scale() -> None:
         (2, 2),
         (2, 4),
     ]
-    assert [scale.shape for scale in quantizer._downsample_to_scales(latent)] == [
+    assert [scale.shape for scale in quantizer.downsample_to_scales(latent)] == [
         (2, 1, 2),
         (2, 2, 2),
         (2, 4, 2),

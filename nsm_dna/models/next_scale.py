@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,32 @@ from .common import (
 
 if TYPE_CHECKING:
     from .vqvae import VQVAE
+
+
+@dataclass
+class NSMOutput:
+    hierarchy_logits: list[Float[Tensor, "batch scale_length codebook_size"]]
+    nucleotide_logits: Float[Tensor, "batch target_length vocab_size"]
+
+
+def tokenizer_scale_indices(
+    tokenizer_scale_lengths: list[int],
+    selected_scale_lengths: list[int],
+) -> list[int]:
+    """Locate an ordered NSM hierarchy within the tokenizer hierarchy."""
+    try:
+        indices = [
+            tokenizer_scale_lengths.index(length)
+            for length in selected_scale_lengths
+        ]
+    except ValueError as error:
+        raise ValueError("Every NSM scale must exist in the tokenizer.") from error
+
+    if indices != sorted(set(indices)):
+        raise ValueError("NSM scales must follow tokenizer order without duplicates.")
+    if not indices or indices[-1] != len(tokenizer_scale_lengths) - 1:
+        raise ValueError("The NSM hierarchy must include the finest tokenizer scale.")
+    return indices
 
 
 class _ResidualOutputHeadBlock(nn.Module):
@@ -126,6 +153,8 @@ class NSM(nn.Module):
         scale_lengths: list[int],
         codebook_sizes: list[int],
         codebook_vectors: list[Tensor],
+        target_length: int,
+        vocab_size: int,
         num_layers: int,
         num_heads: int,
         *,
@@ -135,7 +164,6 @@ class NSM(nn.Module):
         rope_base: float = 10000.0,
         head_num_blocks: int = 2,
         head_hidden_multiplier: float = 2.0,
-        max_prefix_length: int = 64,
     ) -> None:
         super().__init__()
 
@@ -143,11 +171,13 @@ class NSM(nn.Module):
         self.model_dim = model_dim
         self.scale_lengths = list(scale_lengths)
         self.codebook_sizes = list(codebook_sizes)
+        self.target_length = target_length
+        self.vocab_size = vocab_size
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.use_qk_norm = use_qk_norm
         self.rope_base = rope_base
-        self.max_prefix_length = max_prefix_length
+        self.prefix_length = sum(self.scale_lengths)
 
         # The model receives codebook indices as inputs, but needs the actual
         # codebook vectors to condition the next scale. Store the tokenizer's
@@ -172,25 +202,37 @@ class NSM(nn.Module):
         nn.init.normal_(self.bos, mean=0.0, std=0.02)
 
         # Each input block is labeled by the scale it is trying to predict.
-        self.scale_embedding = nn.Embedding(len(self.scale_lengths), self.model_dim)
+        self.scale_embedding = nn.Embedding(
+            len(self.scale_lengths) + 1,
+            self.model_dim,
+        )
         nn.init.normal_(self.scale_embedding.weight, mean=0.0, std=0.02)
 
         head_dim = self.model_dim // self.num_heads
-        # Place the prefix immediately before the target, then express every
-        # target scale in the finest scale's coordinates. For a finest length
-        # of 128, scale 2 uses [31.5, 95.5], the centers of 0–63 and 64–127.
-        prefix_positions = torch.arange(
-            -self.max_prefix_length,
-            0,
-            dtype=torch.float32,
+        # Prefix scales run fine-to-coarse into the target hierarchy, while all
+        # positions remain expressed in the finest latent scale's coordinates.
+        finest_scale_length = self.scale_lengths[-1]
+        prefix_positions = torch.cat(
+            [
+                (torch.arange(scale_length, dtype=torch.float32) + 0.5)
+                * (finest_scale_length / scale_length)
+                - 0.5
+                - finest_scale_length
+                for scale_length in reversed(self.scale_lengths)
+            ]
         )
         hierarchy_positions = torch.cat(
             [
                 (torch.arange(scale_length, dtype=torch.float32) + 0.5)
-                * (self.scale_lengths[-1] / scale_length)
+                * (finest_scale_length / scale_length)
                 - 0.5
                 for scale_length in self.scale_lengths
             ]
+        )
+        nucleotide_positions = (
+            (torch.arange(self.target_length, dtype=torch.float32) + 0.5)
+            * (finest_scale_length / self.target_length)
+            - 0.5
         )
         prefix_rope_cosine, prefix_rope_sine = precompute_rope_cosine_and_sine(
             prefix_positions,
@@ -204,11 +246,21 @@ class NSM(nn.Module):
                 self.rope_base,
             )
         )
+        nucleotide_rope_cosine, nucleotide_rope_sine = (
+            precompute_rope_cosine_and_sine(
+                nucleotide_positions,
+                head_dim,
+                self.rope_base,
+            )
+        )
         self.register_buffer(
             "prefix_positions", prefix_positions, persistent=False
         )
         self.register_buffer(
             "hierarchy_positions", hierarchy_positions, persistent=False
+        )
+        self.register_buffer(
+            "nucleotide_positions", nucleotide_positions, persistent=False
         )
         self.register_buffer(
             "prefix_rope_cosine", prefix_rope_cosine, persistent=False
@@ -221,6 +273,16 @@ class NSM(nn.Module):
         )
         self.register_buffer(
             "hierarchy_rope_sine", hierarchy_rope_sine, persistent=False
+        )
+        self.register_buffer(
+            "nucleotide_rope_cosine",
+            nucleotide_rope_cosine,
+            persistent=False,
+        )
+        self.register_buffer(
+            "nucleotide_rope_sine",
+            nucleotide_rope_sine,
+            persistent=False,
         )
 
         self.blocks = nn.ModuleList(
@@ -248,6 +310,11 @@ class NSM(nn.Module):
             dropout=dropout,
             bias=bias,
         )
+        self.nucleotide_head = nn.Linear(
+            self.model_dim,
+            self.vocab_size,
+            bias=bias,
+        )
 
     def _initialize_residual_projections(self) -> None:
         """Scale residual branches so their variance does not grow with depth."""
@@ -270,14 +337,28 @@ class NSM(nn.Module):
     @classmethod
     def from_config(cls, config: DictConfig, tokenizer: "VQVAE") -> "NSM":
         """Build NSM-DNA from an experiment configuration and its tokenizer."""
+        scale_lengths = (
+            list(config.model.scale_lengths)
+            if config.model.scale_lengths is not None
+            else list(tokenizer.scale_lengths)
+        )
+        scale_indices = tokenizer_scale_indices(
+            tokenizer.scale_lengths,
+            scale_lengths,
+        )
         return cls(
             prefix_dim=tokenizer.quantization_dim,
             model_dim=config.model.model_dim,
-            scale_lengths=tokenizer.scale_lengths,
-            codebook_sizes=tokenizer.codebook_sizes,
-            codebook_vectors=[
-                codebook.codebook for codebook in tokenizer.quantizer.codebooks
+            scale_lengths=scale_lengths,
+            codebook_sizes=[
+                tokenizer.codebook_sizes[index] for index in scale_indices
             ],
+            codebook_vectors=[
+                tokenizer.quantizer.codebooks[index].codebook
+                for index in scale_indices
+            ],
+            target_length=tokenizer.context_length,
+            vocab_size=tokenizer.vocab_size,
             num_layers=config.model.num_layers,
             num_heads=config.model.num_heads,
             dropout=config.model.dropout,
@@ -286,7 +367,6 @@ class NSM(nn.Module):
             rope_base=config.model.rope_base,
             head_num_blocks=config.model.head_num_blocks,
             head_hidden_multiplier=config.model.head_hidden_multiplier,
-            max_prefix_length=tokenizer.latent_length,
         )
 
     @classmethod
@@ -346,13 +426,25 @@ class NSM(nn.Module):
 
         return torch.cat(scale_inputs, dim=1)
 
+    def _build_prefix_inputs(
+        self,
+        prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
+    ) -> Float[Tensor, "batch prefix_length model_dim"]:
+        """Project continuous prefix scales in fine-to-coarse order."""
+        return torch.cat(
+            [
+                self.input_projection(prefix)
+                for prefix in reversed(prefix_by_scale)
+            ],
+            dim=1,
+        )
+
     def _build_attention_mask(
         self,
-        prefix_length: int,
         num_scale_blocks: int,
     ) -> Bool[Tensor, "1 1 length length"]:
-        """Allow full attention within each block and to every earlier block."""
-        input_length = prefix_length + sum(
+        """Connect each target scale to its matching prefix scale and itself."""
+        input_length = self.prefix_length + sum(
             self.scale_lengths[:num_scale_blocks]
         )
         attention_mask = torch.zeros(
@@ -361,33 +453,44 @@ class NSM(nn.Module):
             dtype=torch.bool,
             device=self.prefix_positions.device,
         )
-        attention_mask[:prefix_length, :prefix_length] = True
 
-        block_start = prefix_length
-        for scale_length in self.scale_lengths[:num_scale_blocks]:
+        prefix_blocks: dict[int, tuple[int, int]] = {}
+        block_start = 0
+        for scale_index in reversed(range(len(self.scale_lengths))):
+            block_end = block_start + self.scale_lengths[scale_index]
+            attention_mask[block_start:block_end, block_start:block_end] = True
+            prefix_blocks[scale_index] = (block_start, block_end)
+            block_start = block_end
+
+        for scale_index, scale_length in enumerate(
+            self.scale_lengths[:num_scale_blocks]
+        ):
             block_end = block_start + scale_length
-            attention_mask[block_start:block_end, :block_end] = True
+            prefix_start, prefix_end = prefix_blocks[scale_index]
+            attention_mask[
+                block_start:block_end,
+                prefix_start:prefix_end,
+            ] = True
+            attention_mask[block_start:block_end, block_start:block_end] = True
             block_start = block_end
 
         return attention_mask.reshape(1, 1, input_length, input_length)
 
     def _get_rotary_embeddings(
         self,
-        prefix_length: int,
         num_scale_blocks: int,
     ) -> RotaryEmbeddings:
         hierarchy_length = sum(self.scale_lengths[:num_scale_blocks])
-        prefix_start = self.max_prefix_length - prefix_length
         cosine = torch.cat(
             [
-                self.prefix_rope_cosine[prefix_start:],
+                self.prefix_rope_cosine,
                 self.hierarchy_rope_cosine[:hierarchy_length],
             ],
             dim=0,
         )
         sine = torch.cat(
             [
-                self.prefix_rope_sine[prefix_start:],
+                self.prefix_rope_sine,
                 self.hierarchy_rope_sine[:hierarchy_length],
             ],
             dim=0,
@@ -396,36 +499,28 @@ class NSM(nn.Module):
 
     def _encode_packed(
         self,
-        prefix: Float[Tensor, "batch prefix_length prefix_dim"],
+        prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
         completed_scales: list[Int[Tensor, "batch scale_length"]],
     ) -> Float[Tensor, "batch length model_dim"]:
         """Run the shared packed transformer path used by training and rollout.
 
-        Training supplies one possibly corrupted context for every scale after
-        scale 1, creating all prediction blocks in one pass. Rollout supplies only
-        the scales generated so far, creating the next-scale block it currently
-        needs.
+        Training supplies the preceding context for every scale after scale 1,
+        creating all prediction blocks in one pass. Rollout supplies only the
+        scales generated so far, creating the next-scale block it currently needs.
         """
-        prefix_length = prefix.shape[1]
         num_scale_blocks = len(completed_scales) + 1
         hidden_states = torch.cat(
             [
-                self.input_projection(prefix),
+                self._build_prefix_inputs(prefix_by_scale),
                 self._build_scale_inputs(
                     completed_scales,
-                    batch_size=prefix.shape[0],
+                    batch_size=prefix_by_scale[0].shape[0],
                 ),
             ],
             dim=1,
         )
-        attention_mask = self._build_attention_mask(
-            prefix_length,
-            num_scale_blocks,
-        )
-        rotary_embeddings = self._get_rotary_embeddings(
-            prefix_length,
-            num_scale_blocks,
-        )
+        attention_mask = self._build_attention_mask(num_scale_blocks)
+        rotary_embeddings = self._get_rotary_embeddings(num_scale_blocks)
         for block in self.blocks:
             hidden_states = block(
                 hidden_states,
@@ -438,38 +533,114 @@ class NSM(nn.Module):
         self,
         context_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
         *,
-        prefix: Float[Tensor, "batch prefix_length prefix_dim"],
+        prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
     ) -> Float[Tensor, "batch length model_dim"]:
         """Return prefix states and parallel prediction states for every scale."""
-        if prefix.shape[1] > self.max_prefix_length:
+        if len(prefix_by_scale) != len(self.scale_lengths):
             raise ValueError(
-                f"Prefix length {prefix.shape[1]} exceeds the configured maximum "
-                f"of {self.max_prefix_length}."
+                "One continuous prefix block is required for every NSM scale."
             )
+        for prefix, scale_length in zip(
+            prefix_by_scale,
+            self.scale_lengths,
+            strict=True,
+        ):
+            if prefix.shape[1] != scale_length:
+                raise ValueError(
+                    "Continuous prefix block lengths must match the NSM scales."
+                )
         if len(context_indices_by_scale) != len(self.scale_lengths) - 1:
             raise ValueError(
                 "One context scale is required for every prediction scale "
                 "after scale 1."
             )
-        return self._encode_packed(prefix, context_indices_by_scale)
+        return self._encode_packed(prefix_by_scale, context_indices_by_scale)
 
     def forward(
         self,
         context_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
+        final_scale_indices: Int[Tensor, "batch final_scale_length"],
         *,
-        prefix: Float[Tensor, "batch prefix_length prefix_dim"],
-    ) -> list[Float[Tensor, "batch scale_length codebook_size"]]:
-        hidden_states = self.encode(context_indices_by_scale, prefix=prefix)
-        return self.output_head(hidden_states[:, prefix.shape[1] :])
+        prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
+    ) -> NSMOutput:
+        hidden_states = self.encode(
+            context_indices_by_scale,
+            prefix_by_scale=prefix_by_scale,
+        )
+        return NSMOutput(
+            hierarchy_logits=self.output_head(
+                hidden_states[:, self.prefix_length :]
+            ),
+            nucleotide_logits=self.predict_nucleotides(
+                final_scale_indices,
+                prefix_by_scale=prefix_by_scale,
+            ),
+        )
+
+    def predict_nucleotides(
+        self,
+        final_scale_indices: Int[Tensor, "batch final_scale_length"],
+        *,
+        prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
+    ) -> Float[Tensor, "batch target_length vocab_size"]:
+        """Predict exact nucleotides from the finest quantized scale."""
+        finest_prefix = prefix_by_scale[-1]
+        final_vectors = getattr(self, self._codebook_buffer_names[-1])[
+            final_scale_indices
+        ]
+        repeats_per_code = self.target_length // self.scale_lengths[-1]
+        nucleotide_inputs = self.input_projection(
+            final_vectors.repeat_interleave(repeats_per_code, dim=1)
+        ) + self.scale_embedding.weight[-1]
+        prefix_inputs = self.input_projection(finest_prefix)
+        hidden_states = torch.cat([prefix_inputs, nucleotide_inputs], dim=1)
+
+        prefix_length = finest_prefix.shape[1]
+        total_length = prefix_length + self.target_length
+        attention_mask = torch.zeros(
+            total_length,
+            total_length,
+            dtype=torch.bool,
+            device=hidden_states.device,
+        )
+        attention_mask[:prefix_length, :prefix_length] = True
+        attention_mask[prefix_length:, :] = True
+        attention_mask = attention_mask.reshape(1, 1, total_length, total_length)
+
+        rotary_embeddings = (
+            torch.cat(
+                [
+                    self.prefix_rope_cosine[:prefix_length],
+                    self.nucleotide_rope_cosine,
+                ],
+                dim=0,
+            ),
+            torch.cat(
+                [
+                    self.prefix_rope_sine[:prefix_length],
+                    self.nucleotide_rope_sine,
+                ],
+                dim=0,
+            ),
+        )
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states,
+                attention_mask=attention_mask,
+                rotary_embeddings=rotary_embeddings,
+            )
+        return self.nucleotide_head(
+            self.final_norm(hidden_states[:, prefix_length:])
+        )
 
     def predict_scale(
         self,
-        prefix: Float[Tensor, "batch prefix_length prefix_dim"],
+        prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
         completed_scales: list[Int[Tensor, "batch scale_length"]],
     ) -> Float[Tensor, "batch scale_length codebook_size"]:
         """Predict every code at the next scale in parallel."""
         scale_index = len(completed_scales)
-        hidden_states = self._encode_packed(prefix, completed_scales)
+        hidden_states = self._encode_packed(prefix_by_scale, completed_scales)
         scale_length = self.scale_lengths[scale_index]
         return self.output_head.predict_scale(
             hidden_states[:, -scale_length:], scale_index

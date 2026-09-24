@@ -180,7 +180,7 @@ class MultiscaleVectorQuantizer(nn.Module):
             for codebook_size in codebook_sizes
         )
 
-    def _downsample_to_scales(
+    def downsample_to_scales(
         self,
         latent: Float[Tensor, "batch length quantization_dim"],
     ) -> list[Float[Tensor, "batch scale_length quantization_dim"]]:
@@ -198,7 +198,7 @@ class MultiscaleVectorQuantizer(nn.Module):
 
         return [latents_by_length[length] for length in self.scale_lengths]
 
-    def _upsample_to_full_length(
+    def upsample_to_full_length(
         self,
         quantized: Float[Tensor, "batch scale_length quantization_dim"],
         scale_index: int,
@@ -239,7 +239,7 @@ class MultiscaleVectorQuantizer(nn.Module):
         indices_by_scale: list[Int[Tensor, "batch scale_length"]] = []
         quantized_latents_by_scale: list[Tensor] = []
         partial_quantized_latent: Tensor | None = None
-        latents_by_scale = self._downsample_to_scales(x)
+        latents_by_scale = self.downsample_to_scales(x)
 
         for scale_index, (scale_latent, codebook) in enumerate(
             zip(latents_by_scale, self.codebooks, strict=True)
@@ -252,7 +252,7 @@ class MultiscaleVectorQuantizer(nn.Module):
             quantized_with_gradient = (
                 scale_latent + (quantized_at_scale - scale_latent).detach()
             )
-            expanded_quantized_latent = self._upsample_to_full_length(
+            expanded_quantized_latent = self.upsample_to_full_length(
                 quantized_with_gradient, scale_index
             )
             quantized_latents_by_scale.append(expanded_quantized_latent)
@@ -274,7 +274,7 @@ class MultiscaleVectorQuantizer(nn.Module):
     ) -> Float[Tensor, "batch length quantization_dim"]:
         """Expand one scale's code vectors to the full latent length."""
         codebook = self.codebooks[scale_index]
-        return self._upsample_to_full_length(
+        return self.upsample_to_full_length(
             codebook.codebook[scale_indices], scale_index
         )
 

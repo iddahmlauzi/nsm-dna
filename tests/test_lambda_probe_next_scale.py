@@ -7,30 +7,32 @@ from scripts.evaluation.lambda_probe_next_scale import (
 )
 
 
-def test_window_encoder_extracts_final_first_scale_memory_state() -> None:
+def test_window_encoder_pools_prefix_and_finest_scale_states() -> None:
     class StubTokenizer(nn.Module):
         context_length = 2
+        scale_lengths = [1]
 
-        def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
-            return token_ids.unsqueeze(-1).float()
+        def encode_scales(self, token_ids: torch.Tensor) -> list[torch.Tensor]:
+            return [token_ids[:, :1].unsqueeze(-1).float()]
 
         def encode_indices(self, token_ids: torch.Tensor) -> list[torch.Tensor]:
             return [token_ids]
 
     class StubModel(nn.Module):
+        scale_lengths = [1]
+        prefix_length = 1
+
         def encode(
             self,
             indices_by_scale: list[torch.Tensor],
             *,
-            prefix: torch.Tensor,
+            prefix_by_scale: list[torch.Tensor],
         ) -> torch.Tensor:
-            del indices_by_scale, prefix
+            del indices_by_scale, prefix_by_scale
             return torch.tensor(
                 [
                     [
                         [1.0, 2.0],
-                        [3.0, 4.0],
-                        [5.0, 6.0],
                         [7.0, 8.0],
                     ]
                 ]
@@ -40,7 +42,10 @@ def test_window_encoder_extracts_final_first_scale_memory_state() -> None:
 
     embedding = encoder(torch.tensor([[0, 1, 2, 3]]))
 
-    torch.testing.assert_close(embedding, torch.tensor([[5.0, 6.0]]))
+    torch.testing.assert_close(
+        embedding,
+        torch.tensor([[(1.0 + 7.0) / 2, (2.0 + 8.0) / 2]]),
+    )
 
 
 def test_segment_windows_advance_by_one_target_block() -> None:

@@ -10,7 +10,7 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 from nsm_dna.data import encode_sequence
-from nsm_dna.models.next_scale import NSM
+from nsm_dna.models.next_scale import NSM, tokenizer_scale_indices
 from nsm_dna.models.vqvae import VQVAE
 from scripts.evaluation.lambda_probe_next_token import (
     LambdaSplit,
@@ -29,6 +29,10 @@ class NSMWindowEncoder(nn.Module):
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
+        self.scale_indices = tokenizer_scale_indices(
+            tokenizer.scale_lengths,
+            model.scale_lengths,
+        )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         block_length = self.tokenizer.context_length
@@ -40,11 +44,20 @@ class NSMWindowEncoder(nn.Module):
             dtype=torch.bfloat16,
             enabled=input_ids.device.type == "cuda",
         ):
-            prefix = self.tokenizer.encode(prefix_ids)
-            targets_by_scale = self.tokenizer.encode_indices(target_ids)
-            hidden_states = self.model.encode(targets_by_scale[:-1], prefix=prefix)
+            tokenizer_prefix = self.tokenizer.encode_scales(prefix_ids)
+            prefix_by_scale = [
+                tokenizer_prefix[index] for index in self.scale_indices
+            ]
+            tokenizer_indices = self.tokenizer.encode_indices(target_ids)
+            targets_by_scale = [
+                tokenizer_indices[index] for index in self.scale_indices
+            ]
+            hidden_states = self.model.encode(
+                targets_by_scale[:-1],
+                prefix_by_scale=prefix_by_scale,
+            )
 
-        prefix_states = hidden_states[:, : prefix.shape[1]]
+        prefix_states = hidden_states[:, : self.model.prefix_length]
         finest_scale_states = hidden_states[:, -self.model.scale_lengths[-1] :]
         return (
             torch.cat([prefix_states, finest_scale_states], dim=1)

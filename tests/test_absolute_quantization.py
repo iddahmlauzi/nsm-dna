@@ -22,8 +22,8 @@ def test_learned_downsampling_preserves_left_right_order() -> None:
     swapped_latent = latent.clone()
     swapped_latent[:, :2] = latent[:, :2].flip(dims=[1])
 
-    scale_two_latent = quantizer._downsample_to_scales(latent)[1]
-    swapped_scale_two_latent = quantizer._downsample_to_scales(swapped_latent)[1]
+    scale_two_latent = quantizer.downsample_to_scales(latent)[1]
+    swapped_scale_two_latent = quantizer.downsample_to_scales(swapped_latent)[1]
 
     assert not torch.allclose(
         scale_two_latent[:, 0],

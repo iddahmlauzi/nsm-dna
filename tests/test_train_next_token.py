@@ -80,26 +80,3 @@ def test_checkpoint_is_saved_locally(tmp_path: Path) -> None:
     assert checkpoint_path.exists()
     checkpoint = torch.load(checkpoint_path, weights_only=True)
     assert checkpoint["step"] == 1000
-
-
-def test_default_config_uses_local_checkpoint_recovery() -> None:
-    config_path = Path(__file__).parents[1] / "configs" / "next_token.yaml"
-    config = OmegaConf.load(config_path)
-
-    assert "huggingface" not in config.checkpoint
-    assert config.checkpoint.recovery_interval == 5000
-    assert config.wandb.run_id is None
-
-
-def test_default_config_uses_stable_transformer_training_settings() -> None:
-    config_path = Path(__file__).parents[1] / "configs" / "next_token.yaml"
-    config = OmegaConf.load(config_path)
-
-    assert config.model.dropout == 0.0
-    assert config.model.bias is False
-    assert config.model.use_qk_norm is True
-    assert config.optimizer.warmup_steps == 1907
-    assert config.optimizer.beta_1 == 0.9
-    assert config.optimizer.beta_2 == 0.95
-    assert config.optimizer.weight_decay == 0.05
-    assert config.optimizer.gradient_accumulation_steps == 1

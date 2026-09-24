@@ -96,10 +96,10 @@ def score_token_ids(
     Float[Tensor, "batch num_scales"],
     Float[Tensor, "batch"],
 ]:
-    """Return per-scale hierarchy scores and the decoder score."""
+    """Return per-scale hierarchy scores and the nucleotide score."""
     if input_ids.shape[1] != 2 * tokenizer.context_length:
         raise ValueError("NSM scoring requires one prefix block and one target block.")
-    predicted_scale_lengths = tokenizer.scale_lengths
+    predicted_scale_lengths = model.scale_lengths
     hierarchy_scores = torch.zeros(
         input_ids.shape[0],
         len(predicted_scale_lengths),
@@ -109,19 +109,23 @@ def score_token_ids(
     decoder_scores = torch.zeros(
         input_ids.shape[0], device=input_ids.device, dtype=torch.float64
     )
-    for prediction in prepare_block_predictions(tokenizer, input_ids):
+    for prediction in prepare_block_predictions(
+        tokenizer,
+        input_ids,
+        model.scale_lengths,
+    ):
         with torch.autocast(
             device_type=input_ids.device.type,
             dtype=torch.bfloat16,
             enabled=input_ids.device.type == "cuda",
         ):
-            logits_by_scale = model(
+            output = model(
                 prediction.targets_by_scale[:-1],
-                prefix=prediction.prefix,
+                prediction.targets_by_scale[-1],
+                prefix_by_scale=prediction.prefix_by_scale,
             )
-            decoder_logits = tokenizer.decode_scale(
-                prediction.targets_by_scale[-1], len(predicted_scale_lengths) - 1
-            )
+            logits_by_scale = output.hierarchy_logits
+            decoder_logits = output.nucleotide_logits
 
         # Likelihood counts every predicted code once; the training loss's scale
         # weights do not enter the sequence score.
@@ -136,7 +140,7 @@ def score_token_ids(
                 .double()
             )
 
-        # The final absolute scale supplies the decoder's nucleotide likelihood.
+        # The final absolute scale supplies NSM's nucleotide likelihood.
         nucleotide_log_probabilities = F.log_softmax(decoder_logits.float(), dim=-1)
         nucleotide_targets = prediction.target_ids
         decoder_scores += (
