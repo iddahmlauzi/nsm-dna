@@ -22,8 +22,11 @@ def test_learned_downsampling_preserves_left_right_order() -> None:
     swapped_latent = latent.clone()
     swapped_latent[:, :2] = latent[:, :2].flip(dims=[1])
 
-    scale_two_latent = quantizer.downsample_to_scales(latent)[1]
-    swapped_scale_two_latent = quantizer.downsample_to_scales(swapped_latent)[1]
+    scale_two_latent = quantizer.downsample_to_scales(latent, latent)[1]
+    swapped_scale_two_latent = quantizer.downsample_to_scales(
+        swapped_latent,
+        swapped_latent,
+    )[1]
 
     assert not torch.allclose(
         scale_two_latent[:, 0],
@@ -47,7 +50,11 @@ def test_partial_reconstruction_gradient_flows_through_learned_downsampling(
     latent = torch.randn(1, 4, 4, requires_grad=True)
 
     monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: torch.tensor(0))
-    _, partial_latent, _ = quantizer(latent, include_partial_reconstruction=True)
+    _, partial_latent, _ = quantizer(
+        latent,
+        latent,
+        include_partial_reconstruction=True,
+    )
     assert partial_latent is not None
     partial_latent[..., 0].sum().backward()
 

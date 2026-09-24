@@ -60,8 +60,10 @@ def test_zero_third_base_scale_preserves_the_first_two_base_representation() -> 
         ]
     )
 
-    latent = encoder(token_ids)
-    torch.testing.assert_close(latent[0], latent[1])
+    fine_latent, hierarchy_latent = encoder.encode_latents(token_ids)
+
+    torch.testing.assert_close(fine_latent[0], fine_latent[1])
+    assert not torch.allclose(hierarchy_latent[0], hierarchy_latent[1])
 
 
 def test_single_scale_triplet_vqvae() -> None:
@@ -178,7 +180,7 @@ def test_quantizer_builds_and_quantizes_every_scale() -> None:
     ).eval()
     latent = torch.randn(2, 4, 2)
 
-    quantized_latent, partial_latent, indices_by_scale = quantizer(latent)
+    quantized_latent, partial_latent, indices_by_scale = quantizer(latent, latent)
 
     assert quantized_latent.shape == latent.shape
     assert partial_latent is None
@@ -187,7 +189,9 @@ def test_quantizer_builds_and_quantizes_every_scale() -> None:
         (2, 2),
         (2, 4),
     ]
-    assert [scale.shape for scale in quantizer.downsample_to_scales(latent)] == [
+    assert [
+        scale.shape for scale in quantizer.downsample_to_scales(latent, latent)
+    ] == [
         (2, 1, 2),
         (2, 2, 2),
         (2, 4, 2),

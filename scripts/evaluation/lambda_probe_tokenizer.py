@@ -34,8 +34,11 @@ class TokenizerWindowEncoder(nn.Module):
             dtype=torch.bfloat16,
             enabled=input_ids.device.type == "cuda",
         ):
-            latent = self.tokenizer.encode(input_ids)
-            quantized_latent, _, _ = self.tokenizer.quantizer(latent)
+            fine_latent, hierarchy_latent = self.tokenizer.encode_latents(input_ids)
+            quantized_latent, _, _ = self.tokenizer.quantizer(
+                fine_latent,
+                hierarchy_latent,
+            )
             hidden_states = self.tokenizer.decoder.encode(quantized_latent)
 
         return hidden_states.float().mean(dim=1)

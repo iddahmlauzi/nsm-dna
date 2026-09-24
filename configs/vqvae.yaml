@@ -8,7 +8,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: vqvae
-  name: vqvae-384-learned-hierarchy-triplet-k32-core-refinement-delayed-kmeans
+  name: vqvae-384-triplet-k32-fine-only-core-refinement-delayed-kmeans
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset

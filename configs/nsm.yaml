@@ -6,13 +6,13 @@ run:
 
 # The checkpoint's stored model configuration is the source of truth for the
 # tokenizer architecture, scale lengths, and codebook sizes.
-tokenizer_checkpoint: ../runs/vqvae-384-learned-hierarchy-triplet-k32-core-refinement-delayed-kmeans/checkpoints/best.pt
+tokenizer_checkpoint: ../runs/vqvae-384-triplet-k32-fine-only-core-refinement-delayed-kmeans/checkpoints/best.pt
 
 wandb:
   enabled: true
   entity: nsm-dna
   project: nsm
-  name: nsm-384-triplet-k32-u-shaped-prefix-all-scales-decoder-loss025
+  name: nsm-384-triplet-k32-unbiased-coarse-all-scales-decoder-loss025
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset

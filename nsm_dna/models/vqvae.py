@@ -127,12 +127,26 @@ class VQVAE(nn.Module):
         """Encode DNA into the normalized continuous latent."""
         return self.encoder(token_ids)
 
+    def encode_latents(
+        self,
+        token_ids: Int[Tensor, "batch length"],
+    ) -> tuple[
+        Float[Tensor, "batch latent_length quantization_dim"],
+        Float[Tensor, "batch latent_length quantization_dim"],
+    ]:
+        """Encode DNA for fine quantization and unbiased coarse downsampling."""
+        return self.encoder.encode_latents(token_ids)
+
     def encode_scales(
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> list[Float[Tensor, "batch scale_length quantization_dim"]]:
         """Encode DNA into the continuous latent at every hierarchy scale."""
-        return self.quantizer.downsample_to_scales(self.encode(token_ids).float())
+        fine_latent, hierarchy_latent = self.encode_latents(token_ids)
+        return self.quantizer.downsample_to_scales(
+            fine_latent.float(),
+            hierarchy_latent.float(),
+        )
 
     def forward(
         self,
@@ -144,9 +158,10 @@ class VQVAE(nn.Module):
         Float[Tensor, "batch length vocab_size"] | None,
         list[Int[Tensor, "batch scale_length"]],
     ]:
-        latent = self.encode(token_ids)
+        fine_latent, hierarchy_latent = self.encode_latents(token_ids)
         quantized_latent, partial_quantized_latent, indices_by_scale = self.quantizer(
-            latent,
+            fine_latent,
+            hierarchy_latent,
             include_partial_reconstruction=include_partial_reconstruction,
         )
         logits = self.decoder(quantized_latent)
@@ -166,8 +181,8 @@ class VQVAE(nn.Module):
         if self.training:
             raise RuntimeError("Call model.eval() before encoding sequences.")
 
-        latent = self.encode(token_ids)
-        _, _, indices_by_scale = self.quantizer(latent)
+        fine_latent, hierarchy_latent = self.encode_latents(token_ids)
+        _, _, indices_by_scale = self.quantizer(fine_latent, hierarchy_latent)
         return indices_by_scale
 
     @torch.no_grad()

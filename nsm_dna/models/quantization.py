@@ -182,11 +182,12 @@ class MultiscaleVectorQuantizer(nn.Module):
 
     def downsample_to_scales(
         self,
-        latent: Float[Tensor, "batch length quantization_dim"],
+        fine_latent: Float[Tensor, "batch length quantization_dim"],
+        hierarchy_latent: Float[Tensor, "batch length quantization_dim"],
     ) -> list[Float[Tensor, "batch scale_length quantization_dim"]]:
-        """Build every configured scale through ordered pairwise reductions."""
-        latents_by_length = {self.latent_length: latent}
-        current_latent = latent
+        """Build coarse scales from the unbiased hierarchy representation."""
+        latents_by_length = {self.latent_length: fine_latent}
+        current_latent = hierarchy_latent
 
         for scale_length, downsampler in zip(
             self.downsampled_lengths,
@@ -213,7 +214,8 @@ class MultiscaleVectorQuantizer(nn.Module):
 
     def forward(
         self,
-        x: Float[Tensor, "batch length quantization_dim"],
+        fine_latent: Float[Tensor, "batch length quantization_dim"],
+        hierarchy_latent: Float[Tensor, "batch length quantization_dim"],
         *,
         include_partial_reconstruction: bool = False,
     ) -> tuple[
@@ -226,7 +228,8 @@ class MultiscaleVectorQuantizer(nn.Module):
         When partial reconstruction is enabled and a non-final scale exists,
         return one randomly selected scale latent for auxiliary reconstruction.
         """
-        x = x.float()
+        fine_latent = fine_latent.float()
+        hierarchy_latent = hierarchy_latent.float()
 
         partial_scale_index = None
         if include_partial_reconstruction and len(self.scale_lengths) > 1:
@@ -239,7 +242,10 @@ class MultiscaleVectorQuantizer(nn.Module):
         indices_by_scale: list[Int[Tensor, "batch scale_length"]] = []
         quantized_latents_by_scale: list[Tensor] = []
         partial_quantized_latent: Tensor | None = None
-        latents_by_scale = self.downsample_to_scales(x)
+        latents_by_scale = self.downsample_to_scales(
+            fine_latent,
+            hierarchy_latent,
+        )
 
         for scale_index, (scale_latent, codebook) in enumerate(
             zip(latents_by_scale, self.codebooks, strict=True)
