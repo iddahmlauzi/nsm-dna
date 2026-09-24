@@ -6,13 +6,13 @@ run:
 
 # The checkpoint's stored model configuration is the source of truth for the
 # tokenizer architecture, scale lengths, and codebook sizes.
-tokenizer_checkpoint: ../runs/vqvae-384-triplet-k32-fine-only-core-refinement-delayed-kmeans/checkpoints/best.pt
+tokenizer_checkpoint: ../runs/vqvae-384-triplet-k64-fine-only-core-refinement-delayed-kmeans/checkpoints/best.pt
 
 wandb:
   enabled: true
   entity: nsm-dna
   project: nsm
-  name: nsm-384-triplet-k64-unbiased-coarse-all-scales-geometry
+  name: nsm-384-triplet-k64-unbiased-coarse-soft-conditioning
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -55,14 +55,16 @@ optimizer:
 objective:
   # Alpha 1 gives every hierarchy scale equal weight.
   scale_loss_alpha: 1
-  # Prefer errors whose frozen tokenizer codes are close to the correct code.
-  geometry_loss_weight: 1.0
 
 mixed_precision:
   enabled: true
 
 training:
   num_epochs: 10
+  # Learn exact scale predictions before replacing true preceding codes with
+  # detached probability-weighted codebook vectors.
+  teacher_forcing_epochs: 1
+  soft_conditioning_transition_epochs: 2
   # Set an integer here to override the epoch-derived training length.
   max_steps: null
   log_interval: 10
@@ -74,7 +76,7 @@ training:
 evaluation:
   interval: 1_000
   max_batches: 10
-  # Greedy scale rollout is substantially more expensive than teacher forcing.
+  # Sequential soft rollout is more expensive than teacher forcing.
   rollout_max_batches: 1
 
 checkpoint:

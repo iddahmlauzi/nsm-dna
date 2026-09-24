@@ -64,7 +64,8 @@ mixed_precision:
 
 training:
   num_epochs: 10
-  # Let the encoder establish its triplet geometry before fitting the codebook.
+  # Let the encoder establish its 6-mer and triplet geometry before fitting the
+  # two finest codebooks.
   reinitialize_codebook_step: 1_000
   # Set an integer here to override the epoch-derived training length.
   max_steps: null

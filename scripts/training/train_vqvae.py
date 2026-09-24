@@ -13,7 +13,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from nsm_dna.data import collate_dna_sequences, load_gtdb_dataset
+from nsm_dna.data import BASE_TO_TOKEN_ID, collate_dna_sequences, load_gtdb_dataset
 from nsm_dna.models.vqvae import VQVAE
 from nsm_dna.training import (
     build_learning_rate_scheduler,
@@ -24,9 +24,6 @@ from nsm_dna.training import (
     save_training_checkpoint,
 )
 from nsm_dna.triplet_analysis import (
-    assign_sixmers,
-    assign_triplets,
-    code_table_rows,
     sixmer_code_table_rows,
 )
 
@@ -92,20 +89,41 @@ def _kmeans(
 
 
 @torch.no_grad()
-def reinitialize_finest_codebook(model: VQVAE, seed: int) -> None:
-    """Fit the finest codebook to the encoder's current triplet geometry."""
+def reinitialize_local_codebooks(model: VQVAE, seed: int) -> None:
+    """Fit the two finest codebooks to encoded 6-mers and triplets."""
     device = next(model.parameters()).device
-    sampling_factor = model.context_length // model.latent_length
-    triplets = torch.tensor(
-        list(product(range(model.vocab_size), repeat=sampling_factor)),
-        device=device,
+    local_scales = (
+        (model.latent_length // 2, 6),
+        (model.latent_length, 3),
     )
-    input_ids = triplets.repeat(1, model.latent_length)
-    triplet_vectors = model.encode(input_ids)[:, 0].float()
 
-    codebook = model.quantizer.codebooks[-1]
-    centers = _kmeans(triplet_vectors, codebook.codebook_size, seed)
-    codebook.initialize(centers)
+    for scale_length, kmer_length in local_scales:
+        scale_index = model.scale_lengths.index(scale_length)
+        token_order = (
+            [BASE_TO_TOKEN_ID[base] for base in "TCAG"]
+            if kmer_length == 3
+            else range(model.vocab_size)
+        )
+        kmers = torch.tensor(
+            list(product(token_order, repeat=kmer_length)),
+            device=device,
+        )
+        repeats = model.context_length // kmer_length
+        vectors = []
+        for batch in kmers.split(256):
+            input_ids = batch.repeat(1, repeats)
+            scale_latent = model.encode_scales(input_ids)[scale_index]
+            vectors.append(scale_latent[:, 0].float())
+
+        codebook = model.quantizer.codebooks[scale_index]
+        vectors = torch.cat(vectors)
+        if kmer_length == 3:
+            if codebook.codebook_size != len(vectors):
+                raise ValueError("The finest codebook requires one code per triplet.")
+            centers = vectors
+        else:
+            centers = _kmeans(vectors, codebook.codebook_size, seed)
+        codebook.initialize(centers)
 
 
 @torch.no_grad()
@@ -115,7 +133,7 @@ def evaluate(
     use_mixed_precision: bool,
     partial_reconstruction_weight: float,
     max_batches: int | None = None,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], dict[str, int]]:
     """Evaluate reconstruction at each independent scale without updating codebooks.
 
     Evaluate the entire data loader when max_batches is None.
@@ -147,6 +165,15 @@ def evaluate(
     # Encoder magnitude, which position-wise LayerNorm should keep stable.
     encoder_latent_squared_sum = 0.0
     num_latent_values = 0
+    sixmer_scale_index = None
+    if model.context_length % 6 == 0:
+        sixmer_scale_length = model.context_length // 6
+        if sixmer_scale_length in model.scale_lengths:
+            sixmer_scale_index = model.scale_lengths.index(sixmer_scale_length)
+    token_id_to_base = {
+        token_id: base for base, token_id in BASE_TO_TOKEN_ID.items()
+    }
+    sixmer_assignments: dict[str, int] = {}
 
     for batch_index, batch in enumerate(data_loader):
         if max_batches is not None and batch_index == max_batches:
@@ -194,6 +221,19 @@ def evaluate(
                 scale_indices.flatten().cpu(),
                 minlength=model.codebook_sizes[scale_index],
             )
+
+        if sixmer_scale_index is not None:
+            sixmers = input_ids.reshape(-1, 6).cpu().tolist()
+            sixmer_codes = (
+                indices_by_scale[sixmer_scale_index].flatten().cpu().tolist()
+            )
+            for token_ids, code in zip(sixmers, sixmer_codes, strict=True):
+                sixmer = "".join(
+                    token_id_to_base[token_id] for token_id in token_ids
+                )
+                previous_code = sixmer_assignments.setdefault(sixmer, code)
+                if previous_code != code:
+                    raise RuntimeError("A validation 6-mer received multiple codes.")
 
         full_reconstruction_loss_sum += full_reconstruction_loss.item()
         correct_tokens += (logits.argmax(dim=-1) == input_ids).sum().item()
@@ -252,7 +292,7 @@ def evaluate(
             codebook_vectors.float().square().mean().sqrt().item()
         )
 
-    return metrics
+    return metrics, sixmer_assignments
 
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="vqvae")
@@ -488,9 +528,9 @@ def main(config: DictConfig) -> None:
         scheduler.step()
 
         if step == codebook_reinitialization_step:
-            reinitialize_finest_codebook(model, config.run.seed)
+            reinitialize_local_codebooks(model, config.run.seed)
             if distributed_environment.is_main_process:
-                tqdm.write(f"reinitialized finest codebook at step {step}")
+                tqdm.write(f"reinitialized two finest codebooks at step {step}")
 
         if step % config.training.log_interval == 0:
             loss_sums = torch.tensor(
@@ -544,7 +584,7 @@ def main(config: DictConfig) -> None:
         if step % config.evaluation.interval == 0:
             if distributed_environment.is_main_process:
                 assert validation_loader is not None
-                validation_metrics = evaluate(
+                validation_metrics, sixmer_assignments = evaluate(
                     model,
                     validation_loader,
                     use_mixed_precision,
@@ -645,17 +685,8 @@ def main(config: DictConfig) -> None:
                                 scale_utilizations[scale_length]
                             )
 
-                    triplet_assignments = assign_triplets(model, device)
-                    triplet_table = wandb.Table(
-                        columns=["code", "triplets", "amino acids"],
-                        data=code_table_rows(
-                            triplet_assignments,
-                            model.codebook_sizes[-1],
-                        ),
-                    )
-                    sixmer_assignments = assign_sixmers(model, device)
                     sixmer_scale_index = model.scale_lengths.index(
-                        model.latent_length // 2
+                        model.context_length // 6
                     )
                     sixmer_table = wandb.Table(
                         columns=[
@@ -671,7 +702,6 @@ def main(config: DictConfig) -> None:
                     _log_to_wandb(
                         wandb_run,
                         {
-                            "tokenizer/triplet_assignments": triplet_table,
                             "tokenizer/sixmer_assignments": sixmer_table,
                         },
                         step,

@@ -299,6 +299,10 @@ class NSM(nn.Module):
                 std=residual_standard_deviation,
             )
 
+    def codebook_vectors(self, scale_index: int) -> Tensor:
+        """Return the frozen tokenizer vectors for one selected scale."""
+        return getattr(self, self._codebook_buffer_names[scale_index])
+
     @classmethod
     def from_config(cls, config: DictConfig, tokenizer: "VQVAE") -> "NSM":
         """Build NSM-DNA from an experiment configuration and its tokenizer."""
@@ -460,6 +464,114 @@ class NSM(nn.Module):
         )
         return cosine, sine
 
+    def _predict_scale_from_context(
+        self,
+        prefix: Float[Tensor, "batch scale_length prefix_dim"],
+        scale_index: int,
+        previous_scale_latent: Float[
+            Tensor, "batch previous_scale_length prefix_dim"
+        ]
+        | None,
+    ) -> Float[Tensor, "batch scale_length codebook_size"]:
+        """Predict one scale from its matching prefix and preceding-scale latent."""
+        scale_length = self.scale_lengths[scale_index]
+        batch_size = prefix.shape[0]
+
+        if scale_index == 0:
+            scale_input = self.bos.expand(batch_size, scale_length, -1)
+        else:
+            if previous_scale_latent is None:
+                raise ValueError("Every scale after scale 1 needs preceding context.")
+            repeats_per_code = scale_length // previous_scale_latent.shape[1]
+            scale_input = self.input_projection(
+                previous_scale_latent
+            ).repeat_interleave(repeats_per_code, dim=1)
+        scale_input = scale_input + self.scale_embedding.weight[scale_index]
+
+        hidden_states = torch.cat(
+            [self.input_projection(prefix), scale_input],
+            dim=1,
+        )
+        attention_mask = torch.zeros(
+            2 * scale_length,
+            2 * scale_length,
+            dtype=torch.bool,
+            device=hidden_states.device,
+        )
+        attention_mask[:scale_length, :scale_length] = True
+        attention_mask[scale_length:, :] = True
+        attention_mask = attention_mask.reshape(
+            1, 1, 2 * scale_length, 2 * scale_length
+        )
+
+        prefix_start = sum(self.scale_lengths[scale_index + 1 :])
+        hierarchy_start = sum(self.scale_lengths[:scale_index])
+        rotary_embeddings = (
+            torch.cat(
+                [
+                    self.prefix_rope_cosine[
+                        prefix_start : prefix_start + scale_length
+                    ],
+                    self.hierarchy_rope_cosine[
+                        hierarchy_start : hierarchy_start + scale_length
+                    ],
+                ]
+            ),
+            torch.cat(
+                [
+                    self.prefix_rope_sine[
+                        prefix_start : prefix_start + scale_length
+                    ],
+                    self.hierarchy_rope_sine[
+                        hierarchy_start : hierarchy_start + scale_length
+                    ],
+                ]
+            ),
+        )
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states,
+                attention_mask=attention_mask,
+                rotary_embeddings=rotary_embeddings,
+            )
+        hidden_states = self.final_norm(hidden_states[:, scale_length:])
+        return self.output_head.predict_scale(hidden_states, scale_index)
+
+    def _predict_soft_conditioned_hierarchy(
+        self,
+        context_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
+        prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
+        soft_conditioning_probability: float,
+    ) -> list[Float[Tensor, "batch scale_length codebook_size"]]:
+        """Predict scales sequentially, optionally retaining predicted uncertainty."""
+        logits_by_scale = []
+        previous_scale_latent = None
+
+        for scale_index, prefix in enumerate(prefix_by_scale):
+            scale_logits = self._predict_scale_from_context(
+                prefix,
+                scale_index,
+                previous_scale_latent,
+            )
+            logits_by_scale.append(scale_logits)
+            if scale_index == len(self.scale_lengths) - 1:
+                continue
+
+            codebook_vectors = self.codebook_vectors(scale_index)
+            use_soft_context = (
+                torch.rand((), device=scale_logits.device)
+                < soft_conditioning_probability
+            )
+            if use_soft_context:
+                probabilities = scale_logits.float().softmax(dim=-1).detach()
+                previous_scale_latent = probabilities @ codebook_vectors
+            else:
+                previous_scale_latent = codebook_vectors[
+                    context_indices_by_scale[scale_index]
+                ]
+
+        return logits_by_scale
+
     def _encode_packed(
         self,
         prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
@@ -524,7 +636,17 @@ class NSM(nn.Module):
         context_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
         *,
         prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
+        soft_conditioning_probability: float = 0.0,
     ) -> NSMOutput:
+        if soft_conditioning_probability > 0:
+            return NSMOutput(
+                hierarchy_logits=self._predict_soft_conditioned_hierarchy(
+                    context_indices_by_scale,
+                    prefix_by_scale,
+                    soft_conditioning_probability,
+                )
+            )
+
         hidden_states = self.encode(
             context_indices_by_scale,
             prefix_by_scale=prefix_by_scale,
@@ -537,13 +659,16 @@ class NSM(nn.Module):
 
     def predict_scale(
         self,
-        prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
-        completed_scales: list[Int[Tensor, "batch scale_length"]],
+        prefix: Float[Tensor, "batch scale_length prefix_dim"],
+        scale_index: int,
+        previous_scale_latent: Float[
+            Tensor, "batch previous_scale_length prefix_dim"
+        ]
+        | None,
     ) -> Float[Tensor, "batch scale_length codebook_size"]:
-        """Predict every code at the next scale in parallel."""
-        scale_index = len(completed_scales)
-        hidden_states = self._encode_packed(prefix_by_scale, completed_scales)
-        scale_length = self.scale_lengths[scale_index]
-        return self.output_head.predict_scale(
-            hidden_states[:, -scale_length:], scale_index
+        """Predict one scale from continuous preceding-scale context."""
+        return self._predict_scale_from_context(
+            prefix,
+            scale_index,
+            previous_scale_latent,
         )

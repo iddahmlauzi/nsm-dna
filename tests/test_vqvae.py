@@ -8,7 +8,7 @@ from nsm_dna.models.autoencoder import Decoder, Encoder
 from nsm_dna.models.common import RMSNorm
 from nsm_dna.models.quantization import MultiscaleVectorQuantizer
 from nsm_dna.models.vqvae import VQVAE
-from scripts.training.train_vqvae import evaluate, reinitialize_finest_codebook
+from scripts.training.train_vqvae import evaluate, reinitialize_local_codebooks
 
 
 def _build_model(*, decoder_num_layers: int = 1) -> VQVAE:
@@ -82,7 +82,7 @@ def test_single_scale_triplet_vqvae() -> None:
     logits, partial_logits, indices_by_scale = model(
         batches[0]["input_ids"], include_partial_reconstruction=True
     )
-    metrics = evaluate(
+    metrics, _ = evaluate(
         model,
         batches,
         use_mixed_precision=False,
@@ -96,23 +96,31 @@ def test_single_scale_triplet_vqvae() -> None:
     assert metrics["total_loss"] == metrics["full_reconstruction_loss"]
 
 
-def test_codebook_reinitialization_uses_every_code() -> None:
+def test_local_codebook_reinitialization_uses_every_code() -> None:
     model = VQVAE(
         vocab_size=4,
-        context_length=9,
-        latent_length=3,
+        context_length=12,
+        latent_length=4,
         embed_dim=8,
         quantization_dim=16,
         num_heads=2,
-        scale_lengths=[3],
-        codebook_sizes=[26],
+        scale_lengths=[2, 4],
+        codebook_sizes=[8, 64],
     ).eval()
-    reinitialize_finest_codebook(model, seed=0)
-    triplets = torch.tensor(list(product(range(4), repeat=3)))
-    input_ids = triplets.repeat(1, model.latent_length)
-    used_codes = model.encode_indices(input_ids)[-1].unique()
+    reinitialize_local_codebooks(model, seed=0)
 
-    assert len(used_codes) == model.codebook_sizes[-1]
+    for scale_index, (kmer_length, codebook_size) in enumerate(((6, 8), (3, 64))):
+        token_order = [3, 1, 0, 2] if kmer_length == 3 else range(4)
+        kmers = torch.tensor(list(product(token_order, repeat=kmer_length)))
+        input_ids = kmers.repeat(1, model.context_length // kmer_length)
+        indices = model.encode_indices(input_ids)[scale_index]
+
+        assert len(indices.unique()) == codebook_size
+        if kmer_length == 3:
+            torch.testing.assert_close(
+                indices[:, 0],
+                torch.arange(codebook_size),
+            )
 
 
 def test_decoder_supplies_rope_to_attention() -> None:
@@ -255,7 +263,7 @@ def test_evaluate_reports_diagnostics_by_scale() -> None:
         },
     ]
 
-    metrics = evaluate(
+    metrics, _ = evaluate(
         model,
         batches,
         use_mixed_precision=False,
@@ -269,3 +277,33 @@ def test_evaluate_reports_diagnostics_by_scale() -> None:
         assert f"scale_latent_rms_scale_{scale_length}" in metrics
         assert f"codebook_perplexity_scale_{scale_length}" in metrics
         assert f"codebook_rms_scale_{scale_length}" in metrics
+
+
+def test_evaluate_collects_only_validation_sixmers() -> None:
+    model = VQVAE(
+        vocab_size=4,
+        context_length=12,
+        latent_length=4,
+        embed_dim=8,
+        quantization_dim=4,
+        num_heads=2,
+        scale_lengths=[2, 4],
+        codebook_sizes=[8, 64],
+        decoder_num_layers=1,
+    )
+    batches = [
+        {
+            "input_ids": torch.tensor(
+                [[3, 1, 0, 2, 3, 1, 0, 0, 2, 2, 1, 3]]
+            )
+        }
+    ]
+
+    _, sixmer_assignments = evaluate(
+        model,
+        batches,
+        use_mixed_precision=False,
+        partial_reconstruction_weight=0.25,
+    )
+
+    assert set(sixmer_assignments) == {"TCAGTC", "AAGGCT"}

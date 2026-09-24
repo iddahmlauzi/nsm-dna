@@ -103,7 +103,7 @@ def test_validation_reports_independent_scale_reconstruction() -> None:
     )
     batch = {"input_ids": torch.tensor([[0, 1, 2, 3, 3, 2, 1, 0]])}
 
-    metrics = evaluate(
+    metrics, _ = evaluate(
         model,
         [batch],
         use_mixed_precision=False,

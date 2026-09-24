@@ -8,15 +8,14 @@ from nsm_dna.models.next_scale import NSM
 from nsm_dna.models.vqvae import VQVAE
 from nsm_dna.training import calculate_training_steps
 from scripts.training.train_nsm import (
-    build_codebook_distance_tables,
     build_codebook_neighbor_tables,
     build_scale_loss_weights,
     compute_losses,
     corrupt_context_indices,
     evaluate,
-    geometry_loss,
     prepare_block_predictions,
     rollout_hierarchy,
+    soft_conditioning_probability,
 )
 
 
@@ -109,7 +108,7 @@ def test_context_corruption_uses_nearby_codes() -> None:
     torch.testing.assert_close(context[0], torch.tensor([[0, 1, 2]]))
 
 
-def test_loss_combines_hierarchy_and_geometry() -> None:
+def test_loss_weights_exact_classification_by_scale() -> None:
     targets_by_scale = [
         torch.tensor([[0], [1]]),
         torch.tensor([[1, 2], [2, 3]]),
@@ -121,14 +120,10 @@ def test_loss_combines_hierarchy_and_geometry() -> None:
         torch.randn(2, 4, 4),
     ]
     scale_weights = torch.tensor([0.2, 0.3, 0.5])
-    batch_geometry_loss = torch.tensor(0.7)
-    geometry_weight = 1.0
     losses = compute_losses(
         logits_by_scale,
         targets_by_scale,
         scale_weights,
-        batch_geometry_loss,
-        geometry_weight,
     )
 
     expected_losses = torch.stack(
@@ -146,15 +141,16 @@ def test_loss_combines_hierarchy_and_geometry() -> None:
 
     expected_hierarchy = torch.sum(expected_losses * scale_weights)
     torch.testing.assert_close(losses.hierarchy_by_scale, expected_losses)
-    torch.testing.assert_close(losses.hierarchy, expected_hierarchy)
-    torch.testing.assert_close(
-        losses.geometry,
-        batch_geometry_loss,
-    )
-    torch.testing.assert_close(
-        losses.total,
-        expected_hierarchy + geometry_weight * batch_geometry_loss,
-    )
+    torch.testing.assert_close(losses.total, expected_hierarchy)
+
+
+def test_soft_conditioning_schedule_transitions_after_teacher_forcing() -> None:
+    total_steps = 100
+    num_epochs = 10
+
+    assert soft_conditioning_probability(10, total_steps, num_epochs, 1, 2) == 0
+    assert soft_conditioning_probability(21, total_steps, num_epochs, 1, 2) == 0.5
+    assert soft_conditioning_probability(31, total_steps, num_epochs, 1, 2) == 1
 
 
 def test_tokenizer_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
@@ -235,21 +231,10 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
         indices_by_scale[:-1],
         prefix_by_scale=prediction.prefix_by_scale,
     )
-    distance_tables = build_codebook_distance_tables(
-        [codebook.codebook for codebook in tokenizer.quantizer.codebooks]
-    )
-    batch_geometry_loss = geometry_loss(
-        output.hierarchy_logits,
-        indices_by_scale,
-        distance_tables,
-        scale_weights,
-    )
     losses = compute_losses(
         output.hierarchy_logits,
         indices_by_scale,
         scale_weights,
-        batch_geometry_loss,
-        geometry_loss_weight=1.0,
     )
     losses.total.backward()
 
@@ -261,35 +246,6 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     ]
     assert all(parameter.grad is None for parameter in tokenizer.parameters())
     assert any(parameter.grad is not None for parameter in model.parameters())
-
-
-def test_geometry_loss_backpropagates_to_every_scale() -> None:
-    tokenizer = _build_tokenizer().eval()
-    tokenizer.requires_grad_(False)
-    scale_logits = [
-        torch.randn(2, 1, 4, requires_grad=True),
-        torch.randn(2, 2, 6, requires_grad=True),
-    ]
-    targets_by_scale = [
-        torch.zeros(2, 1, dtype=torch.long),
-        torch.zeros(2, 2, dtype=torch.long),
-    ]
-    distance_tables = build_codebook_distance_tables(
-        [codebook.codebook for codebook in tokenizer.quantizer.codebooks[:2]]
-    )
-    loss = geometry_loss(
-        scale_logits,
-        targets_by_scale,
-        distance_tables,
-        scale_loss_weights=torch.tensor([0.5, 0.5]),
-    )
-    loss.backward()
-
-    assert all(logits.grad is not None for logits in scale_logits)
-    assert all(logits.grad.abs().sum() > 0 for logits in scale_logits)
-    assert all(parameter.grad is None for parameter in tokenizer.parameters())
-
-
 def test_block_prediction_uses_first_block_as_prefix_and_second_as_target() -> None:
     tokenizer = _build_tokenizer().eval()
     input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
@@ -340,18 +296,12 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
         tokenizer,
         data_loader=[{"input_ids": input_ids}],
         scale_loss_weights=scale_weights,
-        codebook_distance_tables=build_codebook_distance_tables(
-            [codebook.codebook for codebook in tokenizer.quantizer.codebooks]
-        ),
-        geometry_loss_weight=1.0,
         use_mixed_precision=False,
         rollout_max_batches=1,
     )
 
     assert model.training is True
     assert metrics["loss"] > 0
-    assert metrics["hierarchy_loss"] > 0
-    assert metrics["geometry_loss"] > 0
     assert 0 <= metrics["hierarchy_accuracy"] <= 1
     assert 0 <= metrics["nucleotide_accuracy"] <= 1
     assert metrics["rollout_nucleotide_loss"] > 0
@@ -361,7 +311,7 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
         assert 0 <= metrics[f"{section}/prediction_accuracy"] <= 1
 
 
-def test_rollout_feeds_each_prediction_back_into_the_hierarchy() -> None:
+def test_rollout_carries_soft_predictions_between_scales() -> None:
     tokenizer = _build_tokenizer().eval()
     codebook_sizes = tokenizer.codebook_sizes
 
@@ -370,25 +320,33 @@ def test_rollout_feeds_each_prediction_back_into_the_hierarchy() -> None:
             super().__init__()
             self.device_anchor = torch.nn.Parameter(torch.zeros(()))
             self.scale_lengths = tokenizer.scale_lengths
-            self.inputs: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
+            self.vectors = [
+                torch.arange(size, dtype=torch.float32).reshape(-1, 1).repeat(1, 4)
+                for size in codebook_sizes
+            ]
+            self.inputs: list[torch.Tensor | None] = []
+            self.logits: list[torch.Tensor] = []
+
+        def codebook_vectors(self, scale_index: int) -> torch.Tensor:
+            return self.vectors[scale_index]
 
         def predict_scale(
             self,
-            prefix_by_scale: list[torch.Tensor],
-            completed_scales: list[torch.Tensor],
+            prefix: torch.Tensor,
+            scale_index: int,
+            previous_scale_latent: torch.Tensor | None,
         ) -> torch.Tensor:
             self.inputs.append(
-                (
-                    [prefix.clone() for prefix in prefix_by_scale],
-                    [indices.clone() for indices in completed_scales],
-                )
+                None
+                if previous_scale_latent is None
+                else previous_scale_latent.clone()
             )
             call_index = len(self.inputs) - 1
-            scale_index = len(completed_scales)
             codebook_size = codebook_sizes[scale_index]
             scale_length = tokenizer.scale_lengths[scale_index]
             logits = torch.full((2, scale_length, codebook_size), -1.0)
             logits[:, :, (call_index + 1) % codebook_size] = 1.0
+            self.logits.append(logits)
             return logits
 
     model = StubModel()
@@ -410,14 +368,15 @@ def test_rollout_feeds_each_prediction_back_into_the_hierarchy() -> None:
         predicted_indices_by_scale[0],
         torch.ones(2, 1, dtype=torch.long),
     )
-    for actual, expected in zip(
-        model.inputs[0][0],
-        prefix_by_scale,
-        strict=True,
-    ):
-        torch.testing.assert_close(actual, expected)
-    torch.testing.assert_close(model.inputs[1][1][0], predicted_indices_by_scale[0])
+    assert model.inputs[0] is None
+    expected_first_context = (
+        model.logits[0].softmax(dim=-1) @ model.codebook_vectors(0)
+    )
+    torch.testing.assert_close(model.inputs[1], expected_first_context)
+    expected_second_context = (
+        model.logits[1].softmax(dim=-1) @ model.codebook_vectors(1)
+    )
     torch.testing.assert_close(
-        model.inputs[2][1][1],
-        predicted_indices_by_scale[1],
+        model.inputs[2],
+        expected_second_context,
     )
