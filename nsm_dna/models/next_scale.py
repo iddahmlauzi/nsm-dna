@@ -468,9 +468,7 @@ class NSM(nn.Module):
         self,
         prefix: Float[Tensor, "batch scale_length prefix_dim"],
         scale_index: int,
-        previous_scale_latent: Float[
-            Tensor, "batch previous_scale_length prefix_dim"
-        ]
+        previous_scale_latent: Float[Tensor, "batch previous_scale_length prefix_dim"]
         | None,
     ) -> Float[Tensor, "batch scale_length codebook_size"]:
         """Predict one scale from its matching prefix and preceding-scale latent."""
@@ -537,41 +535,6 @@ class NSM(nn.Module):
         hidden_states = self.final_norm(hidden_states[:, scale_length:])
         return self.output_head.predict_scale(hidden_states, scale_index)
 
-    def _predict_soft_conditioned_hierarchy(
-        self,
-        context_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
-        prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
-        soft_conditioning_probability: float,
-    ) -> list[Float[Tensor, "batch scale_length codebook_size"]]:
-        """Predict scales sequentially, optionally retaining predicted uncertainty."""
-        logits_by_scale = []
-        previous_scale_latent = None
-
-        for scale_index, prefix in enumerate(prefix_by_scale):
-            scale_logits = self._predict_scale_from_context(
-                prefix,
-                scale_index,
-                previous_scale_latent,
-            )
-            logits_by_scale.append(scale_logits)
-            if scale_index == len(self.scale_lengths) - 1:
-                continue
-
-            codebook_vectors = self.codebook_vectors(scale_index)
-            use_soft_context = (
-                torch.rand((), device=scale_logits.device)
-                < soft_conditioning_probability
-            )
-            if use_soft_context:
-                probabilities = scale_logits.float().softmax(dim=-1).detach()
-                previous_scale_latent = probabilities @ codebook_vectors
-            else:
-                previous_scale_latent = codebook_vectors[
-                    context_indices_by_scale[scale_index]
-                ]
-
-        return logits_by_scale
-
     def _encode_packed(
         self,
         prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
@@ -636,17 +599,7 @@ class NSM(nn.Module):
         context_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
         *,
         prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
-        soft_conditioning_probability: float = 0.0,
     ) -> NSMOutput:
-        if soft_conditioning_probability > 0:
-            return NSMOutput(
-                hierarchy_logits=self._predict_soft_conditioned_hierarchy(
-                    context_indices_by_scale,
-                    prefix_by_scale,
-                    soft_conditioning_probability,
-                )
-            )
-
         hidden_states = self.encode(
             context_indices_by_scale,
             prefix_by_scale=prefix_by_scale,
@@ -661,9 +614,7 @@ class NSM(nn.Module):
         self,
         prefix: Float[Tensor, "batch scale_length prefix_dim"],
         scale_index: int,
-        previous_scale_latent: Float[
-            Tensor, "batch previous_scale_length prefix_dim"
-        ]
+        previous_scale_latent: Float[Tensor, "batch previous_scale_length prefix_dim"]
         | None,
     ) -> Float[Tensor, "batch scale_length codebook_size"]:
         """Predict one scale from continuous preceding-scale context."""

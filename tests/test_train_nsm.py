@@ -11,11 +11,12 @@ from scripts.training.train_nsm import (
     build_codebook_neighbor_tables,
     build_scale_loss_weights,
     compute_losses,
+    compute_student_consistency_loss,
     corrupt_context_indices,
     evaluate,
     prepare_block_predictions,
     rollout_hierarchy,
-    soft_conditioning_probability,
+    student_consistency_is_active,
 )
 
 
@@ -144,13 +145,32 @@ def test_loss_weights_exact_classification_by_scale() -> None:
     torch.testing.assert_close(losses.total, expected_hierarchy)
 
 
-def test_soft_conditioning_schedule_transitions_after_teacher_forcing() -> None:
-    total_steps = 100
-    num_epochs = 10
+def test_student_consistency_matches_teacher_without_updating_teacher() -> None:
+    teacher_logits = [
+        torch.randn(2, 1, 4, requires_grad=True),
+        torch.randn(2, 2, 6, requires_grad=True),
+        torch.randn(2, 4, 8, requires_grad=True),
+    ]
+    student_logits = [
+        logits.detach().clone().requires_grad_() for logits in teacher_logits
+    ]
 
-    assert soft_conditioning_probability(10, total_steps, num_epochs, 1, 2) == 0
-    assert soft_conditioning_probability(21, total_steps, num_epochs, 1, 2) == 0.5
-    assert soft_conditioning_probability(31, total_steps, num_epochs, 1, 2) == 1
+    loss = compute_student_consistency_loss(
+        student_logits,
+        teacher_logits,
+        torch.tensor([0.2, 0.3, 0.5]),
+    )
+    loss.backward()
+
+    torch.testing.assert_close(loss, torch.zeros_like(loss), atol=1e-6, rtol=0)
+    assert all(logits.grad is None for logits in teacher_logits)
+    assert all(logits.grad is not None for logits in student_logits)
+    assert torch.count_nonzero(student_logits[0].grad) == 0
+
+
+def test_student_consistency_starts_after_warmup_epoch() -> None:
+    assert not student_consistency_is_active(20, 100, 5, start_epoch=1)
+    assert student_consistency_is_active(21, 100, 5, start_epoch=1)
 
 
 def test_tokenizer_checkpoint_is_restored_and_frozen(tmp_path: Path) -> None:
@@ -311,7 +331,7 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
         assert 0 <= metrics[f"{section}/prediction_accuracy"] <= 1
 
 
-def test_rollout_carries_soft_predictions_between_scales() -> None:
+def test_rollout_carries_hard_predictions_between_scales() -> None:
     tokenizer = _build_tokenizer().eval()
     codebook_sizes = tokenizer.codebook_sizes
 
@@ -369,13 +389,13 @@ def test_rollout_carries_soft_predictions_between_scales() -> None:
         torch.ones(2, 1, dtype=torch.long),
     )
     assert model.inputs[0] is None
-    expected_first_context = (
-        model.logits[0].softmax(dim=-1) @ model.codebook_vectors(0)
-    )
+    expected_first_context = model.codebook_vectors(0)[
+        predicted_indices_by_scale[0]
+    ]
     torch.testing.assert_close(model.inputs[1], expected_first_context)
-    expected_second_context = (
-        model.logits[1].softmax(dim=-1) @ model.codebook_vectors(1)
-    )
+    expected_second_context = model.codebook_vectors(1)[
+        predicted_indices_by_scale[1]
+    ]
     torch.testing.assert_close(
         model.inputs[2],
         expected_second_context,

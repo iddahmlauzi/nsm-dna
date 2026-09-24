@@ -359,29 +359,3 @@ def test_packed_teacher_forcing_matches_scale_by_scale_prediction() -> None:
             scale_logits,
             teacher_forced_logits[scale_index],
         )
-
-
-def test_soft_conditioning_uses_predictions_instead_of_true_context() -> None:
-    torch.manual_seed(0)
-    model = _build_model(num_layers=1).eval()
-    prefix_by_scale = _prefix_by_scale()
-    indices_by_scale = _indices()
-    changed_indices = [indices.clone() for indices in indices_by_scale]
-    for scale_index, codebook_size in enumerate(model.codebook_sizes[:-1]):
-        changed_indices[scale_index] = (
-            changed_indices[scale_index] + 1
-        ) % codebook_size
-
-    logits = model(
-        indices_by_scale[:-1],
-        prefix_by_scale=prefix_by_scale,
-        soft_conditioning_probability=1.0,
-    ).hierarchy_logits
-    changed_logits = model(
-        changed_indices[:-1],
-        prefix_by_scale=prefix_by_scale,
-        soft_conditioning_probability=1.0,
-    ).hierarchy_logits
-
-    for actual, expected in zip(logits, changed_logits, strict=True):
-        torch.testing.assert_close(actual, expected)

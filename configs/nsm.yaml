@@ -12,7 +12,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: nsm
-  name: nsm-384-triplet-k64-unbiased-coarse-soft-conditioning
+  name: nsm-384-triplet-k64-two-pass-consistency-warmup1
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -55,16 +55,14 @@ optimizer:
 objective:
   # Alpha 1 gives every hierarchy scale equal weight.
   scale_loss_alpha: 1
+  student_consistency_weight: 1
 
 mixed_precision:
   enabled: true
 
 training:
-  num_epochs: 10
-  # Learn exact scale predictions before replacing true preceding codes with
-  # detached probability-weighted codebook vectors.
-  teacher_forcing_epochs: 1
-  soft_conditioning_transition_epochs: 2
+  num_epochs: 5
+  student_consistency_start_epoch: 1
   # Set an integer here to override the epoch-derived training length.
   max_steps: null
   log_interval: 10
@@ -76,7 +74,7 @@ training:
 evaluation:
   interval: 1_000
   max_batches: 10
-  # Sequential soft rollout is more expensive than teacher forcing.
+  # Sequential rollout is more expensive than teacher forcing.
   rollout_max_batches: 1
 
 checkpoint:

@@ -159,19 +159,45 @@ def compute_losses(
     )
 
 
-def soft_conditioning_probability(
+def compute_student_consistency_loss(
+    student_logits_by_scale: list[Tensor],
+    teacher_logits_by_scale: list[Tensor],
+    scale_loss_weights: Tensor,
+) -> Tensor:
+    """Match student predictions to detached teacher distributions."""
+    consistency_by_scale = torch.stack(
+        [
+            F.kl_div(
+                student_logits.float().log_softmax(dim=-1),
+                teacher_logits.detach().float().softmax(dim=-1),
+                reduction="none",
+            )
+            .sum(dim=-1)
+            .mean()
+            for student_logits, teacher_logits in zip(
+                student_logits_by_scale,
+                teacher_logits_by_scale,
+                strict=True,
+            )
+        ]
+    )
+    student_scale_weights = scale_loss_weights[1:]
+    student_scale_weights = student_scale_weights / student_scale_weights.sum()
+    consistency = (consistency_by_scale[1:] * student_scale_weights).sum()
+    # Scale 1 has no generated context, but retaining its zero-weight graph
+    # connection lets DDP reduce every output head in the student pass.
+    return consistency + 0.0 * consistency_by_scale[0]
+
+
+def student_consistency_is_active(
     step: int,
     total_steps: int,
     num_epochs: int,
-    teacher_forcing_epochs: float,
-    transition_epochs: float,
-) -> float:
-    """Transition from teacher forcing to fully predicted soft context."""
+    start_epoch: float,
+) -> bool:
+    """Return whether the teacher-only warmup has finished."""
     epoch_progress = (step - 1) * num_epochs / total_steps
-    transition_progress = (
-        epoch_progress - teacher_forcing_epochs
-    ) / transition_epochs
-    return max(0.0, min(1.0, transition_progress))
+    return epoch_progress >= start_epoch
 
 
 @torch.no_grad()
@@ -207,7 +233,7 @@ def rollout_hierarchy(
     model: NSM,
     prefix_by_scale: list[Float[Tensor, "batch scale_length vq_dim"]],
 ) -> list[Int[Tensor, "batch scale_length"]]:
-    """Generate hard outputs while carrying soft uncertainty between scales."""
+    """Generate hard codes sequentially across hierarchy scales."""
     predicted_indices_by_scale = []
     previous_scale_latent = None
 
@@ -217,11 +243,9 @@ def rollout_hierarchy(
             scale_index,
             previous_scale_latent,
         )
-        predicted_indices_by_scale.append(logits.argmax(dim=-1))
-        probabilities = logits.float().softmax(dim=-1)
-        previous_scale_latent = (
-            probabilities @ model.codebook_vectors(scale_index)
-        )
+        predicted_indices = logits.argmax(dim=-1)
+        predicted_indices_by_scale.append(predicted_indices)
+        previous_scale_latent = model.codebook_vectors(scale_index)[predicted_indices]
 
     return predicted_indices_by_scale
 
@@ -561,19 +585,19 @@ def main(config: DictConfig) -> None:
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
         should_log = step % config.training.log_interval == 0
-
-        if should_log:
-            mean_loss = torch.zeros((), device=device)
-            correct_codes = torch.zeros((), device=device, dtype=torch.long)
-            num_codes = torch.zeros((), device=device, dtype=torch.long)
-
-        conditioning_probability = soft_conditioning_probability(
+        use_student_consistency = student_consistency_is_active(
             step,
             total_steps,
             int(config.training.num_epochs),
-            float(config.training.teacher_forcing_epochs),
-            float(config.training.soft_conditioning_transition_epochs),
+            float(config.training.student_consistency_start_epoch),
         )
+
+        if should_log:
+            mean_loss = torch.zeros((), device=device)
+            mean_teacher_loss = torch.zeros((), device=device)
+            mean_student_loss = torch.zeros((), device=device)
+            correct_codes = torch.zeros((), device=device, dtype=torch.long)
+            num_codes = torch.zeros((), device=device, dtype=torch.long)
 
         for micro_step in range(gradient_accumulation_steps):
             try:
@@ -604,9 +628,10 @@ def main(config: DictConfig) -> None:
                 else:
                     synchronization_context = nullcontext()
 
-                # Average every block prediction in the optimizer step and only
-                # synchronize DDP gradients on the final backward pass.
-                with synchronization_context:
+                teacher_synchronization_context = synchronization_context
+                if use_student_consistency and distributed_environment.is_distributed:
+                    teacher_synchronization_context = training_model.no_sync()
+                with teacher_synchronization_context:
                     with torch.autocast(
                         device_type=device.type,
                         dtype=torch.bfloat16,
@@ -617,25 +642,62 @@ def main(config: DictConfig) -> None:
                             codebook_neighbor_tables,
                             context_corruption_probabilities,
                         )
-                        output = training_model(
+                        teacher_output = training_model(
                             corrupted_indices_by_scale[:-1],
                             prefix_by_scale=prediction.prefix_by_scale,
-                            soft_conditioning_probability=conditioning_probability,
                         )
-                        losses = compute_losses(
-                            output.hierarchy_logits,
+                        teacher_losses = compute_losses(
+                            teacher_output.hierarchy_logits,
                             prediction.targets_by_scale,
                             scale_loss_weights,
                         )
-                        accumulated_loss = losses.total / num_predictions_per_step
-                    accumulated_loss.backward()
+                        teacher_loss = teacher_losses.total / num_predictions_per_step
+                    teacher_loss.backward()
+
+                student_loss = torch.zeros((), device=device)
+                if use_student_consistency:
+                    predicted_context = [
+                        logits.detach().argmax(dim=-1)
+                        for logits in teacher_output.hierarchy_logits[:-1]
+                    ]
+                    with synchronization_context:
+                        with torch.autocast(
+                            device_type=device.type,
+                            dtype=torch.bfloat16,
+                            enabled=use_mixed_precision,
+                        ):
+                            student_output = training_model(
+                                predicted_context,
+                                prefix_by_scale=prediction.prefix_by_scale,
+                            )
+                            student_loss = compute_student_consistency_loss(
+                                student_output.hierarchy_logits,
+                                teacher_output.hierarchy_logits,
+                                scale_loss_weights,
+                            )
+                            weighted_student_loss = (
+                                config.objective.student_consistency_weight
+                                * student_loss
+                                / num_predictions_per_step
+                            )
+                        weighted_student_loss.backward()
 
                 if should_log:
-                    mean_loss += losses.total.detach() / num_predictions_per_step
+                    mean_teacher_loss += (
+                        teacher_losses.total.detach() / num_predictions_per_step
+                    )
+                    mean_student_loss += (
+                        student_loss.detach() / num_predictions_per_step
+                    )
+                    mean_loss += (
+                        teacher_losses.total.detach()
+                        + config.objective.student_consistency_weight
+                        * student_loss.detach()
+                    ) / num_predictions_per_step
 
                     with torch.no_grad():
                         for scale_logits, scale_targets in zip(
-                            output.hierarchy_logits,
+                            teacher_output.hierarchy_logits,
                             prediction.targets_by_scale,
                             strict=True,
                         ):
@@ -658,11 +720,15 @@ def main(config: DictConfig) -> None:
             if distributed_environment.is_distributed:
                 for values in (
                     mean_loss,
+                    mean_teacher_loss,
+                    mean_student_loss,
                     correct_codes,
                     num_codes,
                 ):
                     dist.all_reduce(values, op=dist.ReduceOp.SUM)
                 mean_loss /= distributed_environment.world_size
+                mean_teacher_loss /= distributed_environment.world_size
+                mean_student_loss /= distributed_environment.world_size
 
             if distributed_environment.is_main_process:
                 hierarchy_accuracy = (correct_codes / num_codes).item()
@@ -674,8 +740,9 @@ def main(config: DictConfig) -> None:
                 if wandb_run is not None:
                     wandb_metrics = {
                         "train/loss": mean_loss.item(),
+                        "train/teacher_loss": mean_teacher_loss.item(),
+                        "train/student_consistency_loss": mean_student_loss.item(),
                         "train/hierarchy_accuracy": hierarchy_accuracy,
-                        "train/soft_conditioning_probability": conditioning_probability,
                         "train/gradient_norm": gradient_norm.item(),
                         "train/learning_rate": learning_rate,
                     }
