@@ -114,36 +114,8 @@ class EMACodebook(nn.Module):
         return self.codebook_hits.float().mean()
 
 
-class _LearnedDownsamplingBlock(nn.Module):
-    """Combine each ordered pair of latent positions into one parent."""
-
-    def __init__(self, quantization_dim: int) -> None:
-        super().__init__()
-
-        self.convolution = nn.Conv1d(
-            in_channels=quantization_dim,
-            out_channels=quantization_dim,
-            kernel_size=2,
-            stride=2,
-            bias=False,
-        )
-        self.norm = nn.LayerNorm(
-            quantization_dim,
-            elementwise_affine=False,
-        )
-
-    def forward(
-        self,
-        latent: Float[Tensor, "batch length quantization_dim"],
-    ) -> Float[Tensor, "batch reduced_length quantization_dim"]:
-        latent = einx.id("b l d -> b d l", latent)
-        latent = self.convolution(latent)
-        latent = einx.id("b d l -> b l d", latent)
-        return self.norm(latent)
-
-
-class MultiscaleVectorQuantizer(nn.Module):
-    """Quantize a learned coarse-to-fine hierarchy of encoder latents."""
+class ResidualVectorQuantizer(nn.Module):
+    """Quantize a block-local mean-and-detail hierarchy."""
 
     def __init__(
         self,
@@ -162,14 +134,21 @@ class MultiscaleVectorQuantizer(nn.Module):
         self.quantization_dim = quantization_dim
         self.latent_length = latent_length
 
-        # The encoder supplies scale 128 directly. Learned reductions then build
-        # the remaining hierarchy: 128 → 64 → 32 → 16 → 8 → 4 → 2 → 1.
-        self.downsampled_lengths = list(reversed(self.scale_lengths[:-1]))
+        expected_scale_lengths = []
+        scale_length = 1
+        while scale_length <= self.latent_length:
+            expected_scale_lengths.append(scale_length)
+            scale_length *= 2
+        if self.scale_lengths != expected_scale_lengths:
+            raise ValueError(
+                "scale_lengths must double from 1 through latent_length."
+            )
+        if len(self.codebook_sizes) != len(self.scale_lengths):
+            raise ValueError("Each hierarchy scale requires one codebook size.")
 
-        self.downsamplers = nn.ModuleList(
-            _LearnedDownsamplingBlock(self.quantization_dim)
-            for _ in self.downsampled_lengths
-        )
+        # Scale 1 stores one regional mean. Every later scale stores one detail
+        # for each parent, so one code reconstructs both of the parent's children.
+        self.code_lengths = [1, *self.scale_lengths[:-1]]
         self.codebooks = nn.ModuleList(
             EMACodebook(
                 codebook_size,
@@ -180,42 +159,72 @@ class MultiscaleVectorQuantizer(nn.Module):
             for codebook_size in codebook_sizes
         )
 
-    def downsample_to_scales(
+    def mean_pool_to_scales(
         self,
-        fine_latent: Float[Tensor, "batch length quantization_dim"],
-        hierarchy_latent: Float[Tensor, "batch length quantization_dim"],
+        latent: Float[Tensor, "batch latent_length quantization_dim"],
     ) -> list[Float[Tensor, "batch scale_length quantization_dim"]]:
-        """Build coarse scales from the unbiased hierarchy representation."""
-        latents_by_length = {self.latent_length: fine_latent}
-        current_latent = hierarchy_latent
-
-        for scale_length, downsampler in zip(
-            self.downsampled_lengths,
-            self.downsamplers,
-            strict=True,
-        ):
-            current_latent = downsampler(current_latent)
-            latents_by_length[scale_length] = current_latent
+        """Return deterministic block means from coarse to fine."""
+        latents_by_length = {self.latent_length: latent}
+        current_latent = latent
+        while current_latent.shape[1] > 1:
+            current_latent = current_latent.reshape(
+                current_latent.shape[0],
+                current_latent.shape[1] // 2,
+                2,
+                current_latent.shape[2],
+            ).mean(dim=2)
+            latents_by_length[current_latent.shape[1]] = current_latent
 
         return [latents_by_length[length] for length in self.scale_lengths]
 
-    def upsample_to_full_length(
+    def decompose(
         self,
-        quantized: Float[Tensor, "batch scale_length quantization_dim"],
-        scale_index: int,
-    ) -> Float[Tensor, "batch length quantization_dim"]:
-        """Repeat each scale vector across its corresponding latent block."""
-        scale_length = self.scale_lengths[scale_index]
-        if scale_length == self.latent_length:
-            return quantized
+        latent: Float[Tensor, "batch latent_length quantization_dim"],
+    ) -> list[Float[Tensor, "batch code_length quantization_dim"]]:
+        """Return the regional mean followed by left-child detail vectors."""
+        means_by_scale = self.mean_pool_to_scales(latent)
+        coefficients = [means_by_scale[0]]
+        for parent_mean, child_means in zip(
+            means_by_scale,
+            means_by_scale[1:],
+            strict=False,
+        ):
+            coefficients.append(child_means[:, 0::2] - parent_mean)
+        return coefficients
 
-        repeats_per_position = self.latent_length // scale_length
-        return quantized.repeat_interleave(repeats_per_position, dim=1)
+    @staticmethod
+    def _split_parents(
+        parents: Float[Tensor, "batch parent_length quantization_dim"],
+        details: Float[Tensor, "batch parent_length quantization_dim"],
+    ) -> Float[Tensor, "batch child_length quantization_dim"]:
+        """Reconstruct ordered children while preserving every parent mean."""
+        children = torch.stack((parents + details, parents - details), dim=2)
+        return children.flatten(1, 2)
+
+    def _expand_to_latent_length(
+        self,
+        latent: Float[Tensor, "batch scale_length quantization_dim"],
+    ) -> Float[Tensor, "batch latent_length quantization_dim"]:
+        repeats_per_position = self.latent_length // latent.shape[1]
+        return latent.repeat_interleave(repeats_per_position, dim=1)
+
+    def reconstruct_coefficients(
+        self,
+        coefficients: list[Float[Tensor, "batch code_length quantization_dim"]],
+    ) -> list[Float[Tensor, "batch latent_length quantization_dim"]]:
+        """Return the cumulative full-length reconstruction at every scale."""
+        reconstruction = coefficients[0]
+        cumulative_latents = [self._expand_to_latent_length(reconstruction)]
+        for details in coefficients[1:]:
+            reconstruction = self._split_parents(reconstruction, details)
+            cumulative_latents.append(
+                self._expand_to_latent_length(reconstruction)
+            )
+        return cumulative_latents
 
     def forward(
         self,
-        fine_latent: Float[Tensor, "batch length quantization_dim"],
-        hierarchy_latent: Float[Tensor, "batch length quantization_dim"],
+        latent: Float[Tensor, "batch latent_length quantization_dim"],
         *,
         include_partial_reconstruction: bool = False,
     ) -> tuple[
@@ -223,13 +232,12 @@ class MultiscaleVectorQuantizer(nn.Module):
         Float[Tensor, "batch length quantization_dim"] | None,
         list[Int[Tensor, "batch scale_length"]],
     ]:
-        """Quantize learned views of the continuous latent at coarse scales.
+        """Quantize the regional mean and every spatial detail scale.
 
         When partial reconstruction is enabled and a non-final scale exists,
-        return one randomly selected scale latent for auxiliary reconstruction.
+        return one randomly selected cumulative latent for auxiliary reconstruction.
         """
-        fine_latent = fine_latent.float()
-        hierarchy_latent = hierarchy_latent.float()
+        latent = latent.float()
 
         partial_scale_index = None
         if include_partial_reconstruction and len(self.scale_lengths) > 1:
@@ -240,64 +248,48 @@ class MultiscaleVectorQuantizer(nn.Module):
             ).item()
 
         indices_by_scale: list[Int[Tensor, "batch scale_length"]] = []
-        quantized_latents_by_scale: list[Tensor] = []
-        partial_quantized_latent: Tensor | None = None
-        latents_by_scale = self.downsample_to_scales(
-            fine_latent,
-            hierarchy_latent,
+        quantized_coefficients: list[Tensor] = []
+        coefficients = self.decompose(latent)
+
+        for coefficient, codebook in zip(
+            coefficients,
+            self.codebooks,
+            strict=True,
+        ):
+            quantized, scale_indices = codebook(coefficient)
+            indices_by_scale.append(scale_indices)
+            quantized_coefficients.append(
+                coefficient + (quantized - coefficient).detach()
+            )
+
+        cumulative_latents = self.reconstruct_coefficients(quantized_coefficients)
+        partial_quantized_latent = (
+            cumulative_latents[partial_scale_index]
+            if partial_scale_index is not None
+            else None
         )
 
-        for scale_index, (scale_latent, codebook) in enumerate(
-            zip(latents_by_scale, self.codebooks, strict=True)
-        ):
-            quantized_at_scale, scale_indices = codebook(scale_latent)
-            indices_by_scale.append(scale_indices)
-
-            # Backpropagate reconstruction through the learned downsampling path
-            # that produced the codebook input.
-            quantized_with_gradient = (
-                scale_latent + (quantized_at_scale - scale_latent).detach()
-            )
-            expanded_quantized_latent = self.upsample_to_full_length(
-                quantized_with_gradient, scale_index
-            )
-            quantized_latents_by_scale.append(expanded_quantized_latent)
-
-            if scale_index == partial_scale_index:
-                partial_quantized_latent = expanded_quantized_latent
-
         return (
-            quantized_latents_by_scale[-1],
+            cumulative_latents[-1],
             partial_quantized_latent,
             indices_by_scale,
         )
 
     @torch.no_grad()
-    def indices_to_scale_latent(
-        self,
-        scale_indices: Int[Tensor, "batch scale_length"],
-        scale_index: int,
-    ) -> Float[Tensor, "batch length quantization_dim"]:
-        """Expand one scale's code vectors to the full latent length."""
-        codebook = self.codebooks[scale_index]
-        return self.upsample_to_full_length(
-            codebook.codebook[scale_indices], scale_index
-        )
-
-    @torch.no_grad()
-    def indices_to_scale_latents(
+    def indices_to_cumulative_latents(
         self,
         indices_by_scale: list[Int[Tensor, "batch scale_length"]],
     ) -> list[Float[Tensor, "batch length quantization_dim"]]:
-        """Expand each scale's codes without combining them with other scales."""
-        scale_latents: list[Tensor] = []
-
-        for scale_index, scale_indices in enumerate(indices_by_scale):
-            scale_latents.append(
-                self.indices_to_scale_latent(scale_indices, scale_index)
+        """Reconstruct the latent after each successive code scale."""
+        coefficients = [
+            codebook.codebook[scale_indices]
+            for codebook, scale_indices in zip(
+                self.codebooks,
+                indices_by_scale,
+                strict=True,
             )
-
-        return scale_latents
+        ]
+        return self.reconstruct_coefficients(coefficients)
 
     @property
     def utilization_by_scale(self) -> list[Float[Tensor, ""]]:

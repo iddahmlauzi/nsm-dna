@@ -70,6 +70,7 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
         prefix_dim=4,
         model_dim=8,
         scale_lengths=[1, 2, 4],
+        code_lengths=[1, 1, 2],
         codebook_sizes=[4, 6, 16],
         codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(16, 4)],
         target_length=8,
@@ -87,7 +88,6 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
     for prediction in prepare_block_predictions(
         tokenizer,
         input_ids,
-        model.scale_lengths,
     ):
         output = model(
             prediction.targets_by_scale[:-1],
@@ -124,6 +124,7 @@ def test_sequence_score_requires_prefix() -> None:
         prefix_dim=4,
         model_dim=8,
         scale_lengths=[1, 2, 4],
+        code_lengths=[1, 1, 2],
         codebook_sizes=[4, 6, 16],
         codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(16, 4)],
         target_length=8,

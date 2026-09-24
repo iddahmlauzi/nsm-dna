@@ -20,6 +20,7 @@ def test_window_encoder_pools_prefix_and_finest_scale_states() -> None:
 
     class StubModel(nn.Module):
         scale_lengths = [1]
+        code_lengths = [1]
         prefix_length = 1
 
         def encode(

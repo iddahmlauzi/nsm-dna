@@ -26,26 +26,6 @@ class NSMOutput:
     nucleotide_logits: Float[Tensor, "batch target_length vocab_size"]
 
 
-def tokenizer_scale_indices(
-    tokenizer_scale_lengths: list[int],
-    selected_scale_lengths: list[int],
-) -> list[int]:
-    """Locate an ordered NSM hierarchy within the tokenizer hierarchy."""
-    try:
-        indices = [
-            tokenizer_scale_lengths.index(length)
-            for length in selected_scale_lengths
-        ]
-    except ValueError as error:
-        raise ValueError("Every NSM scale must exist in the tokenizer.") from error
-
-    if indices != sorted(set(indices)):
-        raise ValueError("NSM scales must follow tokenizer order without duplicates.")
-    if not indices or indices[-1] != len(tokenizer_scale_lengths) - 1:
-        raise ValueError("The NSM hierarchy must include the finest tokenizer scale.")
-    return indices
-
-
 class _ResidualOutputHeadBlock(nn.Module):
     """Learn a widened squared-ReLU correction to model-space hidden states."""
 
@@ -144,13 +124,14 @@ class MultiscaleOutputHead(nn.Module):
 
 
 class NSM(nn.Module):
-    """Predict absolute-scale codes from a latent prefix and earlier target codes."""
+    """Predict a mean-and-detail hierarchy from a continuous latent prefix."""
 
     def __init__(
         self,
         prefix_dim: int,
         model_dim: int,
         scale_lengths: list[int],
+        code_lengths: list[int],
         codebook_sizes: list[int],
         codebook_vectors: list[Tensor],
         target_length: int,
@@ -170,6 +151,7 @@ class NSM(nn.Module):
         self.prefix_dim = prefix_dim
         self.model_dim = model_dim
         self.scale_lengths = list(scale_lengths)
+        self.code_lengths = list(code_lengths)
         self.codebook_sizes = list(codebook_sizes)
         self.target_length = target_length
         self.vocab_size = vocab_size
@@ -178,6 +160,14 @@ class NSM(nn.Module):
         self.use_qk_norm = use_qk_norm
         self.rope_base = rope_base
         self.prefix_length = sum(self.scale_lengths)
+        self.hierarchy_length = sum(self.code_lengths)
+
+        expected_code_lengths = [1, *self.scale_lengths[:-1]]
+        if self.code_lengths != expected_code_lengths:
+            raise ValueError(
+                "Residual code lengths must contain one mean followed by one "
+                "detail per parent position."
+            )
 
         # The model receives codebook indices as inputs, but needs the actual
         # codebook vectors to condition the next scale. Store the tokenizer's
@@ -223,10 +213,10 @@ class NSM(nn.Module):
         )
         hierarchy_positions = torch.cat(
             [
-                (torch.arange(scale_length, dtype=torch.float32) + 0.5)
-                * (finest_scale_length / scale_length)
+                (torch.arange(code_length, dtype=torch.float32) + 0.5)
+                * (finest_scale_length / code_length)
                 - 0.5
-                for scale_length in self.scale_lengths
+                for code_length in self.code_lengths
             ]
         )
         nucleotide_positions = (
@@ -303,7 +293,7 @@ class NSM(nn.Module):
         self.final_norm = RMSNorm(self.model_dim, eps=1e-5)
         self.output_head = MultiscaleOutputHead(
             self.model_dim,
-            self.scale_lengths,
+            self.code_lengths,
             self.codebook_sizes,
             num_blocks=head_num_blocks,
             hidden_multiplier=head_hidden_multiplier,
@@ -337,25 +327,14 @@ class NSM(nn.Module):
     @classmethod
     def from_config(cls, config: DictConfig, tokenizer: "VQVAE") -> "NSM":
         """Build NSM-DNA from an experiment configuration and its tokenizer."""
-        scale_lengths = (
-            list(config.model.scale_lengths)
-            if config.model.scale_lengths is not None
-            else list(tokenizer.scale_lengths)
-        )
-        scale_indices = tokenizer_scale_indices(
-            tokenizer.scale_lengths,
-            scale_lengths,
-        )
         return cls(
             prefix_dim=tokenizer.quantization_dim,
             model_dim=config.model.model_dim,
-            scale_lengths=scale_lengths,
-            codebook_sizes=[
-                tokenizer.codebook_sizes[index] for index in scale_indices
-            ],
+            scale_lengths=tokenizer.scale_lengths,
+            code_lengths=tokenizer.code_lengths,
+            codebook_sizes=tokenizer.codebook_sizes,
             codebook_vectors=[
-                tokenizer.quantizer.codebooks[index].codebook
-                for index in scale_indices
+                codebook.codebook for codebook in tokenizer.quantizer.codebooks
             ],
             target_length=tokenizer.context_length,
             vocab_size=tokenizer.vocab_size,
@@ -401,26 +380,37 @@ class NSM(nn.Module):
         completed_scales: list[Int[Tensor, "batch scale_length"]],
         batch_size: int,
     ) -> Float[Tensor, "batch length model_dim"]:
-        """Build BOS and repeated prior-scale blocks for parallel prediction."""
+        """Build BOS and cumulative parent states for scale prediction."""
         scale_inputs = [
-            self.bos.expand(batch_size, self.scale_lengths[0], -1)
+            self.bos.expand(batch_size, self.code_lengths[0], -1)
             + self.scale_embedding.weight[0]
         ]
 
-        for target_scale_index, source_indices in enumerate(
-            completed_scales,
-            start=1,
-        ):
-            source_scale_index = target_scale_index - 1
-            vectors = getattr(
+        reconstruction = None
+        for source_scale_index, source_indices in enumerate(completed_scales):
+            codebook = getattr(
                 self,
                 self._codebook_buffer_names[source_scale_index],
             )
-            source_inputs = self.input_projection(vectors[source_indices])
-            target_scale_length = self.scale_lengths[target_scale_index]
-            repeats_per_code = target_scale_length // source_indices.shape[1]
+            coefficient = codebook[source_indices]
+            if reconstruction is None:
+                reconstruction = coefficient
+            else:
+                reconstruction = torch.stack(
+                    (reconstruction + coefficient, reconstruction - coefficient),
+                    dim=2,
+                ).flatten(1, 2)
+
+            target_scale_index = source_scale_index + 1
+            if target_scale_index == len(self.code_lengths):
+                break
+            if reconstruction.shape[1] != self.code_lengths[target_scale_index]:
+                raise ValueError(
+                    "Completed residual scales do not reconstruct the next "
+                    "scale's parent length."
+                )
             scale_inputs.append(
-                source_inputs.repeat_interleave(repeats_per_code, dim=1)
+                self.input_projection(reconstruction)
                 + self.scale_embedding.weight[target_scale_index]
             )
 
@@ -445,7 +435,7 @@ class NSM(nn.Module):
     ) -> Bool[Tensor, "1 1 length length"]:
         """Connect each target scale to its matching prefix scale and itself."""
         input_length = self.prefix_length + sum(
-            self.scale_lengths[:num_scale_blocks]
+            self.code_lengths[:num_scale_blocks]
         )
         attention_mask = torch.zeros(
             input_length,
@@ -462,10 +452,10 @@ class NSM(nn.Module):
             prefix_blocks[scale_index] = (block_start, block_end)
             block_start = block_end
 
-        for scale_index, scale_length in enumerate(
-            self.scale_lengths[:num_scale_blocks]
+        for scale_index, code_length in enumerate(
+            self.code_lengths[:num_scale_blocks]
         ):
-            block_end = block_start + scale_length
+            block_end = block_start + code_length
             prefix_start, prefix_end = prefix_blocks[scale_index]
             attention_mask[
                 block_start:block_end,
@@ -480,7 +470,7 @@ class NSM(nn.Module):
         self,
         num_scale_blocks: int,
     ) -> RotaryEmbeddings:
-        hierarchy_length = sum(self.scale_lengths[:num_scale_blocks])
+        hierarchy_length = sum(self.code_lengths[:num_scale_blocks])
         cosine = torch.cat(
             [
                 self.prefix_rope_cosine,
@@ -554,6 +544,13 @@ class NSM(nn.Module):
                 "One context scale is required for every prediction scale "
                 "after scale 1."
             )
+        for indices, code_length in zip(
+            context_indices_by_scale,
+            self.code_lengths,
+            strict=False,
+        ):
+            if indices.shape[1] != code_length:
+                raise ValueError("Target code blocks must match residual code lengths.")
         return self._encode_packed(prefix_by_scale, context_indices_by_scale)
 
     def forward(
@@ -572,25 +569,50 @@ class NSM(nn.Module):
                 hidden_states[:, self.prefix_length :]
             ),
             nucleotide_logits=self.predict_nucleotides(
-                final_scale_indices,
+                [*context_indices_by_scale, final_scale_indices],
                 prefix_by_scale=prefix_by_scale,
             ),
         )
 
+    def _reconstruct_indices(
+        self,
+        indices_by_scale: list[Int[Tensor, "batch code_length"]],
+    ) -> Float[Tensor, "batch finest_scale_length prefix_dim"]:
+        """Reconstruct the cumulative latent represented by residual codes."""
+        if len(indices_by_scale) != len(self.code_lengths):
+            raise ValueError("Nucleotide prediction requires every residual scale.")
+
+        reconstruction = None
+        for scale_index, (indices, code_length) in enumerate(
+            zip(indices_by_scale, self.code_lengths, strict=True)
+        ):
+            if indices.shape[1] != code_length:
+                raise ValueError("Residual indices do not match their code length.")
+            codebook = getattr(self, self._codebook_buffer_names[scale_index])
+            coefficient = codebook[indices]
+            if reconstruction is None:
+                reconstruction = coefficient
+            else:
+                reconstruction = torch.stack(
+                    (reconstruction + coefficient, reconstruction - coefficient),
+                    dim=2,
+                ).flatten(1, 2)
+
+        assert reconstruction is not None
+        return reconstruction
+
     def predict_nucleotides(
         self,
-        final_scale_indices: Int[Tensor, "batch final_scale_length"],
+        indices_by_scale: list[Int[Tensor, "batch code_length"]],
         *,
         prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
     ) -> Float[Tensor, "batch target_length vocab_size"]:
-        """Predict exact nucleotides from the finest quantized scale."""
+        """Predict exact nucleotides from the cumulative quantized hierarchy."""
         finest_prefix = prefix_by_scale[-1]
-        final_vectors = getattr(self, self._codebook_buffer_names[-1])[
-            final_scale_indices
-        ]
+        cumulative_latent = self._reconstruct_indices(indices_by_scale)
         repeats_per_code = self.target_length // self.scale_lengths[-1]
         nucleotide_inputs = self.input_projection(
-            final_vectors.repeat_interleave(repeats_per_code, dim=1)
+            cumulative_latent.repeat_interleave(repeats_per_code, dim=1)
         ) + self.scale_embedding.weight[-1]
         prefix_inputs = self.input_projection(finest_prefix)
         hidden_states = torch.cat([prefix_inputs, nucleotide_inputs], dim=1)
@@ -641,7 +663,7 @@ class NSM(nn.Module):
         """Predict every code at the next scale in parallel."""
         scale_index = len(completed_scales)
         hidden_states = self._encode_packed(prefix_by_scale, completed_scales)
-        scale_length = self.scale_lengths[scale_index]
+        scale_length = self.code_lengths[scale_index]
         return self.output_head.predict_scale(
             hidden_states[:, -scale_length:], scale_index
         )

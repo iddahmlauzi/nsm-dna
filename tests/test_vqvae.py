@@ -1,14 +1,12 @@
-from itertools import product
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from nsm_dna.models.autoencoder import Decoder, Encoder
 from nsm_dna.models.common import RMSNorm
-from nsm_dna.models.quantization import MultiscaleVectorQuantizer
+from nsm_dna.models.quantization import ResidualVectorQuantizer
 from nsm_dna.models.vqvae import VQVAE
-from scripts.training.train_vqvae import evaluate, reinitialize_finest_codebook
+from scripts.training.train_vqvae import evaluate, reinitialize_codebooks
 
 
 def _build_model(*, decoder_num_layers: int = 1) -> VQVAE:
@@ -60,59 +58,22 @@ def test_zero_third_base_scale_preserves_the_first_two_base_representation() -> 
         ]
     )
 
-    fine_latent, hierarchy_latent = encoder.encode_latents(token_ids)
+    latent = encoder(token_ids)
 
-    torch.testing.assert_close(fine_latent[0], fine_latent[1])
-    assert not torch.allclose(hierarchy_latent[0], hierarchy_latent[1])
+    torch.testing.assert_close(latent[0], latent[1])
 
 
-def test_single_scale_triplet_vqvae() -> None:
-    model = VQVAE(
-        vocab_size=4,
-        context_length=9,
-        latent_length=3,
-        embed_dim=8,
-        quantization_dim=4,
-        num_heads=2,
-        scale_lengths=[3],
-        codebook_sizes=[21],
+def test_codebook_reinitialization_fits_every_coefficient_scale() -> None:
+    model = _build_model().eval()
+    input_ids = torch.randint(0, model.vocab_size, (32, model.context_length))
+
+    reinitialize_codebooks(model, input_ids, seed=0)
+
+    assert all(codebook.codebook_hits.all() for codebook in model.quantizer.codebooks)
+    assert all(
+        torch.isfinite(codebook.codebook).all()
+        for codebook in model.quantizer.codebooks
     )
-    batches = [{"input_ids": torch.randint(0, 4, (2, 9))}]
-
-    logits, partial_logits, indices_by_scale = model(
-        batches[0]["input_ids"], include_partial_reconstruction=True
-    )
-    metrics = evaluate(
-        model,
-        batches,
-        use_mixed_precision=False,
-        partial_reconstruction_weight=0.25,
-    )
-
-    assert logits.shape == (2, 9, 4)
-    assert partial_logits is None
-    assert indices_by_scale[0].shape == (2, 3)
-    assert metrics["partial_reconstruction_loss"] == 0.0
-    assert metrics["total_loss"] == metrics["full_reconstruction_loss"]
-
-
-def test_codebook_reinitialization_uses_every_code() -> None:
-    model = VQVAE(
-        vocab_size=4,
-        context_length=9,
-        latent_length=3,
-        embed_dim=8,
-        quantization_dim=16,
-        num_heads=2,
-        scale_lengths=[3],
-        codebook_sizes=[26],
-    ).eval()
-    reinitialize_finest_codebook(model, seed=0)
-    triplets = torch.tensor(list(product(range(4), repeat=3)))
-    input_ids = triplets.repeat(1, model.latent_length)
-    used_codes = model.encode_indices(input_ids)[-1].unique()
-
-    assert len(used_codes) == model.codebook_sizes[-1]
 
 
 def test_decoder_supplies_rope_to_attention() -> None:
@@ -172,7 +133,7 @@ def test_decoder_uses_configured_transformer_blocks_and_qk_norm() -> None:
 
 
 def test_quantizer_builds_and_quantizes_every_scale() -> None:
-    quantizer = MultiscaleVectorQuantizer(
+    quantizer = ResidualVectorQuantizer(
         scale_lengths=[1, 2, 4],
         codebook_sizes=[4, 6, 8],
         quantization_dim=2,
@@ -180,17 +141,17 @@ def test_quantizer_builds_and_quantizes_every_scale() -> None:
     ).eval()
     latent = torch.randn(2, 4, 2)
 
-    quantized_latent, partial_latent, indices_by_scale = quantizer(latent, latent)
+    quantized_latent, partial_latent, indices_by_scale = quantizer(latent)
 
     assert quantized_latent.shape == latent.shape
     assert partial_latent is None
     assert [indices.shape for indices in indices_by_scale] == [
         (2, 1),
+        (2, 1),
         (2, 2),
-        (2, 4),
     ]
     assert [
-        scale.shape for scale in quantizer.downsample_to_scales(latent, latent)
+        scale.shape for scale in quantizer.mean_pool_to_scales(latent)
     ] == [
         (2, 1, 2),
         (2, 2, 2),
@@ -238,10 +199,6 @@ def test_partial_reconstruction_backpropagates_through_encoder() -> None:
     assert any(
         parameter.grad is not None and parameter.grad.count_nonzero() > 0
         for parameter in model.encoder.parameters()
-    )
-    assert any(
-        parameter.grad is not None and parameter.grad.count_nonzero() > 0
-        for parameter in model.quantizer.downsamplers.parameters()
     )
 
 

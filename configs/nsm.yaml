@@ -6,13 +6,13 @@ run:
 
 # The checkpoint's stored model configuration is the source of truth for the
 # tokenizer architecture, scale lengths, and codebook sizes.
-tokenizer_checkpoint: ../runs/vqvae-384-triplet-k32-fine-only-core-refinement-delayed-kmeans/checkpoints/best.pt
+tokenizer_checkpoint: ../runs/vqvae-384-triplet-residual-haar-k32-k64-restart/checkpoints/best.pt
 
 wandb:
   enabled: true
   entity: nsm-dna
   project: nsm
-  name: nsm-384-triplet-k32-unbiased-coarse-all-scales-decoder-loss025
+  name: nsm-384-triplet-residual-haar-k32-k64-geometry
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -26,9 +26,6 @@ data:
   shuffle_buffer_size: 10_000
 
 model:
-  # Set to null to use every scale stored in the tokenizer checkpoint.
-  scale_lengths: null
-
   # Match the width, depth, and head count of the GPT-2 small backbone.
   model_dim: 768
   num_layers: 12
@@ -55,8 +52,8 @@ optimizer:
 objective:
   # Alpha 1 gives every hierarchy scale equal weight.
   scale_loss_alpha: 1
-  # Reconstruct the target from straight-through predicted hierarchy codes.
-  predicted_reconstruction_loss_weight: 0.25
+  # Prefer errors whose frozen tokenizer codes are close to the correct code.
+  geometry_loss_weight: 1.0
 
 mixed_precision:
   enabled: true

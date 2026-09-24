@@ -112,7 +112,6 @@ def score_token_ids(
     for prediction in prepare_block_predictions(
         tokenizer,
         input_ids,
-        model.scale_lengths,
     ):
         with torch.autocast(
             device_type=input_ids.device.type,
@@ -140,7 +139,7 @@ def score_token_ids(
                 .double()
             )
 
-        # The final absolute scale supplies NSM's nucleotide likelihood.
+        # The cumulative hierarchy supplies NSM's nucleotide likelihood.
         nucleotide_log_probabilities = F.log_softmax(decoder_logits.float(), dim=-1)
         nucleotide_targets = prediction.target_ids
         decoder_scores += (

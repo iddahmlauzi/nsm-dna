@@ -8,12 +8,13 @@ from nsm_dna.models.next_scale import NSM
 from nsm_dna.models.vqvae import VQVAE
 from nsm_dna.training import calculate_training_steps
 from scripts.training.train_nsm import (
+    build_codebook_distance_tables,
     build_codebook_neighbor_tables,
     build_scale_loss_weights,
     compute_losses,
     corrupt_context_indices,
     evaluate,
-    predicted_reconstruction_loss,
+    geometry_loss,
     prepare_block_predictions,
     rollout_hierarchy,
 )
@@ -39,6 +40,7 @@ def _build_nsm() -> NSM:
         prefix_dim=4,
         model_dim=8,
         scale_lengths=[1, 2, 4],
+        code_lengths=[1, 1, 2],
         codebook_sizes=[4, 6, 16],
         codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(16, 4)],
         target_length=8,
@@ -124,16 +126,16 @@ def test_loss_combines_hierarchy_and_nucleotide_prediction() -> None:
     target_ids = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
     nucleotide_logits = torch.randn(2, 4, 4)
     scale_weights = torch.tensor([0.2, 0.3, 0.5])
-    reconstruction_loss = torch.tensor(0.7)
-    reconstruction_weight = 0.25
+    batch_geometry_loss = torch.tensor(0.7)
+    geometry_weight = 0.25
     losses = compute_losses(
         logits_by_scale,
         nucleotide_logits,
         targets_by_scale,
         target_ids,
         scale_weights,
-        reconstruction_loss,
-        reconstruction_weight,
+        batch_geometry_loss,
+        geometry_weight,
     )
 
     expected_losses = torch.stack(
@@ -158,14 +160,14 @@ def test_loss_combines_hierarchy_and_nucleotide_prediction() -> None:
     torch.testing.assert_close(losses.hierarchy, expected_hierarchy)
     torch.testing.assert_close(losses.nucleotide, expected_nucleotide)
     torch.testing.assert_close(
-        losses.predicted_reconstruction,
-        reconstruction_loss,
+        losses.geometry,
+        batch_geometry_loss,
     )
     torch.testing.assert_close(
         losses.total,
         expected_hierarchy
         + expected_nucleotide
-        + reconstruction_weight * reconstruction_loss,
+        + geometry_weight * batch_geometry_loss,
     )
 
 
@@ -232,7 +234,7 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     model = _build_nsm()
     input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
     scale_weights = build_scale_loss_weights(
-        tokenizer.scale_lengths,
+        tokenizer.code_lengths,
         scale_loss_alpha=0.25,
         device=torch.device("cpu"),
     )
@@ -240,7 +242,6 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     prediction = prepare_block_predictions(
         tokenizer,
         input_ids,
-        model.scale_lengths,
     )[0]
     indices_by_scale = prediction.targets_by_scale
     output = model(
@@ -248,12 +249,14 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
         indices_by_scale[-1],
         prefix_by_scale=prediction.prefix_by_scale,
     )
-    reconstruction_loss = predicted_reconstruction_loss(
-        tokenizer,
+    distance_tables = build_codebook_distance_tables(
+        [codebook.codebook for codebook in tokenizer.quantizer.codebooks]
+    )
+    batch_geometry_loss = geometry_loss(
         output.hierarchy_logits,
-        prediction.target_ids,
-        tokenizer_scale_indices=[0, 1, 2],
-        scale_index=1,
+        indices_by_scale,
+        distance_tables,
+        scale_weights,
     )
     losses = compute_losses(
         output.hierarchy_logits,
@@ -261,39 +264,43 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
         indices_by_scale,
         prediction.target_ids,
         scale_weights,
-        reconstruction_loss,
-        predicted_reconstruction_loss_weight=0.25,
+        batch_geometry_loss,
+        geometry_loss_weight=0.25,
     )
     losses.total.backward()
 
-    assert [targets.shape[1] for targets in indices_by_scale] == [1, 2, 4]
+    assert [targets.shape[1] for targets in indices_by_scale] == tokenizer.code_lengths
     assert [logits.shape for logits in output.hierarchy_logits] == [
         (2, 1, 4),
-        (2, 2, 6),
-        (2, 4, 16),
+        (2, 1, 6),
+        (2, 2, 16),
     ]
     assert output.nucleotide_logits.shape == (*prediction.target_ids.shape, 4)
     assert all(parameter.grad is None for parameter in tokenizer.parameters())
     assert any(parameter.grad is not None for parameter in model.parameters())
 
 
-def test_predicted_reconstruction_backpropagates_through_hard_codes() -> None:
+def test_geometry_loss_prefers_nearby_codes_and_backpropagates() -> None:
     tokenizer = _build_tokenizer().eval()
     tokenizer.requires_grad_(False)
-    scale_logits = torch.randn(2, 2, 6, requires_grad=True)
-    target_ids = torch.arange(2 * 8).reshape(2, 8) % 4
-
-    loss = predicted_reconstruction_loss(
-        tokenizer,
-        logits_by_scale=[scale_logits],
-        target_ids=target_ids,
-        tokenizer_scale_indices=[1],
-        scale_index=0,
+    scale_logits = [
+        torch.randn(2, 1, 4, requires_grad=True),
+        torch.randn(2, 1, 6, requires_grad=True),
+    ]
+    targets_by_scale = [torch.zeros(2, 1, dtype=torch.long)] * 2
+    distance_tables = build_codebook_distance_tables(
+        [codebook.codebook for codebook in tokenizer.quantizer.codebooks[:2]]
+    )
+    loss = geometry_loss(
+        scale_logits,
+        targets_by_scale,
+        distance_tables,
+        scale_loss_weights=torch.tensor([0.5, 0.5]),
     )
     loss.backward()
 
-    assert scale_logits.grad is not None
-    assert scale_logits.grad.abs().sum() > 0
+    assert all(logits.grad is not None for logits in scale_logits)
+    assert all(logits.grad.abs().sum() > 0 for logits in scale_logits)
     assert all(parameter.grad is None for parameter in tokenizer.parameters())
 
 
@@ -302,22 +309,16 @@ def test_block_prediction_uses_first_block_as_prefix_and_second_as_target() -> N
     input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
     prefix_ids = input_ids[:, :8]
     target_ids = input_ids[:, 8:]
-    selected_scale_lengths = [
-        tokenizer.scale_lengths[0],
-        tokenizer.scale_lengths[-1],
-    ]
-
     block_predictions = prepare_block_predictions(
         tokenizer,
         input_ids,
-        selected_scale_lengths,
     )
     assert len(block_predictions) == 1
 
     prediction = block_predictions[0]
     torch.testing.assert_close(prediction.target_ids, target_ids)
     tokenizer_prefix = tokenizer.encode_scales(prefix_ids)
-    expected_prefix = [tokenizer_prefix[0], tokenizer_prefix[-1]]
+    expected_prefix = tokenizer_prefix
     for actual, expected in zip(
         prediction.prefix_by_scale,
         expected_prefix,
@@ -326,7 +327,7 @@ def test_block_prediction_uses_first_block_as_prefix_and_second_as_target() -> N
         torch.testing.assert_close(actual, expected)
 
     tokenizer_targets = tokenizer.encode_indices(target_ids)
-    expected_targets = [tokenizer_targets[0], tokenizer_targets[-1]]
+    expected_targets = tokenizer_targets
     for actual, expected in zip(prediction.targets_by_scale, expected_targets):
         torch.testing.assert_close(actual, expected)
 
@@ -337,7 +338,7 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
     model = _build_nsm()
     input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
     scale_weights = build_scale_loss_weights(
-        tokenizer.scale_lengths,
+        tokenizer.code_lengths,
         scale_loss_alpha=0.25,
         device=torch.device("cpu"),
     )
@@ -347,7 +348,10 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
         tokenizer,
         data_loader=[{"input_ids": input_ids}],
         scale_loss_weights=scale_weights,
-        predicted_reconstruction_loss_weight=0.25,
+        codebook_distance_tables=build_codebook_distance_tables(
+            [codebook.codebook for codebook in tokenizer.quantizer.codebooks]
+        ),
+        geometry_loss_weight=0.25,
         use_mixed_precision=False,
         rollout_max_batches=1,
     )
@@ -356,7 +360,7 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
     assert metrics["loss"] > 0
     assert metrics["hierarchy_loss"] > 0
     assert metrics["nucleotide_loss"] > 0
-    assert metrics["predicted_reconstruction_loss"] > 0
+    assert metrics["geometry_loss"] > 0
     assert 0 <= metrics["hierarchy_accuracy"] <= 1
     assert 0 <= metrics["nucleotide_accuracy"] <= 1
     assert metrics["rollout_nucleotide_loss"] > 0
@@ -375,6 +379,7 @@ def test_rollout_feeds_each_prediction_back_into_the_hierarchy() -> None:
             super().__init__()
             self.device_anchor = torch.nn.Parameter(torch.zeros(()))
             self.scale_lengths = tokenizer.scale_lengths
+            self.code_lengths = tokenizer.code_lengths
             self.inputs: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
 
         def predict_scale(
@@ -391,7 +396,7 @@ def test_rollout_feeds_each_prediction_back_into_the_hierarchy() -> None:
             call_index = len(self.inputs) - 1
             scale_index = len(completed_scales)
             codebook_size = codebook_sizes[scale_index]
-            scale_length = tokenizer.scale_lengths[scale_index]
+            scale_length = tokenizer.code_lengths[scale_index]
             logits = torch.full((2, scale_length, codebook_size), -1.0)
             logits[:, :, (call_index + 1) % codebook_size] = 1.0
             return logits
@@ -408,8 +413,8 @@ def test_rollout_feeds_each_prediction_back_into_the_hierarchy() -> None:
 
     assert [indices.shape for indices in predicted_indices_by_scale] == [
         (2, 1),
+        (2, 1),
         (2, 2),
-        (2, 4),
     ]
     torch.testing.assert_close(
         predicted_indices_by_scale[0],

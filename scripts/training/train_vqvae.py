@@ -1,5 +1,4 @@
 from contextlib import nullcontext
-from itertools import product
 from pathlib import Path
 
 import hydra
@@ -9,6 +8,7 @@ import torch.nn.functional as F
 import wandb
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
+from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -23,7 +23,6 @@ from nsm_dna.training import (
     load_training_checkpoint,
     save_training_checkpoint,
 )
-from nsm_dna.triplet_analysis import assign_triplets, code_table_rows
 
 
 def _log_to_wandb(
@@ -87,20 +86,28 @@ def _kmeans(
 
 
 @torch.no_grad()
-def reinitialize_finest_codebook(model: VQVAE, seed: int) -> None:
-    """Fit the finest codebook to the encoder's current triplet geometry."""
-    device = next(model.parameters()).device
-    sampling_factor = model.context_length // model.latent_length
-    triplets = torch.tensor(
-        list(product(range(model.vocab_size), repeat=sampling_factor)),
-        device=device,
-    )
-    input_ids = triplets.repeat(1, model.latent_length)
-    triplet_vectors = model.encode(input_ids)[:, 0].float()
+def reinitialize_codebooks(model: VQVAE, input_ids: Tensor, seed: int) -> None:
+    """Fit every codebook to its current mean or detail coefficients."""
+    coefficients = model.quantizer.decompose(model.encode(input_ids).float())
+    is_main_process = not dist.is_initialized() or dist.get_rank() == 0
 
-    codebook = model.quantizer.codebooks[-1]
-    centers = _kmeans(triplet_vectors, codebook.codebook_size, seed)
-    codebook.initialize(centers)
+    if is_main_process:
+        for scale_index, (coefficient, codebook) in enumerate(
+            zip(coefficients, model.quantizer.codebooks, strict=True)
+        ):
+            points = coefficient.flatten(0, 1)
+            centers = _kmeans(points, codebook.codebook_size, seed + scale_index)
+            codebook.initialize(centers)
+
+    if dist.is_initialized():
+        for codebook in model.quantizer.codebooks:
+            for buffer in (
+                codebook.codebook,
+                codebook.ema_counts,
+                codebook.ema_vector_sums,
+                codebook.codebook_hits,
+            ):
+                dist.broadcast(buffer, src=0)
 
 
 @torch.no_grad()
@@ -111,7 +118,7 @@ def evaluate(
     partial_reconstruction_weight: float,
     max_batches: int | None = None,
 ) -> dict[str, float]:
-    """Evaluate reconstruction at each independent scale without updating codebooks.
+    """Evaluate cumulative reconstruction without updating codebooks.
 
     Evaluate the entire data loader when max_batches is None.
     """
@@ -124,7 +131,7 @@ def evaluate(
     num_tokens = 0
     num_batches = 0
 
-    # Decoder quality from each scale on its own.
+    # Decoder quality after adding each successive detail scale.
     reconstruction_loss_sums_by_scale = [0.0] * len(model.scale_lengths)
     correct_tokens_by_scale = [0] * len(model.scale_lengths)
 
@@ -160,7 +167,9 @@ def evaluate(
             )
 
             encoder_latent = model.encode(input_ids)
-            scale_latents = model.quantizer.indices_to_scale_latents(indices_by_scale)
+            scale_latents = model.quantizer.indices_to_cumulative_latents(
+                indices_by_scale
+            )
 
             encoder_latent_squared_sum += encoder_latent.float().square().sum().item()
             num_latent_values += encoder_latent.numel()
@@ -409,7 +418,7 @@ def main(config: DictConfig) -> None:
     )
     gradient_accumulation_steps = config.optimizer.gradient_accumulation_steps
     partial_reconstruction_weight = config.model.partial_reconstruction_weight
-    codebook_reinitialization_step = config.training.reinitialize_codebook_step
+    codebook_reinitialization_step = config.training.reinitialize_codebooks_step
 
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
@@ -483,9 +492,9 @@ def main(config: DictConfig) -> None:
         scheduler.step()
 
         if step == codebook_reinitialization_step:
-            reinitialize_finest_codebook(model, config.run.seed)
+            reinitialize_codebooks(model, input_ids, config.run.seed)
             if distributed_environment.is_main_process:
-                tqdm.write(f"reinitialized finest codebook at step {step}")
+                tqdm.write(f"reinitialized codebooks at step {step}")
 
         if step % config.training.log_interval == 0:
             loss_sums = torch.tensor(
@@ -640,20 +649,6 @@ def main(config: DictConfig) -> None:
                                 scale_utilizations[scale_length]
                             )
 
-                    triplet_assignments = assign_triplets(model, device)
-                    triplet_table = wandb.Table(
-                        columns=["code", "triplets", "amino acids"],
-                        data=code_table_rows(
-                            triplet_assignments,
-                            model.codebook_sizes[-1],
-                        ),
-                    )
-                    _log_to_wandb(
-                        wandb_run,
-                        {"tokenizer/triplet_assignments": triplet_table},
-                        step,
-                        commit=False,
-                    )
                     _log_to_wandb(
                         wandb_run,
                         wandb_metrics,

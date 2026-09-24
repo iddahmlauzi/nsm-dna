@@ -7,11 +7,11 @@ from omegaconf import OmegaConf
 from torch import Tensor
 
 from .autoencoder import Decoder, Encoder
-from .quantization import MultiscaleVectorQuantizer
+from .quantization import ResidualVectorQuantizer
 
 
 class VQVAE(nn.Module):
-    """VQ-VAE with a learned codebook at every latent scale."""
+    """VQ-VAE with a quantized mean-and-detail latent hierarchy."""
 
     def __init__(
         self,
@@ -57,7 +57,7 @@ class VQVAE(nn.Module):
             bias=bias,
         )
 
-        self.quantizer = MultiscaleVectorQuantizer(
+        self.quantizer = ResidualVectorQuantizer(
             self.scale_lengths,
             self.codebook_sizes,
             self.quantization_dim,
@@ -65,6 +65,7 @@ class VQVAE(nn.Module):
             decay=decay,
             eps=eps,
         )
+        self.code_lengths = self.quantizer.code_lengths
         self.decoder = Decoder(
             self.vocab_size,
             self.context_length,
@@ -127,26 +128,12 @@ class VQVAE(nn.Module):
         """Encode DNA into the normalized continuous latent."""
         return self.encoder(token_ids)
 
-    def encode_latents(
-        self,
-        token_ids: Int[Tensor, "batch length"],
-    ) -> tuple[
-        Float[Tensor, "batch latent_length quantization_dim"],
-        Float[Tensor, "batch latent_length quantization_dim"],
-    ]:
-        """Encode DNA for fine quantization and unbiased coarse downsampling."""
-        return self.encoder.encode_latents(token_ids)
-
     def encode_scales(
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> list[Float[Tensor, "batch scale_length quantization_dim"]]:
-        """Encode DNA into the continuous latent at every hierarchy scale."""
-        fine_latent, hierarchy_latent = self.encode_latents(token_ids)
-        return self.quantizer.downsample_to_scales(
-            fine_latent.float(),
-            hierarchy_latent.float(),
-        )
+        """Return deterministic continuous block means at every resolution."""
+        return self.quantizer.mean_pool_to_scales(self.encode(token_ids).float())
 
     def forward(
         self,
@@ -158,10 +145,9 @@ class VQVAE(nn.Module):
         Float[Tensor, "batch length vocab_size"] | None,
         list[Int[Tensor, "batch scale_length"]],
     ]:
-        fine_latent, hierarchy_latent = self.encode_latents(token_ids)
+        latent = self.encode(token_ids)
         quantized_latent, partial_quantized_latent, indices_by_scale = self.quantizer(
-            fine_latent,
-            hierarchy_latent,
+            latent,
             include_partial_reconstruction=include_partial_reconstruction,
         )
         logits = self.decoder(quantized_latent)
@@ -177,35 +163,24 @@ class VQVAE(nn.Module):
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> list[Int[Tensor, "batch scale_length"]]:
-        """Encode a target block into independent code indices at every scale."""
+        """Encode a target block into its mean and successive detail codes."""
         if self.training:
             raise RuntimeError("Call model.eval() before encoding sequences.")
 
-        fine_latent, hierarchy_latent = self.encode_latents(token_ids)
-        _, _, indices_by_scale = self.quantizer(fine_latent, hierarchy_latent)
+        _, _, indices_by_scale = self.quantizer(self.encode(token_ids))
         return indices_by_scale
-
-    @torch.no_grad()
-    def decode_scale(
-        self,
-        scale_indices: Int[Tensor, "batch scale_length"],
-        scale_index: int,
-    ) -> Float[Tensor, "batch length vocab_size"]:
-        """Decode one scale's absolute codes into nucleotide logits."""
-        scale_latent = self.quantizer.indices_to_scale_latent(
-            scale_indices, scale_index
-        )
-        return self.decoder(scale_latent)
 
     @torch.no_grad()
     def decode_scales(
         self,
         indices_by_scale: list[Int[Tensor, "batch scale_length"]],
     ) -> list[Float[Tensor, "batch length vocab_size"]]:
-        """Decode each scale independently."""
+        """Decode the cumulative reconstruction after each hierarchy scale."""
         return [
-            self.decode_scale(scale_indices, scale_index)
-            for scale_index, scale_indices in enumerate(indices_by_scale)
+            self.decoder(latent)
+            for latent in self.quantizer.indices_to_cumulative_latents(
+                indices_by_scale
+            )
         ]
 
     @property

@@ -10,10 +10,9 @@ from scripts.evaluation.lambda_probe_tokenizer import (
 class _Quantizer(nn.Module):
     def forward(
         self,
-        fine_latent: torch.Tensor,
-        hierarchy_latent: torch.Tensor,
+        latent: torch.Tensor,
     ) -> tuple:
-        return fine_latent + 1, None, None
+        return latent + 1, None, None
 
 
 class _Decoder(nn.Module):
@@ -27,12 +26,8 @@ class _Tokenizer(nn.Module):
         self.quantizer = _Quantizer()
         self.decoder = _Decoder()
 
-    def encode_latents(
-        self,
-        input_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        latent = input_ids.float().unsqueeze(-1)
-        return latent, latent
+    def encode(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return input_ids.float().unsqueeze(-1)
 
 
 def test_tokenizer_encoder_returns_mean_decoder_hidden_state() -> None:

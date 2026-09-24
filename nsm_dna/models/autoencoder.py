@@ -73,18 +73,7 @@ class Encoder(nn.Module):
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> Float[Tensor, "batch latent_length quantization_dim"]:
-        """Return the finest-scale latent used for triplet quantization."""
-        fine_latent, _ = self.encode_latents(token_ids)
-        return fine_latent
-
-    def encode_latents(
-        self,
-        token_ids: Int[Tensor, "batch length"],
-    ) -> tuple[
-        Float[Tensor, "batch latent_length quantization_dim"],
-        Float[Tensor, "batch latent_length quantization_dim"],
-    ]:
-        """Return fine-scale and unbiased hierarchy latents."""
+        """Return the continuous triplet representation."""
         x = self.token_embedding(token_ids)
         x = einx.id("b l d -> b d l", x)
 
@@ -94,19 +83,14 @@ class Encoder(nn.Module):
             refinement = F.conv1d(x[:, :, 2:], weights[:, :, 2:], stride=3)
             core = self.core_norm(einx.id("b d l -> b l d", core))
             refinement = self.refinement_norm(einx.id("b d l -> b l d", refinement))
-            fine_latent = core + self.third_base_scale * refinement
-            hierarchy_latent = core + refinement
+            x = core + self.third_base_scale * refinement
             if self.downsampler.bias is not None:
-                fine_latent = fine_latent + self.downsampler.bias
-                hierarchy_latent = hierarchy_latent + self.downsampler.bias
-
-            return self.norm(fine_latent), self.norm(hierarchy_latent)
+                x = x + self.downsampler.bias
         else:
             x = self.downsampler(x)
             x = einx.id("b d l -> b l d", x)
 
-        latent = self.norm(x)
-        return latent, latent
+        return self.norm(x)
 
 
 class Decoder(nn.Module):

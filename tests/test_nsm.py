@@ -17,6 +17,7 @@ def _build_model(
         prefix_dim=3,
         model_dim=8,
         scale_lengths=[1, 2, 4],
+        code_lengths=[1, 1, 2],
         codebook_sizes=[4, 5, 6],
         codebook_vectors=[torch.randn(4, 3), torch.randn(5, 3), torch.randn(6, 3)],
         target_length=8,
@@ -30,8 +31,8 @@ def _build_model(
 def _indices() -> list[torch.Tensor]:
     return [
         torch.tensor([[1], [2]]),
-        torch.tensor([[2, 3], [3, 4]]),
-        torch.tensor([[3, 4, 5, 0], [4, 5, 0, 1]]),
+        torch.tensor([[2], [3]]),
+        torch.tensor([[3, 4], [4, 5]]),
     ]
 
 
@@ -45,6 +46,7 @@ def test_nsm_from_checkpoint_restores_model_and_step(tmp_path: Path) -> None:
         quantization_dim=3,
         latent_length=2,
         scale_lengths=[1, 2],
+        code_lengths=[1, 1],
         codebook_sizes=[4, 5],
         context_length=4,
         vocab_size=4,
@@ -59,6 +61,7 @@ def test_nsm_from_checkpoint_restores_model_and_step(tmp_path: Path) -> None:
         prefix_dim=tokenizer.quantization_dim,
         model_dim=8,
         scale_lengths=tokenizer.scale_lengths,
+        code_lengths=tokenizer.code_lengths,
         codebook_sizes=tokenizer.codebook_sizes,
         codebook_vectors=codebook_vectors,
         target_length=tokenizer.context_length,
@@ -75,7 +78,6 @@ def test_nsm_from_checkpoint_restores_model_and_step(tmp_path: Path) -> None:
             "config": {
                 "data": {"sequence_length": 6},
                 "model": {
-                    "scale_lengths": None,
                     "model_dim": 8,
                     "num_layers": 1,
                     "num_heads": 2,
@@ -135,7 +137,7 @@ def test_multiscale_output_head_starts_as_linear_classifiers() -> None:
         torch.testing.assert_close(actual, expected)
 
 
-def test_scale_inputs_repeat_prior_scale_codes_to_the_target_length() -> None:
+def test_scale_inputs_use_the_cumulative_parent_reconstruction() -> None:
     model = _build_model(num_layers=0)
     indices_by_scale = _indices()
 
@@ -148,9 +150,14 @@ def test_scale_inputs_repeat_prior_scale_codes_to_the_target_length() -> None:
     expected_inputs = torch.cat(
         [
             model.bos.expand(2, 1, -1) + model.scale_embedding.weight[0],
-            model.input_projection(first_codes).repeat_interleave(2, dim=1)
+            model.input_projection(first_codes)
             + model.scale_embedding.weight[1],
-            model.input_projection(second_codes).repeat_interleave(2, dim=1)
+            model.input_projection(
+                torch.stack(
+                    (first_codes + second_codes, first_codes - second_codes),
+                    dim=2,
+                ).flatten(1, 2)
+            )
             + model.scale_embedding.weight[2],
         ],
         dim=1,
@@ -163,7 +170,7 @@ def test_attention_connects_each_target_to_its_matching_prefix_scale() -> None:
     mask = model._build_attention_mask(num_scale_blocks=2)[0, 0]
 
     scale_one_target = model.prefix_length
-    scale_two_target = scale_one_target + model.scale_lengths[0]
+    scale_two_target = scale_one_target + model.code_lengths[0]
     scale_one_prefix = model.prefix_length - model.scale_lengths[0]
     scale_two_prefix_start = model.scale_lengths[-1]
 
@@ -171,14 +178,14 @@ def test_attention_connects_each_target_to_its_matching_prefix_scale() -> None:
     assert not mask[scale_one_target, 0]
     assert mask[scale_two_target, scale_two_prefix_start]
     assert not mask[scale_two_target, scale_one_prefix]
-    assert mask[scale_two_target, scale_two_target + 1]
+    assert mask[scale_two_target, scale_two_target]
 
 
 def test_rope_positions_are_centers_in_the_finest_scale_coordinates() -> None:
     model = _build_model()
     torch.testing.assert_close(
         model.hierarchy_positions,
-        torch.tensor([1.5, 0.5, 2.5, 0.0, 1.0, 2.0, 3.0]),
+        torch.tensor([1.5, 1.5, 0.5, 2.5]),
     )
     torch.testing.assert_close(
         model.prefix_positions,
@@ -203,6 +210,7 @@ def test_nsm_scales_residual_projection_initialization() -> None:
         prefix_dim=8,
         model_dim=64,
         scale_lengths=[1, 2, 4],
+        code_lengths=[1, 1, 2],
         codebook_sizes=[8, 8, 8],
         codebook_vectors=[torch.randn(8, 8) for _ in range(3)],
         target_length=8,
@@ -245,8 +253,8 @@ def test_nsm_predicts_every_codebook_including_scale_one() -> None:
 
     assert [value.shape for value in logits] == [
         (2, 1, 4),
-        (2, 2, 5),
-        (2, 4, 6),
+        (2, 1, 5),
+        (2, 2, 6),
     ]
     for actual, expected in zip(logits, expected_logits, strict=True):
         torch.testing.assert_close(actual, expected)
@@ -285,13 +293,13 @@ def test_nsm_returns_prefix_and_hierarchy_hidden_states() -> None:
 
     assert hidden_states.shape == (
         2,
-        model.prefix_length + sum(model.scale_lengths),
+        model.prefix_length + sum(model.code_lengths),
         model.model_dim,
     )
     assert [value.shape for value in logits] == [
         (2, 1, 4),
-        (2, 2, 5),
-        (2, 4, 6),
+        (2, 1, 5),
+        (2, 2, 6),
     ]
     expected_logits = model.output_head(hidden_states[:, model.prefix_length :])
     for actual, expected in zip(logits, expected_logits, strict=True):
