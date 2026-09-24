@@ -63,7 +63,7 @@ def test_target_block_window_excludes_incomplete_target_blocks() -> None:
     )
 
 
-def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
+def test_sequence_score_sums_hierarchy_probabilities() -> None:
     torch.manual_seed(0)
     tokenizer = _build_tokenizer()
     model = NSM(
@@ -72,18 +72,15 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
         scale_lengths=[1, 2, 4],
         codebook_sizes=[4, 6, 16],
         codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(16, 4)],
-        target_length=8,
-        vocab_size=4,
         num_layers=1,
         num_heads=2,
         dropout=0.0,
     ).eval()
     input_ids = torch.arange(2 * 16).reshape(2, 16) % 4
 
-    hierarchy_scores, decoder_scores = score_token_ids(model, tokenizer, input_ids)
+    hierarchy_scores = score_token_ids(model, tokenizer, input_ids)
 
     expected_hierarchy_scores = torch.zeros(2, 3, dtype=torch.float64)
-    expected_decoder_scores = torch.zeros(2, dtype=torch.float64)
     for prediction in prepare_block_predictions(
         tokenizer,
         input_ids,
@@ -91,7 +88,6 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
     ):
         output = model(
             prediction.targets_by_scale[:-1],
-            prediction.targets_by_scale[-1],
             prefix_by_scale=prediction.prefix_by_scale,
         )
         logits_by_scale = output.hierarchy_logits
@@ -105,16 +101,7 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
             ).reshape(scale_targets.shape)
             expected_hierarchy_scores[:, scale_index] -= scale_losses.sum(1).double()
 
-        decoder_logits = output.nucleotide_logits
-        decoder_losses = F.cross_entropy(
-            decoder_logits.flatten(0, 1),
-            prediction.target_ids.flatten(),
-            reduction="none",
-        ).reshape(prediction.target_ids.shape)
-        expected_decoder_scores -= decoder_losses.sum(1).double()
-
     torch.testing.assert_close(hierarchy_scores, expected_hierarchy_scores)
-    torch.testing.assert_close(decoder_scores, expected_decoder_scores)
 
 
 def test_sequence_score_requires_prefix() -> None:
@@ -126,8 +113,6 @@ def test_sequence_score_requires_prefix() -> None:
         scale_lengths=[1, 2, 4],
         codebook_sizes=[4, 6, 16],
         codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(16, 4)],
-        target_length=8,
-        vocab_size=4,
         num_layers=1,
         num_heads=2,
         dropout=0.0,

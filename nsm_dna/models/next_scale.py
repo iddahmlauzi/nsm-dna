@@ -23,7 +23,6 @@ if TYPE_CHECKING:
 @dataclass
 class NSMOutput:
     hierarchy_logits: list[Float[Tensor, "batch scale_length codebook_size"]]
-    nucleotide_logits: Float[Tensor, "batch target_length vocab_size"]
 
 
 def tokenizer_scale_indices(
@@ -153,8 +152,6 @@ class NSM(nn.Module):
         scale_lengths: list[int],
         codebook_sizes: list[int],
         codebook_vectors: list[Tensor],
-        target_length: int,
-        vocab_size: int,
         num_layers: int,
         num_heads: int,
         *,
@@ -171,8 +168,6 @@ class NSM(nn.Module):
         self.model_dim = model_dim
         self.scale_lengths = list(scale_lengths)
         self.codebook_sizes = list(codebook_sizes)
-        self.target_length = target_length
-        self.vocab_size = vocab_size
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.use_qk_norm = use_qk_norm
@@ -203,7 +198,7 @@ class NSM(nn.Module):
 
         # Each input block is labeled by the scale it is trying to predict.
         self.scale_embedding = nn.Embedding(
-            len(self.scale_lengths) + 1,
+            len(self.scale_lengths),
             self.model_dim,
         )
         nn.init.normal_(self.scale_embedding.weight, mean=0.0, std=0.02)
@@ -229,11 +224,6 @@ class NSM(nn.Module):
                 for scale_length in self.scale_lengths
             ]
         )
-        nucleotide_positions = (
-            (torch.arange(self.target_length, dtype=torch.float32) + 0.5)
-            * (finest_scale_length / self.target_length)
-            - 0.5
-        )
         prefix_rope_cosine, prefix_rope_sine = precompute_rope_cosine_and_sine(
             prefix_positions,
             head_dim,
@@ -246,21 +236,11 @@ class NSM(nn.Module):
                 self.rope_base,
             )
         )
-        nucleotide_rope_cosine, nucleotide_rope_sine = (
-            precompute_rope_cosine_and_sine(
-                nucleotide_positions,
-                head_dim,
-                self.rope_base,
-            )
-        )
         self.register_buffer(
             "prefix_positions", prefix_positions, persistent=False
         )
         self.register_buffer(
             "hierarchy_positions", hierarchy_positions, persistent=False
-        )
-        self.register_buffer(
-            "nucleotide_positions", nucleotide_positions, persistent=False
         )
         self.register_buffer(
             "prefix_rope_cosine", prefix_rope_cosine, persistent=False
@@ -273,16 +253,6 @@ class NSM(nn.Module):
         )
         self.register_buffer(
             "hierarchy_rope_sine", hierarchy_rope_sine, persistent=False
-        )
-        self.register_buffer(
-            "nucleotide_rope_cosine",
-            nucleotide_rope_cosine,
-            persistent=False,
-        )
-        self.register_buffer(
-            "nucleotide_rope_sine",
-            nucleotide_rope_sine,
-            persistent=False,
         )
 
         self.blocks = nn.ModuleList(
@@ -308,11 +278,6 @@ class NSM(nn.Module):
             num_blocks=head_num_blocks,
             hidden_multiplier=head_hidden_multiplier,
             dropout=dropout,
-            bias=bias,
-        )
-        self.nucleotide_head = nn.Linear(
-            self.model_dim,
-            self.vocab_size,
             bias=bias,
         )
 
@@ -357,8 +322,6 @@ class NSM(nn.Module):
                 tokenizer.quantizer.codebooks[index].codebook
                 for index in scale_indices
             ],
-            target_length=tokenizer.context_length,
-            vocab_size=tokenizer.vocab_size,
             num_layers=config.model.num_layers,
             num_heads=config.model.num_heads,
             dropout=config.model.dropout,
@@ -559,7 +522,6 @@ class NSM(nn.Module):
     def forward(
         self,
         context_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
-        final_scale_indices: Int[Tensor, "batch final_scale_length"],
         *,
         prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
     ) -> NSMOutput:
@@ -571,66 +533,6 @@ class NSM(nn.Module):
             hierarchy_logits=self.output_head(
                 hidden_states[:, self.prefix_length :]
             ),
-            nucleotide_logits=self.predict_nucleotides(
-                final_scale_indices,
-                prefix_by_scale=prefix_by_scale,
-            ),
-        )
-
-    def predict_nucleotides(
-        self,
-        final_scale_indices: Int[Tensor, "batch final_scale_length"],
-        *,
-        prefix_by_scale: list[Float[Tensor, "batch scale_length prefix_dim"]],
-    ) -> Float[Tensor, "batch target_length vocab_size"]:
-        """Predict exact nucleotides from the finest quantized scale."""
-        finest_prefix = prefix_by_scale[-1]
-        final_vectors = getattr(self, self._codebook_buffer_names[-1])[
-            final_scale_indices
-        ]
-        repeats_per_code = self.target_length // self.scale_lengths[-1]
-        nucleotide_inputs = self.input_projection(
-            final_vectors.repeat_interleave(repeats_per_code, dim=1)
-        ) + self.scale_embedding.weight[-1]
-        prefix_inputs = self.input_projection(finest_prefix)
-        hidden_states = torch.cat([prefix_inputs, nucleotide_inputs], dim=1)
-
-        prefix_length = finest_prefix.shape[1]
-        total_length = prefix_length + self.target_length
-        attention_mask = torch.zeros(
-            total_length,
-            total_length,
-            dtype=torch.bool,
-            device=hidden_states.device,
-        )
-        attention_mask[:prefix_length, :prefix_length] = True
-        attention_mask[prefix_length:, :] = True
-        attention_mask = attention_mask.reshape(1, 1, total_length, total_length)
-
-        rotary_embeddings = (
-            torch.cat(
-                [
-                    self.prefix_rope_cosine[:prefix_length],
-                    self.nucleotide_rope_cosine,
-                ],
-                dim=0,
-            ),
-            torch.cat(
-                [
-                    self.prefix_rope_sine[:prefix_length],
-                    self.nucleotide_rope_sine,
-                ],
-                dim=0,
-            ),
-        )
-        for block in self.blocks:
-            hidden_states = block(
-                hidden_states,
-                attention_mask=attention_mask,
-                rotary_embeddings=rotary_embeddings,
-            )
-        return self.nucleotide_head(
-            self.final_norm(hidden_states[:, prefix_length:])
         )
 
     def predict_scale(

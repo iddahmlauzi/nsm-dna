@@ -8,7 +8,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: vqvae
-  name: vqvae-384-triplet-k32-fine-only-core-refinement-delayed-kmeans
+  name: vqvae-384-triplet-k64-fine-only-core-refinement-delayed-kmeans
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -35,9 +35,9 @@ model:
   # RoPE is applied only in the decoder.
   rope_base: 10_000
   # Coarse scales are built through learned stride-2 convolutions. The final
-  # length-128 scale assigns each nucleotide triplet to one of 32 codes.
+  # length-128 scale has enough codes to represent every nucleotide triplet.
   scale_lengths: [1, 2, 4, 8, 16, 32, 64, 128]
-  codebook_sizes: [32, 32, 64, 64, 128, 128, 128, 32]
+  codebook_sizes: [32, 32, 64, 64, 128, 128, 128, 64]
 
   decoder_num_layers: 4
   use_qk_norm: true

@@ -12,7 +12,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: nsm
-  name: nsm-384-triplet-k32-unbiased-coarse-all-scales-decoder-loss025
+  name: nsm-384-triplet-k64-unbiased-coarse-all-scales-geometry
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -55,8 +55,8 @@ optimizer:
 objective:
   # Alpha 1 gives every hierarchy scale equal weight.
   scale_loss_alpha: 1
-  # Reconstruct the target from straight-through predicted hierarchy codes.
-  predicted_reconstruction_loss_weight: 0.25
+  # Prefer errors whose frozen tokenizer codes are close to the correct code.
+  geometry_loss_weight: 1.0
 
 mixed_precision:
   enabled: true

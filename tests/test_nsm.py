@@ -19,8 +19,6 @@ def _build_model(
         scale_lengths=[1, 2, 4],
         codebook_sizes=[4, 5, 6],
         codebook_vectors=[torch.randn(4, 3), torch.randn(5, 3), torch.randn(6, 3)],
-        target_length=8,
-        vocab_size=4,
         num_layers=num_layers,
         num_heads=2,
         dropout=0.0,
@@ -61,8 +59,6 @@ def test_nsm_from_checkpoint_restores_model_and_step(tmp_path: Path) -> None:
         scale_lengths=tokenizer.scale_lengths,
         codebook_sizes=tokenizer.codebook_sizes,
         codebook_vectors=codebook_vectors,
-        target_length=tokenizer.context_length,
-        vocab_size=tokenizer.vocab_size,
         num_layers=1,
         num_heads=2,
         dropout=0.0,
@@ -205,8 +201,6 @@ def test_nsm_scales_residual_projection_initialization() -> None:
         scale_lengths=[1, 2, 4],
         codebook_sizes=[8, 8, 8],
         codebook_vectors=[torch.randn(8, 8) for _ in range(3)],
-        target_length=8,
-        vocab_size=4,
         num_layers=num_layers,
         num_heads=4,
         dropout=0.0,
@@ -231,7 +225,6 @@ def test_nsm_predicts_every_codebook_including_scale_one() -> None:
 
     output = model(
         indices_by_scale[:-1],
-        indices_by_scale[-1],
         prefix_by_scale=prefix_by_scale,
     )
     logits = output.hierarchy_logits
@@ -250,7 +243,6 @@ def test_nsm_predicts_every_codebook_including_scale_one() -> None:
     ]
     for actual, expected in zip(logits, expected_logits, strict=True):
         torch.testing.assert_close(actual, expected)
-    assert output.nucleotide_logits.shape == (2, model.target_length, model.vocab_size)
 
 
 def test_first_scale_uses_the_learned_bos_input() -> None:
@@ -279,7 +271,6 @@ def test_nsm_returns_prefix_and_hierarchy_hidden_states() -> None:
     )
     logits = model(
         indices_by_scale[:-1],
-        indices_by_scale[-1],
         prefix_by_scale=prefix_by_scale,
     ).hierarchy_logits
 
@@ -308,12 +299,10 @@ def test_a_scale_cannot_change_its_own_or_earlier_logits() -> None:
 
     logits = model(
         indices_by_scale[:-1],
-        indices_by_scale[-1],
         prefix_by_scale=prefix_by_scale,
     ).hierarchy_logits
     changed_logits = model(
         changed_indices[:-1],
-        changed_indices[-1],
         prefix_by_scale=prefix_by_scale,
     ).hierarchy_logits
 
@@ -333,12 +322,10 @@ def test_first_scale_is_predicted_without_supplying_its_code() -> None:
 
     logits = model(
         indices_by_scale[:-1],
-        indices_by_scale[-1],
         prefix_by_scale=prefix_by_scale,
     ).hierarchy_logits
     changed_logits = model(
         changed_indices[:-1],
-        changed_indices[-1],
         prefix_by_scale=prefix_by_scale,
     ).hierarchy_logits
 
@@ -353,7 +340,6 @@ def test_packed_teacher_forcing_matches_scale_by_scale_prediction() -> None:
 
     teacher_forced_logits = model(
         indices_by_scale[:-1],
-        indices_by_scale[-1],
         prefix_by_scale=prefix_by_scale,
     ).hierarchy_logits
     for scale_index in range(len(indices_by_scale)):

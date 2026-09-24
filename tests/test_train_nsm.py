@@ -8,12 +8,13 @@ from nsm_dna.models.next_scale import NSM
 from nsm_dna.models.vqvae import VQVAE
 from nsm_dna.training import calculate_training_steps
 from scripts.training.train_nsm import (
+    build_codebook_distance_tables,
     build_codebook_neighbor_tables,
     build_scale_loss_weights,
     compute_losses,
     corrupt_context_indices,
     evaluate,
-    predicted_reconstruction_loss,
+    geometry_loss,
     prepare_block_predictions,
     rollout_hierarchy,
 )
@@ -41,8 +42,6 @@ def _build_nsm() -> NSM:
         scale_lengths=[1, 2, 4],
         codebook_sizes=[4, 6, 16],
         codebook_vectors=[torch.randn(4, 4), torch.randn(6, 4), torch.randn(16, 4)],
-        target_length=8,
-        vocab_size=4,
         num_layers=1,
         num_heads=2,
         dropout=0.0,
@@ -110,7 +109,7 @@ def test_context_corruption_uses_nearby_codes() -> None:
     torch.testing.assert_close(context[0], torch.tensor([[0, 1, 2]]))
 
 
-def test_loss_combines_hierarchy_and_nucleotide_prediction() -> None:
+def test_loss_combines_hierarchy_and_geometry() -> None:
     targets_by_scale = [
         torch.tensor([[0], [1]]),
         torch.tensor([[1, 2], [2, 3]]),
@@ -121,19 +120,15 @@ def test_loss_combines_hierarchy_and_nucleotide_prediction() -> None:
         torch.randn(2, 2, 4),
         torch.randn(2, 4, 4),
     ]
-    target_ids = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
-    nucleotide_logits = torch.randn(2, 4, 4)
     scale_weights = torch.tensor([0.2, 0.3, 0.5])
-    reconstruction_loss = torch.tensor(0.7)
-    reconstruction_weight = 0.25
+    batch_geometry_loss = torch.tensor(0.7)
+    geometry_weight = 1.0
     losses = compute_losses(
         logits_by_scale,
-        nucleotide_logits,
         targets_by_scale,
-        target_ids,
         scale_weights,
-        reconstruction_loss,
-        reconstruction_weight,
+        batch_geometry_loss,
+        geometry_weight,
     )
 
     expected_losses = torch.stack(
@@ -150,22 +145,15 @@ def test_loss_combines_hierarchy_and_nucleotide_prediction() -> None:
     )
 
     expected_hierarchy = torch.sum(expected_losses * scale_weights)
-    expected_nucleotide = F.cross_entropy(
-        nucleotide_logits.flatten(0, 1),
-        target_ids.flatten(),
-    )
     torch.testing.assert_close(losses.hierarchy_by_scale, expected_losses)
     torch.testing.assert_close(losses.hierarchy, expected_hierarchy)
-    torch.testing.assert_close(losses.nucleotide, expected_nucleotide)
     torch.testing.assert_close(
-        losses.predicted_reconstruction,
-        reconstruction_loss,
+        losses.geometry,
+        batch_geometry_loss,
     )
     torch.testing.assert_close(
         losses.total,
-        expected_hierarchy
-        + expected_nucleotide
-        + reconstruction_weight * reconstruction_loss,
+        expected_hierarchy + geometry_weight * batch_geometry_loss,
     )
 
 
@@ -245,24 +233,23 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     indices_by_scale = prediction.targets_by_scale
     output = model(
         indices_by_scale[:-1],
-        indices_by_scale[-1],
         prefix_by_scale=prediction.prefix_by_scale,
     )
-    reconstruction_loss = predicted_reconstruction_loss(
-        tokenizer,
+    distance_tables = build_codebook_distance_tables(
+        [codebook.codebook for codebook in tokenizer.quantizer.codebooks]
+    )
+    batch_geometry_loss = geometry_loss(
         output.hierarchy_logits,
-        prediction.target_ids,
-        tokenizer_scale_indices=[0, 1, 2],
-        scale_index=1,
+        indices_by_scale,
+        distance_tables,
+        scale_weights,
     )
     losses = compute_losses(
         output.hierarchy_logits,
-        output.nucleotide_logits,
         indices_by_scale,
-        prediction.target_ids,
         scale_weights,
-        reconstruction_loss,
-        predicted_reconstruction_loss_weight=0.25,
+        batch_geometry_loss,
+        geometry_loss_weight=1.0,
     )
     losses.total.backward()
 
@@ -272,28 +259,34 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
         (2, 2, 6),
         (2, 4, 16),
     ]
-    assert output.nucleotide_logits.shape == (*prediction.target_ids.shape, 4)
     assert all(parameter.grad is None for parameter in tokenizer.parameters())
     assert any(parameter.grad is not None for parameter in model.parameters())
 
 
-def test_predicted_reconstruction_backpropagates_through_hard_codes() -> None:
+def test_geometry_loss_backpropagates_to_every_scale() -> None:
     tokenizer = _build_tokenizer().eval()
     tokenizer.requires_grad_(False)
-    scale_logits = torch.randn(2, 2, 6, requires_grad=True)
-    target_ids = torch.arange(2 * 8).reshape(2, 8) % 4
-
-    loss = predicted_reconstruction_loss(
-        tokenizer,
-        logits_by_scale=[scale_logits],
-        target_ids=target_ids,
-        tokenizer_scale_indices=[1],
-        scale_index=0,
+    scale_logits = [
+        torch.randn(2, 1, 4, requires_grad=True),
+        torch.randn(2, 2, 6, requires_grad=True),
+    ]
+    targets_by_scale = [
+        torch.zeros(2, 1, dtype=torch.long),
+        torch.zeros(2, 2, dtype=torch.long),
+    ]
+    distance_tables = build_codebook_distance_tables(
+        [codebook.codebook for codebook in tokenizer.quantizer.codebooks[:2]]
+    )
+    loss = geometry_loss(
+        scale_logits,
+        targets_by_scale,
+        distance_tables,
+        scale_loss_weights=torch.tensor([0.5, 0.5]),
     )
     loss.backward()
 
-    assert scale_logits.grad is not None
-    assert scale_logits.grad.abs().sum() > 0
+    assert all(logits.grad is not None for logits in scale_logits)
+    assert all(logits.grad.abs().sum() > 0 for logits in scale_logits)
     assert all(parameter.grad is None for parameter in tokenizer.parameters())
 
 
@@ -347,7 +340,10 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
         tokenizer,
         data_loader=[{"input_ids": input_ids}],
         scale_loss_weights=scale_weights,
-        predicted_reconstruction_loss_weight=0.25,
+        codebook_distance_tables=build_codebook_distance_tables(
+            [codebook.codebook for codebook in tokenizer.quantizer.codebooks]
+        ),
+        geometry_loss_weight=1.0,
         use_mixed_precision=False,
         rollout_max_batches=1,
     )
@@ -355,8 +351,7 @@ def test_evaluate_reports_every_scale_and_restores_training_mode() -> None:
     assert model.training is True
     assert metrics["loss"] > 0
     assert metrics["hierarchy_loss"] > 0
-    assert metrics["nucleotide_loss"] > 0
-    assert metrics["predicted_reconstruction_loss"] > 0
+    assert metrics["geometry_loss"] > 0
     assert 0 <= metrics["hierarchy_accuracy"] <= 1
     assert 0 <= metrics["nucleotide_accuracy"] <= 1
     assert metrics["rollout_nucleotide_loss"] > 0

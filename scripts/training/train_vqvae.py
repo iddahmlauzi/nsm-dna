@@ -23,7 +23,12 @@ from nsm_dna.training import (
     load_training_checkpoint,
     save_training_checkpoint,
 )
-from nsm_dna.triplet_analysis import assign_triplets, code_table_rows
+from nsm_dna.triplet_analysis import (
+    assign_sixmers,
+    assign_triplets,
+    code_table_rows,
+    sixmer_code_table_rows,
+)
 
 
 def _log_to_wandb(
@@ -648,9 +653,27 @@ def main(config: DictConfig) -> None:
                             model.codebook_sizes[-1],
                         ),
                     )
+                    sixmer_assignments = assign_sixmers(model, device)
+                    sixmer_scale_index = model.scale_lengths.index(
+                        model.latent_length // 2
+                    )
+                    sixmer_table = wandb.Table(
+                        columns=[
+                            "code",
+                            "triplet pairs / 6-mers",
+                            "amino-acid pairs",
+                        ],
+                        data=sixmer_code_table_rows(
+                            sixmer_assignments,
+                            model.codebook_sizes[sixmer_scale_index],
+                        ),
+                    )
                     _log_to_wandb(
                         wandb_run,
-                        {"tokenizer/triplet_assignments": triplet_table},
+                        {
+                            "tokenizer/triplet_assignments": triplet_table,
+                            "tokenizer/sixmer_assignments": sixmer_table,
+                        },
                         step,
                         commit=False,
                     )

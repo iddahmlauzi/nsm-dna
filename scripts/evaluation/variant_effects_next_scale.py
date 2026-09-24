@@ -92,11 +92,8 @@ def score_token_ids(
     model: NSM,
     tokenizer: VQVAE,
     input_ids: Int[Tensor, "batch sequence_length"],
-) -> tuple[
-    Float[Tensor, "batch num_scales"],
-    Float[Tensor, "batch"],
-]:
-    """Return per-scale hierarchy scores and the nucleotide score."""
+) -> Float[Tensor, "batch num_scales"]:
+    """Return the observed code log probability at every hierarchy scale."""
     if input_ids.shape[1] != 2 * tokenizer.context_length:
         raise ValueError("NSM scoring requires one prefix block and one target block.")
     predicted_scale_lengths = model.scale_lengths
@@ -105,9 +102,6 @@ def score_token_ids(
         len(predicted_scale_lengths),
         device=input_ids.device,
         dtype=torch.float64,
-    )
-    decoder_scores = torch.zeros(
-        input_ids.shape[0], device=input_ids.device, dtype=torch.float64
     )
     for prediction in prepare_block_predictions(
         tokenizer,
@@ -121,11 +115,9 @@ def score_token_ids(
         ):
             output = model(
                 prediction.targets_by_scale[:-1],
-                prediction.targets_by_scale[-1],
                 prefix_by_scale=prediction.prefix_by_scale,
             )
             logits_by_scale = output.hierarchy_logits
-            decoder_logits = output.nucleotide_logits
 
         # Likelihood counts every predicted code once; the training loss's scale
         # weights do not enter the sequence score.
@@ -140,17 +132,7 @@ def score_token_ids(
                 .double()
             )
 
-        # The final absolute scale supplies NSM's nucleotide likelihood.
-        nucleotide_log_probabilities = F.log_softmax(decoder_logits.float(), dim=-1)
-        nucleotide_targets = prediction.target_ids
-        decoder_scores += (
-            nucleotide_log_probabilities.gather(-1, nucleotide_targets.unsqueeze(-1))
-            .squeeze(-1)
-            .sum(1)
-            .double()
-        )
-
-    return hierarchy_scores, decoder_scores
+    return hierarchy_scores
 
 
 def score_sequences(
@@ -163,22 +145,20 @@ def score_sequences(
     """Score fixed-length DNA sequences and retain each score component."""
     predicted_scale_lengths = tokenizer.scale_lengths
     scores = {f"scale_{length}": [] for length in predicted_scale_lengths}
-    scores.update({"hierarchy": [], "decoder": [], "joint": []})
+    scores["hierarchy"] = []
 
     for start in tqdm(range(0, len(sequences), batch_size), unit="batch"):
         batch = sequences[start : start + batch_size]
         input_ids = torch.stack([encode_sequence(sequence) for sequence in batch]).to(
             device
         )
-        hierarchy_by_scale, decoder = score_token_ids(model, tokenizer, input_ids)
+        hierarchy_by_scale = score_token_ids(model, tokenizer, input_ids)
         hierarchy = hierarchy_by_scale.sum(1)
         batch_scores = {
             f"scale_{length}": hierarchy_by_scale[:, scale_index]
             for scale_index, length in enumerate(predicted_scale_lengths)
         }
         batch_scores["hierarchy"] = hierarchy
-        batch_scores["decoder"] = decoder
-        batch_scores["joint"] = hierarchy + decoder
         for name, values in batch_scores.items():
             scores[name].extend(values.cpu().tolist())
 
@@ -283,13 +263,13 @@ def evaluate_assay(
                 "experimental_score": row["experimental_score"],
                 "directionality": row["directionality"],
                 "window_start_0_based": row["window_start_0_based"],
-                "reference_log_probability": sequence_scores["joint"][reference],
-                "mutant_log_probability": sequence_scores["joint"][mutant],
-                "variant_score": variant_scores["joint"],
+                "reference_log_probability": sequence_scores["hierarchy"][reference],
+                "mutant_log_probability": sequence_scores["hierarchy"][mutant],
+                "variant_score": variant_scores["hierarchy"],
                 **{
                     f"{name}_variant_score": score
                     for name, score in variant_scores.items()
-                    if name != "joint"
+                    if name != "hierarchy"
                 },
             }
         )
@@ -300,12 +280,14 @@ def evaluate_assay(
     ]
     correlations = {}
     for name in scores_by_component:
-        score_column = "variant_score" if name == "joint" else f"{name}_variant_score"
+        score_column = (
+            "variant_score" if name == "hierarchy" else f"{name}_variant_score"
+        )
         model_scores = [float(row[score_column]) for row in predictions]
         correlations[name] = float(
             spearmanr(model_scores, experimental_scores).statistic
         )
-    component_names = [name for name in scores_by_component if name != "joint"]
+    component_names = [name for name in scores_by_component if name != "hierarchy"]
     write_csv(
         predictions,
         PREDICTION_COLUMNS + tuple(f"{name}_variant_score" for name in component_names),
@@ -317,7 +299,7 @@ def evaluate_assay(
         "num_variants": len(rows),
         "num_excluded": num_excluded,
         "num_unique_windows": len(unique_sequences),
-        "spearman": correlations["joint"],
+        "spearman": correlations["hierarchy"],
         **{f"spearman_{name}": correlations[name] for name in component_names},
     }
 
@@ -361,7 +343,6 @@ def main(config: DictConfig) -> None:
         )
     target_length = int(tokenizer.context_length)
     component_names = [f"scale_{length}" for length in tokenizer.scale_lengths]
-    component_names.extend(["hierarchy", "decoder"])
 
     results = []
     for path in assay_paths:
@@ -378,7 +359,7 @@ def main(config: DictConfig) -> None:
         )
         results.append(result)
         correlations = [
-            f"joint {float(result['spearman']):.4f}",
+            f"hierarchy {float(result['spearman']):.4f}",
             *(
                 f"{name} {float(result[f'spearman_{name}']):.4f}"
                 for name in component_names
@@ -406,10 +387,8 @@ def main(config: DictConfig) -> None:
         "checkpoint_step": checkpoint_step,
         "tokenizer_checkpoint": str(tokenizer_checkpoint_path),
         "tokenizer_checkpoint_sha256": sha256(tokenizer_checkpoint_path),
-        "score": (
-            "mutant minus reference summed hierarchy and nucleotide log probability"
-        ),
-        "score_components": ["joint"] + component_names,
+        "score": "mutant minus reference summed hierarchy log probability",
+        "score_components": ["hierarchy", *component_names],
         "prefix_length": prefix_length,
         "target_length": target_length,
         "window_length": prefix_length + target_length,

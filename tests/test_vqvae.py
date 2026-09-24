@@ -264,6 +264,7 @@ def test_evaluate_reports_diagnostics_by_scale() -> None:
 
     assert "encoder_latent_rms" in metrics
     for scale_length in model.scale_lengths:
+        assert f"accuracy_scale_{scale_length}" in metrics
         assert f"latent_mse_scale_{scale_length}" in metrics
         assert f"scale_latent_rms_scale_{scale_length}" in metrics
         assert f"codebook_perplexity_scale_{scale_length}" in metrics

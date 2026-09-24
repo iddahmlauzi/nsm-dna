@@ -42,8 +42,7 @@ class BlockPredictionBatch:
 class Losses:
     total: Tensor
     hierarchy: Tensor
-    nucleotide: Tensor
-    predicted_reconstruction: Tensor
+    geometry: Tensor
     hierarchy_by_scale: Tensor
 
 
@@ -76,6 +75,18 @@ def build_codebook_neighbor_tables(
             distances.topk(neighbor_count, largest=False).indices
         )
     return neighbor_tables
+
+
+@torch.no_grad()
+def build_codebook_distance_tables(codebook_vectors: list[Tensor]) -> list[Tensor]:
+    """Return squared code distances normalized within each codebook."""
+    distance_tables = []
+    for vectors in codebook_vectors:
+        distances = torch.cdist(vectors.float(), vectors.float()).square()
+        num_codes = distances.shape[0]
+        mean_pairwise_distance = distances.sum() / (num_codes * (num_codes - 1))
+        distance_tables.append(distances / mean_pairwise_distance)
+    return distance_tables
 
 
 @torch.no_grad()
@@ -138,45 +149,36 @@ def decode_predicted_scale(
     return tokenizer.decoder(full_latent)
 
 
-def predicted_reconstruction_loss(
-    tokenizer: VQVAE,
+def geometry_loss(
     logits_by_scale: list[Tensor],
-    target_ids: Tensor,
-    tokenizer_scale_indices: list[int],
-    scale_index: int | None,
+    targets_by_scale: list[Tensor],
+    distance_tables_by_scale: list[Tensor],
+    scale_loss_weights: Tensor,
 ) -> Tensor:
-    """Reconstruct nucleotides from one predicted scale, or average all scales."""
-    if scale_index is None:
-        selected_scale_indices = range(len(logits_by_scale))
-    else:
-        selected_scale_indices = [scale_index]
-
-    losses = []
-    for selected_index in selected_scale_indices:
-        nucleotide_logits = decode_predicted_scale(
-            tokenizer,
-            logits_by_scale[selected_index],
-            tokenizer_scale_indices[selected_index],
+    """Penalize probability on codes far from the correct code at every scale."""
+    losses_by_scale = []
+    for scale_logits, scale_targets, distance_table in zip(
+        logits_by_scale,
+        targets_by_scale,
+        distance_tables_by_scale,
+        strict=True,
+    ):
+        probabilities = scale_logits.float().softmax(dim=-1)
+        target_distances = distance_table[scale_targets]
+        losses_by_scale.append(
+            (probabilities * target_distances).sum(dim=-1).mean()
         )
-        losses.append(
-            F.cross_entropy(
-                nucleotide_logits.flatten(0, 1),
-                target_ids.flatten(),
-            )
-        )
-    return torch.stack(losses).mean()
+    return (torch.stack(losses_by_scale) * scale_loss_weights).sum()
 
 
 def compute_losses(
     logits_by_scale: list[Tensor],
-    nucleotide_logits: Tensor,
     targets_by_scale: list[Tensor],
-    target_ids: Tensor,
     scale_loss_weights: Tensor,
-    predicted_reconstruction: Tensor,
-    predicted_reconstruction_loss_weight: float,
+    geometry: Tensor,
+    geometry_loss_weight: float,
 ) -> Losses:
-    """Combine hierarchy, nucleotide, and predicted-code reconstruction losses."""
+    """Combine exact-code classification and code geometry losses."""
     hierarchy_by_scale = torch.stack(
         [
             F.cross_entropy(
@@ -190,19 +192,10 @@ def compute_losses(
         ]
     )
     hierarchy = (hierarchy_by_scale * scale_loss_weights).sum()
-    nucleotide = F.cross_entropy(
-        nucleotide_logits.flatten(0, 1),
-        target_ids.flatten(),
-    )
     return Losses(
-        total=(
-            hierarchy
-            + nucleotide
-            + predicted_reconstruction_loss_weight * predicted_reconstruction
-        ),
+        total=hierarchy + geometry_loss_weight * geometry,
         hierarchy=hierarchy,
-        nucleotide=nucleotide,
-        predicted_reconstruction=predicted_reconstruction,
+        geometry=geometry,
         hierarchy_by_scale=hierarchy_by_scale,
     )
 
@@ -256,7 +249,8 @@ def evaluate(
     tokenizer: VQVAE,
     data_loader: DataLoader,
     scale_loss_weights: Tensor,
-    predicted_reconstruction_loss_weight: float,
+    codebook_distance_tables: list[Tensor],
+    geometry_loss_weight: float,
     use_mixed_precision: bool,
     max_batches: int | None = None,
     rollout_max_batches: int = 0,
@@ -273,7 +267,7 @@ def evaluate(
         tokenizer.scale_lengths,
         model.scale_lengths,
     )
-    loss_sums = torch.zeros(4, device=device)
+    loss_sums = torch.zeros(3, device=device)
     hierarchy_loss_sums_by_scale = torch.zeros(num_scales, device=device)
     correct_codes_by_scale = torch.zeros(num_scales, device=device)
     num_codes_by_scale = torch.zeros(num_scales, device=device)
@@ -311,24 +305,20 @@ def evaluate(
                 # scales, with all scale tasks packed into one transformer pass.
                 output = model(
                     prediction.targets_by_scale[:-1],
-                    prediction.targets_by_scale[-1],
                     prefix_by_scale=prediction.prefix_by_scale,
                 )
-                reconstruction_loss = predicted_reconstruction_loss(
-                    tokenizer,
+                batch_geometry_loss = geometry_loss(
                     output.hierarchy_logits,
-                    prediction.target_ids,
-                    scale_indices,
-                    scale_index=None,
+                    prediction.targets_by_scale,
+                    codebook_distance_tables,
+                    scale_loss_weights,
                 )
                 losses = compute_losses(
                     output.hierarchy_logits,
-                    output.nucleotide_logits,
                     prediction.targets_by_scale,
-                    prediction.target_ids,
                     scale_loss_weights,
-                    reconstruction_loss,
-                    predicted_reconstruction_loss_weight,
+                    batch_geometry_loss,
+                    geometry_loss_weight,
                 )
 
                 # Rollout predicts the first scale from the real prefix, then
@@ -338,10 +328,11 @@ def evaluate(
                         model,
                         prefix_by_scale=prediction.prefix_by_scale,
                     )
-                    rollout_logits = model.predict_nucleotides(
+                    rollout_latent = tokenizer.quantizer.indices_to_scale_latent(
                         rollout_indices[-1],
-                        prefix_by_scale=prediction.prefix_by_scale,
+                        scale_indices[-1],
                     )
+                    rollout_logits = tokenizer.decoder(rollout_latent)
                     rollout_nucleotide_loss = F.cross_entropy(
                         rollout_logits.flatten(0, 1),
                         prediction.target_ids.flatten(),
@@ -365,16 +356,16 @@ def evaluate(
                 )
 
             loss_sums += torch.stack(
-                [
-                    losses.total,
-                    losses.hierarchy,
-                    losses.nucleotide,
-                    losses.predicted_reconstruction,
-                ]
+                [losses.total, losses.hierarchy, losses.geometry]
             )
             hierarchy_loss_sums_by_scale += losses.hierarchy_by_scale
+            finest_logits = decode_predicted_scale(
+                tokenizer,
+                output.hierarchy_logits[-1],
+                scale_indices[-1],
+            )
             correct_nucleotides += (
-                output.nucleotide_logits.argmax(dim=-1) == prediction.target_ids
+                finest_logits.argmax(dim=-1) == prediction.target_ids
             ).sum().item()
             num_nucleotides += prediction.target_ids.numel()
             num_block_predictions += 1
@@ -395,8 +386,7 @@ def evaluate(
     metrics = {
         "loss": mean_losses[0].item(),
         "hierarchy_loss": mean_losses[1].item(),
-        "nucleotide_loss": mean_losses[2].item(),
-        "predicted_reconstruction_loss": mean_losses[3].item(),
+        "geometry_loss": mean_losses[2].item(),
         "hierarchy_accuracy": (
             correct_codes_by_scale.sum() / num_codes_by_scale.sum()
         ).item(),
@@ -535,6 +525,12 @@ def main(config: DictConfig) -> None:
         ],
         int(config.training.context_neighbor_count),
     )
+    codebook_distance_tables = build_codebook_distance_tables(
+        [
+            tokenizer.quantizer.codebooks[index].codebook
+            for index in scale_indices
+        ]
+    )
     tokenizer_corruption_probabilities = [
         float(probability)
         for probability in config.training.context_corruption_probabilities
@@ -605,11 +601,9 @@ def main(config: DictConfig) -> None:
         should_log = step % config.training.log_interval == 0
 
         if should_log:
-            mean_losses = torch.zeros(4, device=device)
+            mean_losses = torch.zeros(3, device=device)
             correct_codes = torch.zeros((), device=device, dtype=torch.long)
             num_codes = torch.zeros((), device=device, dtype=torch.long)
-            correct_nucleotides = torch.zeros((), device=device, dtype=torch.long)
-            num_nucleotides = torch.zeros((), device=device, dtype=torch.long)
 
         for micro_step in range(gradient_accumulation_steps):
             try:
@@ -655,31 +649,20 @@ def main(config: DictConfig) -> None:
                         )
                         output = training_model(
                             corrupted_indices_by_scale[:-1],
-                            corrupted_indices_by_scale[-1],
                             prefix_by_scale=prediction.prefix_by_scale,
                         )
-                        reconstruction_scale_index = torch.randint(
-                            len(model.scale_lengths),
-                            size=(),
-                            device=device,
-                        ).item()
-                        reconstruction_loss = predicted_reconstruction_loss(
-                            tokenizer,
+                        batch_geometry_loss = geometry_loss(
                             output.hierarchy_logits,
-                            prediction.target_ids,
-                            scale_indices,
-                            scale_index=reconstruction_scale_index,
+                            prediction.targets_by_scale,
+                            codebook_distance_tables,
+                            scale_loss_weights,
                         )
                         losses = compute_losses(
                             output.hierarchy_logits,
-                            output.nucleotide_logits,
                             prediction.targets_by_scale,
-                            prediction.target_ids,
                             scale_loss_weights,
-                            reconstruction_loss,
-                            float(
-                                config.objective.predicted_reconstruction_loss_weight
-                            ),
+                            batch_geometry_loss,
+                            float(config.objective.geometry_loss_weight),
                         )
                         accumulated_loss = losses.total / num_predictions_per_step
                     accumulated_loss.backward()
@@ -689,8 +672,7 @@ def main(config: DictConfig) -> None:
                         [
                             losses.total,
                             losses.hierarchy,
-                            losses.nucleotide,
-                            losses.predicted_reconstruction,
+                            losses.geometry,
                         ]
                     ).detach() / num_predictions_per_step
 
@@ -704,11 +686,6 @@ def main(config: DictConfig) -> None:
                                 scale_logits.argmax(dim=-1) == scale_targets
                             ).sum()
                             num_codes += scale_targets.numel()
-                        correct_nucleotides += (
-                            output.nucleotide_logits.argmax(dim=-1)
-                            == prediction.target_ids
-                        ).sum()
-                        num_nucleotides += prediction.target_ids.numel()
 
         gradient_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(),
@@ -726,31 +703,23 @@ def main(config: DictConfig) -> None:
                     mean_losses,
                     correct_codes,
                     num_codes,
-                    correct_nucleotides,
-                    num_nucleotides,
                 ):
                     dist.all_reduce(values, op=dist.ReduceOp.SUM)
                 mean_losses /= distributed_environment.world_size
 
             if distributed_environment.is_main_process:
                 hierarchy_accuracy = (correct_codes / num_codes).item()
-                nucleotide_accuracy = (
-                    correct_nucleotides / num_nucleotides
-                ).item()
 
                 progress_bar.set_postfix(
                     loss=f"{mean_losses[0].item():.4f}",
-                    nucleotide_accuracy=f"{nucleotide_accuracy:.2%}",
                 )
 
                 if wandb_run is not None:
                     wandb_metrics = {
                         "train/loss": mean_losses[0].item(),
                         "train/hierarchy_loss": mean_losses[1].item(),
-                        "train/nucleotide_loss": mean_losses[2].item(),
-                        "train/predicted_reconstruction_loss": mean_losses[3].item(),
+                        "train/geometry_loss": mean_losses[2].item(),
                         "train/hierarchy_accuracy": hierarchy_accuracy,
-                        "train/nucleotide_accuracy": nucleotide_accuracy,
                         "train/gradient_norm": gradient_norm.item(),
                         "train/learning_rate": learning_rate,
                     }
@@ -768,7 +737,8 @@ def main(config: DictConfig) -> None:
                     tokenizer,
                     validation_loader,
                     scale_loss_weights,
-                    float(config.objective.predicted_reconstruction_loss_weight),
+                    codebook_distance_tables,
+                    float(config.objective.geometry_loss_weight),
                     use_mixed_precision,
                     max_batches=config.evaluation.max_batches,
                     rollout_max_batches=config.evaluation.rollout_max_batches,
@@ -802,12 +772,9 @@ def main(config: DictConfig) -> None:
                         "validation/hierarchy_loss": validation_metrics[
                             "hierarchy_loss"
                         ],
-                        "validation/nucleotide_loss": validation_metrics[
-                            "nucleotide_loss"
+                        "validation/geometry_loss": validation_metrics[
+                            "geometry_loss"
                         ],
-                        "validation/predicted_reconstruction_loss": (
-                            validation_metrics["predicted_reconstruction_loss"]
-                        ),
                         "validation/hierarchy_accuracy": validation_metrics[
                             "hierarchy_accuracy"
                         ],
