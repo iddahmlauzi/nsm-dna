@@ -1,7 +1,7 @@
 import einx
 import torch
 import torch.nn as nn
-from jaxtyping import Float, Int
+from jaxtyping import Float
 from torch import Tensor
 
 from .common import (
@@ -16,53 +16,6 @@ def _sampling_factor(context_length: int, latent_length: int) -> int:
     if latent_length <= 0 or context_length % latent_length != 0:
         raise ValueError("context_length must be divisible by latent_length.")
     return context_length // latent_length
-
-
-class Encoder(nn.Module):
-    """Embed nucleotides and downsample them into a continuous latent."""
-
-    def __init__(
-        self,
-        vocab_size: int,
-        context_length: int,
-        latent_length: int,
-        embed_dim: int,
-        quantization_dim: int,
-        bias: bool = False,
-    ) -> None:
-        super().__init__()
-
-        sampling_factor = _sampling_factor(context_length, latent_length)
-
-        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-
-        # Combine each non-overlapping group of nucleotides into one latent
-        # position, reducing context_length positions to latent_length positions.
-        # It also reduces embed_dim to quantization_dim. With fewer independently
-        # varying values in each vector, a fixed number of codebook vectors can
-        # provide closer matches during nearest-code lookup.
-        self.downsampler = nn.Conv1d(
-            in_channels=embed_dim,
-            out_channels=quantization_dim,
-            kernel_size=sampling_factor,
-            stride=sampling_factor,
-            bias=bias,
-        )
-
-        # Euclidean codebook distances grow with the magnitude of the latent
-        # vectors. Normalize each vector so that magnitude cannot drift during
-        # training and make nearest-code matching progressively harder.
-        self.norm = nn.LayerNorm(quantization_dim, elementwise_affine=False)
-
-    def forward(
-        self,
-        token_ids: Int[Tensor, "batch length"],
-    ) -> Float[Tensor, "batch latent_length quantization_dim"]:
-        x = self.token_embedding(token_ids)
-        x = einx.id("b l d -> b d l", x)
-        x = self.downsampler(x)
-        x = einx.id("b d l -> b l d", x)
-        return self.norm(x)
 
 
 class Decoder(nn.Module):

@@ -1,4 +1,4 @@
-# Multiscale VQ-VAE tokenizer with independently quantized scales.
+# Multiscale VQ-VAE tokenizer with a discrete pairwise hierarchy.
 
 run:
   seed: 0
@@ -8,7 +8,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: vqvae
-  name: vqvae-256-dinucleotide
+  name: vqvae-256-pairwise-hierarchy-exact-dinucleotides
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -33,9 +33,15 @@ model:
   # RoPE is applied only in the decoder.
   rope_base: 10_000
   # Every scale is quantized after recursively applying learned stride-2
-  # convolutions. The final length-128 scale uses 16 codes for dinucleotides.
+  # convolutions. Each parent is built from quantized child vectors so the
+  # discrete codes form a nested pairwise hierarchy. Child vectors are detached
+  # at each boundary so a parent loss cannot collapse its prediction targets.
+  # Scale 128 uses the exact ID 4 * left_base + right_base and a trainable vector
+  # for each dinucleotide. Only the coarser scales use EMA vector quantization.
   scale_lengths: [1, 2, 4, 8, 16, 32, 64, 128]
-  codebook_sizes: [32, 32, 64, 64, 128, 128, 128, 16]
+  # Scale 128 represents exact dinucleotides. Scale 64 compresses the 256
+  # possible four-mers into 64 codes, or four four-mers per code when balanced.
+  codebook_sizes: [32, 32, 64, 64, 128, 128, 64, 16]
 
   decoder_num_layers: 4
   use_qk_norm: true
@@ -44,8 +50,10 @@ model:
   decay: 0.99
   eps: 1e-5
 
-  # Each step also decodes one uniformly sampled non-final scale by itself.
-  partial_reconstruction_weight: 0.25
+  # Scales 1 through 64 predict their ordered pairs of immediate child codes.
+  # Commitment is averaged over those seven EMA-quantized scales.
+  hierarchy_prediction_weight: 1.0
+  commitment_cost: 0.25
 
 optimizer:
   learning_rate: 1e-4

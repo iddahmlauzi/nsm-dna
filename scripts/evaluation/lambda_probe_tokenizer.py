@@ -21,7 +21,7 @@ from scripts.evaluation.lambda_probe_next_token import (
 
 
 class TokenizerWindowEncoder(nn.Module):
-    """Mean-pool VQ-VAE latents before quantization and before decoding."""
+    """Mean-pool the tokenizer's exact dinucleotide vectors."""
 
     def __init__(self, tokenizer: VQVAE) -> None:
         super().__init__()
@@ -33,13 +33,9 @@ class TokenizerWindowEncoder(nn.Module):
             dtype=torch.bfloat16,
             enabled=input_ids.device.type == "cuda",
         ):
-            pre_quant = self.tokenizer.encode(input_ids)
-            pre_decode, _, _ = self.tokenizer.quantizer(pre_quant)
+            finest_vectors = self.tokenizer.encode(input_ids)
 
-        return torch.cat(
-            [pre_quant.float().mean(dim=1), pre_decode.float().mean(dim=1)],
-            dim=1,
-        )
+        return finest_vectors.float().mean(dim=1)
 
 
 def evaluate_tokenizer_representations(
@@ -51,11 +47,11 @@ def evaluate_tokenizer_representations(
     output_directory: Path,
     device: torch.device,
 ) -> dict[str, dict[str, object]]:
-    """Extract both tokenizer representations in one VQ-VAE pass."""
-    combined_embeddings = {
+    """Evaluate the tokenizer's exact dinucleotide representation."""
+    embeddings = {
         split_name: extract_segment_embeddings(
             encoder,
-            2 * embed_dim,
+            embed_dim,
             window_length,
             window_length,
             split.sequences,
@@ -65,26 +61,15 @@ def evaluate_tokenizer_representations(
         )
         for split_name, split in splits.items()
     }
-    representations = {
-        "pre_quant": {
-            split_name: embeddings[:, :embed_dim]
-            for split_name, embeddings in combined_embeddings.items()
-        },
-        "pre_decode": {
-            split_name: embeddings[:, embed_dim:]
-            for split_name, embeddings in combined_embeddings.items()
-        },
-    }
     return {
-        representation_name: evaluate_probes(
-            f"trained_tokenizer_{representation_name}",
+        "finest_dinucleotide": evaluate_probes(
+            "trained_tokenizer_finest_dinucleotide",
             embeddings,
             splits,
             config,
             output_directory,
             device,
         )
-        for representation_name, embeddings in representations.items()
     }
 
 
@@ -161,13 +146,9 @@ def main(config: DictConfig) -> None:
             for name, path in split_paths.items()
         },
         "representations": {
-            "pre_quant": (
-                "mean of continuous encoder latents before vector quantization "
-                "for each 128-base window, then mean across windows"
-            ),
-            "pre_decode": (
-                "mean of the complete multiscale quantized latent immediately "
-                "before the decoder for each 128-base window, then mean across windows"
+            "finest_dinucleotide": (
+                "mean of exact scale-128 dinucleotide vectors for each "
+                "128-base window, then mean across windows"
             ),
         },
         "window_length": tokenizer.context_length,

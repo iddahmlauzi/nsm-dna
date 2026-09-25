@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -6,12 +7,33 @@ from jaxtyping import Float, Int
 from omegaconf import OmegaConf
 from torch import Tensor
 
-from .autoencoder import Decoder, Encoder
+from .autoencoder import Decoder
 from .quantization import MultiscaleVectorQuantizer
 
 
+class VQVAEHierarchyOutput(NamedTuple):
+    """Outputs used to train the discrete pairwise hierarchy."""
+
+    logits: Tensor
+    indices_by_scale: list[Tensor]
+    commitment_losses_by_scale: Tensor
+    child_logits_by_scale: list[tuple[Tensor, Tensor]]
+
+
+class _PairPredictionHead(nn.Module):
+    """Predict the ordered left and right children of one parent code."""
+
+    def __init__(self, input_dim: int, child_size: int, bias: bool) -> None:
+        super().__init__()
+        self.left = nn.Linear(input_dim, child_size, bias=bias)
+        self.right = nn.Linear(input_dim, child_size, bias=bias)
+
+    def forward(self, parent: Tensor) -> tuple[Tensor, Tensor]:
+        return self.left(parent), self.right(parent)
+
+
 class VQVAE(nn.Module):
-    """VQ-VAE with a learned codebook at every latent scale."""
+    """Pairwise hierarchy with exact dinucleotides at the finest scale."""
 
     def __init__(
         self,
@@ -49,15 +71,6 @@ class VQVAE(nn.Module):
                 "The final scale requires one code for each dinucleotide."
             )
 
-        self.encoder = Encoder(
-            self.vocab_size,
-            self.context_length,
-            self.latent_length,
-            self.embed_dim,
-            self.quantization_dim,
-            bias=bias,
-        )
-
         self.quantizer = MultiscaleVectorQuantizer(
             self.scale_lengths,
             self.codebook_sizes,
@@ -65,6 +78,16 @@ class VQVAE(nn.Module):
             latent_length=self.latent_length,
             decay=decay,
             eps=eps,
+        )
+        self.child_predictors = nn.ModuleList(
+            [
+                _PairPredictionHead(
+                    self.quantization_dim,
+                    child_size,
+                    bias,
+                )
+                for child_size in self.codebook_sizes[1:]
+            ]
         )
         self.decoder = Decoder(
             self.vocab_size,
@@ -124,56 +147,68 @@ class VQVAE(nn.Module):
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> Float[Tensor, "batch latent_length quantization_dim"]:
-        """Encode DNA into the normalized continuous latent."""
-        return self.encoder(token_ids)
+        """Look up the trainable vector for each exact dinucleotide ID."""
+        finest_indices = self._finest_scale_indices(token_ids)
+        return self.quantizer.codebooks[-1].codebook[finest_indices]
+
+    def _finest_scale_indices(
+        self,
+        token_ids: Int[Tensor, "batch length"],
+    ) -> Int[Tensor, "batch latent_length"]:
+        left_tokens = token_ids[:, 0::2]
+        right_tokens = token_ids[:, 1::2]
+        return left_tokens * self.vocab_size + right_tokens
 
     @torch.no_grad()
     def encode_scales(
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> list[Float[Tensor, "batch scale_length quantization_dim"]]:
-        """Encode DNA into the continuous latent at every hierarchy scale."""
+        """Encode DNA into the pre-quantization state at every scale."""
         if self.training:
             raise RuntimeError("Call model.eval() before encoding sequences.")
 
-        latent = self.encode(token_ids)
-        return self.quantizer._downsample_to_scales(latent.float())
+        return self.quantizer._downsample_to_scales(
+            self._finest_scale_indices(token_ids),
+        )
 
     def forward(
         self,
         token_ids: Int[Tensor, "batch length"],
-        *,
-        include_partial_reconstruction: bool = False,
-    ) -> tuple[
-        Float[Tensor, "batch length vocab_size"],
-        Float[Tensor, "batch length vocab_size"] | None,
-        list[Int[Tensor, "batch scale_length"]],
-    ]:
-        latent = self.encode(token_ids)
-        quantized_latent, partial_quantized_latent, indices_by_scale = self.quantizer(
-            latent,
-            include_partial_reconstruction=include_partial_reconstruction,
+    ) -> VQVAEHierarchyOutput:
+        quantization = self.quantizer.quantize(
+            self._finest_scale_indices(token_ids),
         )
-        logits = self.decoder(quantized_latent)
-
-        partial_logits = None
-        if partial_quantized_latent is not None:
-            partial_logits = self.decoder(partial_quantized_latent)
-
-        return logits, partial_logits, indices_by_scale
+        logits = self.decoder(quantization.quantized_latent)
+        child_logits_by_scale = [
+            predictor(quantized)
+            for predictor, quantized in zip(
+                self.child_predictors,
+                quantization.quantized_latents_by_scale[:-1],
+                strict=True,
+            )
+        ]
+        return VQVAEHierarchyOutput(
+            logits=logits,
+            indices_by_scale=quantization.indices_by_scale,
+            commitment_losses_by_scale=(
+                quantization.commitment_losses_by_scale
+            ),
+            child_logits_by_scale=child_logits_by_scale,
+        )
 
     @torch.no_grad()
     def encode_indices(
         self,
         token_ids: Int[Tensor, "batch length"],
     ) -> list[Int[Tensor, "batch scale_length"]]:
-        """Encode a target block into independent code indices at every scale."""
+        """Encode a target block into code indices at every hierarchy scale."""
         if self.training:
             raise RuntimeError("Call model.eval() before encoding sequences.")
 
-        latent = self.encode(token_ids)
-        _, _, indices_by_scale = self.quantizer(latent)
-        return indices_by_scale
+        return self.quantizer.quantize(
+            self._finest_scale_indices(token_ids)
+        ).indices_by_scale
 
     @torch.no_grad()
     def decode_scale(

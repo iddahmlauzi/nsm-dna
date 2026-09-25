@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from nsm_dna.data import collate_dna_sequences, load_gtdb_dataset
-from nsm_dna.models.vqvae import VQVAE
+from nsm_dna.models.vqvae import VQVAE, VQVAEHierarchyOutput
 from nsm_dna.training import (
     build_learning_rate_scheduler,
     calculate_training_steps,
@@ -24,15 +24,40 @@ from nsm_dna.training import (
 )
 
 
+def calculate_hierarchy_prediction_losses(
+    output: VQVAEHierarchyOutput,
+) -> torch.Tensor:
+    """Calculate ordered child-prediction loss at every learned parent scale."""
+    losses = []
+
+    for scale_index, (left_logits, right_logits) in enumerate(
+        output.child_logits_by_scale
+    ):
+        children = output.indices_by_scale[scale_index + 1]
+
+        left_targets = children[:, 0::2]
+        right_targets = children[:, 1::2]
+        left_loss = F.cross_entropy(
+            left_logits.flatten(0, 1), left_targets.flatten()
+        )
+        right_loss = F.cross_entropy(
+            right_logits.flatten(0, 1), right_targets.flatten()
+        )
+        losses.append((left_loss + right_loss) / 2)
+
+    return torch.stack(losses)
+
+
 @torch.no_grad()
 def evaluate(
     model: VQVAE,
     data_loader: DataLoader,
     use_mixed_precision: bool,
-    partial_reconstruction_weight: float,
+    hierarchy_prediction_weight: float,
+    commitment_cost: float,
     max_batches: int | None = None,
 ) -> dict[str, float]:
-    """Evaluate reconstruction at each independent scale without updating codebooks.
+    """Evaluate reconstruction and the discrete pairwise hierarchy.
 
     Evaluate the entire data loader when max_batches is None.
     """
@@ -41,6 +66,13 @@ def evaluate(
     device = next(model.parameters()).device
 
     full_reconstruction_loss_sum = 0.0
+    hierarchy_prediction_loss_sums_by_scale = [0.0] * len(
+        model.child_predictors
+    )
+    num_commitment_scales = len(model.scale_lengths) - 1
+    commitment_loss_sums_by_scale = [0.0] * num_commitment_scales
+    child_correct_by_scale = [0] * len(model.child_predictors)
+    child_count_by_scale = [0] * len(model.child_predictors)
     correct_tokens = 0
     num_tokens = 0
     num_batches = 0
@@ -60,8 +92,8 @@ def evaluate(
         for codebook_size in model.codebook_sizes
     ]
 
-    # Encoder magnitude, which position-wise LayerNorm should keep stable.
-    encoder_latent_squared_sum = 0.0
+    # Magnitude of the exact dinucleotide vectors supplied to the decoder.
+    finest_latent_squared_sum = 0.0
     num_latent_values = 0
 
     for batch_index, batch in enumerate(data_loader):
@@ -74,19 +106,36 @@ def evaluate(
             dtype=torch.bfloat16,
             enabled=use_mixed_precision,
         ):
-            logits, _, indices_by_scale = model(input_ids)
+            output = model(input_ids)
+            logits = output.logits
+            indices_by_scale = output.indices_by_scale
             full_reconstruction_loss = F.cross_entropy(
                 logits.flatten(0, 1),
                 input_ids.flatten(),
             )
+            hierarchy_prediction_losses = calculate_hierarchy_prediction_losses(
+                output,
+            )
 
-            encoder_latent = model.encode(input_ids)
+            for scale_index, (left_logits, right_logits) in enumerate(
+                output.child_logits_by_scale
+            ):
+                children = indices_by_scale[scale_index + 1]
+                left_targets = children[:, 0::2]
+                right_targets = children[:, 1::2]
+                child_correct_by_scale[scale_index] += (
+                    (left_logits.argmax(dim=-1) == left_targets).sum().item()
+                    + (right_logits.argmax(dim=-1) == right_targets).sum().item()
+                )
+                child_count_by_scale[scale_index] += children.numel()
+
+            finest_latent = model.encode(input_ids)
             scale_latents = model.quantizer.indices_to_scale_latents(
                 indices_by_scale
             )
 
-            encoder_latent_squared_sum += encoder_latent.float().square().sum().item()
-            num_latent_values += encoder_latent.numel()
+            finest_latent_squared_sum += finest_latent.float().square().sum().item()
+            num_latent_values += finest_latent.numel()
             for scale_index, scale_latent in enumerate(scale_latents):
                 scale_logits = model.decoder(scale_latent)
                 scale_reconstruction_loss = F.cross_entropy(
@@ -101,7 +150,7 @@ def evaluate(
                 )
                 latent_mse_sums_by_scale[scale_index] += F.mse_loss(
                     scale_latent.float(),
-                    encoder_latent.float(),
+                    finest_latent.float(),
                 ).item()
                 scale_latent_squared_sums_by_scale[scale_index] += (
                     scale_latent.float().square().sum().item()
@@ -114,6 +163,16 @@ def evaluate(
             )
 
         full_reconstruction_loss_sum += full_reconstruction_loss.item()
+        for scale_index, hierarchy_loss in enumerate(
+            hierarchy_prediction_losses
+        ):
+            hierarchy_prediction_loss_sums_by_scale[scale_index] += (
+                hierarchy_loss.item()
+            )
+        for scale_index, commitment_loss in enumerate(
+            output.commitment_losses_by_scale
+        ):
+            commitment_loss_sums_by_scale[scale_index] += commitment_loss.item()
         correct_tokens += (logits.argmax(dim=-1) == input_ids).sum().item()
         num_tokens += input_ids.numel()
         num_batches += 1
@@ -122,18 +181,23 @@ def evaluate(
         model.train()
 
     full_reconstruction_loss = full_reconstruction_loss_sum / num_batches
-    partial_reconstruction_loss = sum(
-        reconstruction_loss_sums_by_scale[:-1]
-    ) / ((len(model.scale_lengths) - 1) * num_batches)
+    hierarchy_prediction_loss = sum(
+        hierarchy_prediction_loss_sums_by_scale
+    ) / (len(model.child_predictors) * num_batches)
+    commitment_loss = sum(commitment_loss_sums_by_scale) / (
+        num_commitment_scales * num_batches
+    )
     metrics = {
         "full_reconstruction_loss": full_reconstruction_loss,
-        "partial_reconstruction_loss": partial_reconstruction_loss,
+        "hierarchy_prediction_loss": hierarchy_prediction_loss,
+        "commitment_loss": commitment_loss,
         "total_loss": (
             full_reconstruction_loss
-            + partial_reconstruction_weight * partial_reconstruction_loss
+            + hierarchy_prediction_weight * hierarchy_prediction_loss
+            + commitment_cost * commitment_loss
         ),
         "accuracy": correct_tokens / num_tokens,
-        "encoder_latent_rms": (encoder_latent_squared_sum / num_latent_values) ** 0.5,
+        "finest_latent_rms": (finest_latent_squared_sum / num_latent_values) ** 0.5,
     }
 
     scale_metrics = zip(
@@ -153,6 +217,19 @@ def evaluate(
         metrics[f"latent_mse_scale_{scale_length}"] = (
             latent_mse_sums_by_scale[scale_index] / num_batches
         )
+        if scale_index < len(model.child_predictors):
+            metrics[f"child_prediction_loss_scale_{scale_length}"] = (
+                hierarchy_prediction_loss_sums_by_scale[scale_index]
+                / num_batches
+            )
+            metrics[f"child_prediction_accuracy_scale_{scale_length}"] = (
+                child_correct_by_scale[scale_index]
+                / child_count_by_scale[scale_index]
+            )
+        if scale_index < num_commitment_scales:
+            metrics[f"commitment_loss_scale_{scale_length}"] = (
+                commitment_loss_sums_by_scale[scale_index] / num_batches
+            )
         scale_latent_squared_sum = scale_latent_squared_sums_by_scale[scale_index]
         metrics[f"scale_latent_rms_scale_{scale_length}"] = (
             scale_latent_squared_sum / num_latent_values
@@ -306,7 +383,6 @@ def main(config: DictConfig) -> None:
 
     # DDP synchronizes gradients. EMA codebook statistics are synchronized
     # separately inside the quantizer, so they do not need per-forward broadcasts.
-    # Only the randomly selected partial scale uses its downsampling path each step.
     training_model: VQVAE | DistributedDataParallel = model
     if distributed_environment.is_distributed:
         if device.type == "cuda":
@@ -314,13 +390,9 @@ def main(config: DictConfig) -> None:
                 model,
                 device_ids=[distributed_environment.local_rank],
                 output_device=distributed_environment.local_rank,
-                find_unused_parameters=True,
             )
         else:
-            training_model = DistributedDataParallel(
-                model,
-                find_unused_parameters=True,
-            )
+            training_model = DistributedDataParallel(model)
 
     # Train the model.
     training_epoch = 0
@@ -331,12 +403,14 @@ def main(config: DictConfig) -> None:
         disable=not distributed_environment.is_main_process,
     )
     gradient_accumulation_steps = config.optimizer.gradient_accumulation_steps
-    partial_reconstruction_weight = config.model.partial_reconstruction_weight
+    hierarchy_prediction_weight = config.model.hierarchy_prediction_weight
+    commitment_cost = config.model.commitment_cost
 
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
         full_reconstruction_loss_sum = 0.0
-        partial_reconstruction_loss_sum = 0.0
+        hierarchy_prediction_loss_sum = 0.0
+        commitment_loss_sum = 0.0
 
         for micro_step in range(gradient_accumulation_steps):
             try:
@@ -363,23 +437,25 @@ def main(config: DictConfig) -> None:
                     dtype=torch.bfloat16,
                     enabled=use_mixed_precision,
                 ):
-                    full_logits, partial_logits, _ = training_model(
-                        input_ids,
-                        include_partial_reconstruction=True,
-                    )
-                    assert partial_logits is not None
+                    output = training_model(input_ids)
+                    assert isinstance(output, VQVAEHierarchyOutput)
                     full_reconstruction_loss = F.cross_entropy(
-                        full_logits.flatten(0, 1),
+                        output.logits.flatten(0, 1),
                         input_ids.flatten(),
                     )
-                    partial_reconstruction_loss = F.cross_entropy(
-                        partial_logits.flatten(0, 1),
-                        input_ids.flatten(),
+                    hierarchy_prediction_loss = (
+                        calculate_hierarchy_prediction_losses(
+                            output,
+                        ).mean()
+                    )
+                    commitment_loss = (
+                        output.commitment_losses_by_scale.mean()
                     )
                     loss = (
                         full_reconstruction_loss
-                        + partial_reconstruction_weight
-                        * partial_reconstruction_loss
+                        + hierarchy_prediction_weight
+                        * hierarchy_prediction_loss
+                        + commitment_cost * commitment_loss
                     )
                     accumulated_loss = loss / gradient_accumulation_steps
                 accumulated_loss.backward()
@@ -387,8 +463,11 @@ def main(config: DictConfig) -> None:
             full_reconstruction_loss_sum += (
                 full_reconstruction_loss.item() / gradient_accumulation_steps
             )
-            partial_reconstruction_loss_sum += (
-                partial_reconstruction_loss.item() / gradient_accumulation_steps
+            hierarchy_prediction_loss_sum += (
+                hierarchy_prediction_loss.item() / gradient_accumulation_steps
+            )
+            commitment_loss_sum += (
+                commitment_loss.item() / gradient_accumulation_steps
             )
 
         # Limit unusually large parameter updates before the optimizer step.
@@ -406,7 +485,8 @@ def main(config: DictConfig) -> None:
             loss_sums = torch.tensor(
                 [
                     full_reconstruction_loss_sum,
-                    partial_reconstruction_loss_sum,
+                    hierarchy_prediction_loss_sum,
+                    commitment_loss_sum,
                 ],
                 device=device,
             )
@@ -417,21 +497,24 @@ def main(config: DictConfig) -> None:
             if distributed_environment.is_main_process:
                 (
                     full_reconstruction_loss_value,
-                    partial_reconstruction_loss_value,
+                    hierarchy_prediction_loss_value,
+                    commitment_loss_value,
                 ) = loss_sums.tolist()
                 total_loss_value = (
                     full_reconstruction_loss_value
-                    + partial_reconstruction_weight
-                    * partial_reconstruction_loss_value
+                    + hierarchy_prediction_weight
+                    * hierarchy_prediction_loss_value
+                    + commitment_cost * commitment_loss_value
                 )
                 global_utilization = model.global_utilization.item()
                 progress_bar.set_postfix(
                     full_reconstruction_loss=(
                         f"{full_reconstruction_loss_value:.4f}"
                     ),
-                    partial_reconstruction_loss=(
-                        f"{partial_reconstruction_loss_value:.4f}"
+                    hierarchy_prediction_loss=(
+                        f"{hierarchy_prediction_loss_value:.4f}"
                     ),
+                    commitment_loss=f"{commitment_loss_value:.4f}",
                     total_loss=f"{total_loss_value:.4f}",
                 )
 
@@ -441,9 +524,10 @@ def main(config: DictConfig) -> None:
                             "train/full_reconstruction_loss": (
                                 full_reconstruction_loss_value
                             ),
-                            "train/partial_reconstruction_loss": (
-                                partial_reconstruction_loss_value
+                            "train/hierarchy_prediction_loss": (
+                                hierarchy_prediction_loss_value
                             ),
+                            "train/commitment_loss": commitment_loss_value,
                             "train/total_loss": total_loss_value,
                             "train/gradient_norm": gradient_norm.item(),
                             "train/learning_rate": learning_rate,
@@ -459,26 +543,26 @@ def main(config: DictConfig) -> None:
                     model,
                     validation_loader,
                     use_mixed_precision,
-                    partial_reconstruction_weight,
+                    hierarchy_prediction_weight,
+                    commitment_cost,
                     max_batches=config.evaluation.max_batches,
                 )
                 tqdm.write(
                     f"step {step} validation: "
                     f"full reconstruction loss "
                     f"{validation_metrics['full_reconstruction_loss']:.4f}, "
-                    f"partial reconstruction loss "
-                    f"{validation_metrics['partial_reconstruction_loss']:.4f}, "
+                    f"hierarchy prediction loss "
+                    f"{validation_metrics['hierarchy_prediction_loss']:.4f}, "
+                    f"commitment loss "
+                    f"{validation_metrics['commitment_loss']:.4f}, "
                     f"total loss {validation_metrics['total_loss']:.4f}, "
                     f"accuracy {validation_metrics['accuracy']:.2%}"
                 )
 
                 if (
-                    validation_metrics["full_reconstruction_loss"]
-                    < best_validation_loss
+                    validation_metrics["total_loss"] < best_validation_loss
                 ):
-                    best_validation_loss = validation_metrics[
-                        "full_reconstruction_loss"
-                    ]
+                    best_validation_loss = validation_metrics["total_loss"]
                     best_checkpoint_path = save_training_checkpoint(
                         run_directory,
                         model,
@@ -521,15 +605,18 @@ def main(config: DictConfig) -> None:
                         "validation/full_reconstruction_loss": validation_metrics[
                             "full_reconstruction_loss"
                         ],
-                        "validation/partial_reconstruction_loss": validation_metrics[
-                            "partial_reconstruction_loss"
+                        "validation/hierarchy_prediction_loss": validation_metrics[
+                            "hierarchy_prediction_loss"
+                        ],
+                        "validation/commitment_loss": validation_metrics[
+                            "commitment_loss"
                         ],
                         "validation/total_loss": validation_metrics["total_loss"],
                         "validation/accuracy": validation_metrics["accuracy"],
-                        "validation/encoder_latent_rms": validation_metrics[
-                            "encoder_latent_rms"
+                        "validation/finest_latent_rms": validation_metrics[
+                            "finest_latent_rms"
                         ],
-                        "validation/best_reconstruction_loss": best_validation_loss,
+                        "validation/best_total_loss": best_validation_loss,
                     }
                     scale_metric_names = {
                         "reconstruction_loss": "reconstruction_loss",
@@ -538,6 +625,10 @@ def main(config: DictConfig) -> None:
                         "scale_latent_rms": "scale_latent_rms",
                         "codebook_perplexity": "codebook_perplexity",
                         "codebook_rms": "codebook_rms",
+                        "child_prediction_loss": "child_prediction_loss",
+                        "child_prediction_accuracy": (
+                            "child_prediction_accuracy"
+                        ),
                     }
 
                     for scale_number, scale_length in enumerate(
@@ -546,15 +637,22 @@ def main(config: DictConfig) -> None:
                     ):
                         section = f"scale_{scale_number:02d}_length_{scale_length}"
                         for panel_name, metric_name in scale_metric_names.items():
-                            wandb_metrics[f"{section}/{panel_name}"] = (
-                                validation_metrics[
-                                    f"{metric_name}_scale_{scale_length}"
-                                ]
-                            )
+                            metric_key = f"{metric_name}_scale_{scale_length}"
+                            if metric_key in validation_metrics:
+                                wandb_metrics[f"{section}/{panel_name}"] = (
+                                    validation_metrics[metric_key]
+                                )
 
                         if scale_length in scale_utilizations:
                             wandb_metrics[f"{section}/utilization"] = (
                                 scale_utilizations[scale_length]
+                            )
+                        commitment_metric = (
+                            f"commitment_loss_scale_{scale_length}"
+                        )
+                        if commitment_metric in validation_metrics:
+                            wandb_metrics[f"{section}/commitment_loss"] = (
+                                validation_metrics[commitment_metric]
                             )
 
                     wandb_run.log(wandb_metrics, step=step)
