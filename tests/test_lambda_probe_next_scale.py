@@ -14,17 +14,23 @@ def test_window_encoder_extracts_final_first_scale_memory_state() -> None:
         def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
             return token_ids.unsqueeze(-1).float()
 
+        def encode_scales(self, token_ids: torch.Tensor) -> list[torch.Tensor]:
+            return [self.encode(token_ids)]
+
         def encode_indices(self, token_ids: torch.Tensor) -> list[torch.Tensor]:
             return [token_ids]
 
     class StubModel(nn.Module):
+        scale_lengths = [2]
+
         def encode(
             self,
             indices_by_scale: list[torch.Tensor],
             *,
-            prefix: torch.Tensor,
+            prefix_by_scale: list[torch.Tensor],
+            prefix_token_ids: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            del indices_by_scale, prefix
+            del indices_by_scale, prefix_by_scale, prefix_token_ids
             return torch.tensor(
                 [
                     [

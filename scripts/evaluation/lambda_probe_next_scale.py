@@ -40,11 +40,15 @@ class NSMWindowEncoder(nn.Module):
             dtype=torch.bfloat16,
             enabled=input_ids.device.type == "cuda",
         ):
-            prefix = self.tokenizer.encode(prefix_ids)
+            prefix_by_scale = self.tokenizer.encode_scales(prefix_ids)
             targets_by_scale = self.tokenizer.encode_indices(target_ids)
-            hidden_states = self.model.encode(targets_by_scale[:-1], prefix=prefix)
+            hidden_states = self.model.encode(
+                targets_by_scale[:-1],
+                prefix_by_scale=prefix_by_scale,
+                prefix_token_ids=prefix_ids,
+            )
 
-        memory_token_index = prefix.shape[1]
+        memory_token_index = hidden_states.shape[1] - sum(self.model.scale_lengths)
         return hidden_states[:, memory_token_index].float()
 
 

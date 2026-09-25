@@ -86,7 +86,7 @@ def test_sequence_score_includes_hierarchy_and_decoder_probabilities() -> None:
     for prediction in prepare_block_predictions(tokenizer, input_ids):
         logits_by_scale = model(
             prediction.targets_by_scale[:-1],
-            prefix=prediction.prefix,
+            prefix_by_scale=prediction.prefix_by_scale,
         )
         for scale_index, (scale_logits, scale_targets) in enumerate(
             zip(logits_by_scale, prediction.targets_by_scale)

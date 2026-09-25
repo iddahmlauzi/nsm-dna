@@ -127,6 +127,18 @@ class VQVAE(nn.Module):
         """Encode DNA into the normalized continuous latent."""
         return self.encoder(token_ids)
 
+    @torch.no_grad()
+    def encode_scales(
+        self,
+        token_ids: Int[Tensor, "batch length"],
+    ) -> list[Float[Tensor, "batch scale_length quantization_dim"]]:
+        """Encode DNA into the continuous latent at every hierarchy scale."""
+        if self.training:
+            raise RuntimeError("Call model.eval() before encoding sequences.")
+
+        latent = self.encode(token_ids)
+        return self.quantizer._downsample_to_scales(latent.float())
+
     def forward(
         self,
         token_ids: Int[Tensor, "batch length"],

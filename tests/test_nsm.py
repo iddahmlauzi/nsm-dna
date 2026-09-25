@@ -13,6 +13,7 @@ def _build_model(
     *,
     num_layers: int = 1,
     max_prefix_length: int = 4,
+    prefix_conditioning: str = "full_resolution",
 ) -> NSM:
     return NSM(
         prefix_dim=3,
@@ -24,6 +25,7 @@ def _build_model(
         num_heads=2,
         dropout=0.0,
         max_prefix_length=max_prefix_length,
+        prefix_conditioning=prefix_conditioning,
     )
 
 
@@ -192,6 +194,61 @@ def test_prefix_is_visible_to_every_causal_hierarchy_position() -> None:
     torch.testing.assert_close(model._build_attention_mask(2, 2), expected_mask)
 
 
+def test_previous_scale_only_attention_hides_older_scale_blocks() -> None:
+    model = NSM(
+        prefix_dim=3,
+        model_dim=8,
+        scale_lengths=[1, 2],
+        codebook_sizes=[4, 5],
+        codebook_vectors=[torch.randn(4, 3), torch.randn(5, 3)],
+        num_layers=1,
+        num_heads=2,
+        dropout=0.0,
+        max_prefix_length=2,
+        hierarchy_attention="previous_scale_only",
+    )
+
+    expected_mask = torch.tensor(
+        [
+            [True, True, False, False, False],
+            [True, True, False, False, False],
+            [True, True, True, False, False],
+            [True, True, False, True, True],
+            [True, True, False, True, True],
+        ]
+    ).reshape(1, 1, 5, 5)
+
+    torch.testing.assert_close(model._build_attention_mask(2, 2), expected_mask)
+
+
+def test_multiscale_prefix_resolutions_are_revealed_progressively() -> None:
+    model = NSM(
+        prefix_dim=3,
+        model_dim=8,
+        scale_lengths=[1, 2],
+        codebook_sizes=[4, 5],
+        codebook_vectors=[torch.randn(4, 3), torch.randn(5, 3)],
+        num_layers=1,
+        num_heads=2,
+        dropout=0.0,
+        max_prefix_length=2,
+        prefix_conditioning="all_previous_resolutions",
+    )
+
+    expected_mask = torch.tensor(
+        [
+            [True, False, False, False, False, False],
+            [True, True, True, False, False, False],
+            [True, True, True, False, False, False],
+            [True, False, False, True, False, False],
+            [True, True, True, True, True, True],
+            [True, True, True, True, True, True],
+        ]
+    ).reshape(1, 1, 6, 6)
+
+    torch.testing.assert_close(model._build_attention_mask(3, 2), expected_mask)
+
+
 def test_rope_positions_are_centers_in_the_finest_scale_coordinates() -> None:
     model = _build_model()
     torch.testing.assert_close(
@@ -245,8 +302,11 @@ def test_nsm_predicts_every_codebook_including_scale_one() -> None:
     indices_by_scale = _indices()
     prefix = torch.randn(2, 4, 3)
 
-    logits = model(indices_by_scale[:-1], prefix=prefix)
-    expected_hidden_states = model.encode(indices_by_scale[:-1], prefix=prefix)
+    logits = model(indices_by_scale[:-1], prefix_by_scale=[prefix])
+    expected_hidden_states = model.encode(
+        indices_by_scale[:-1],
+        prefix_by_scale=[prefix],
+    )
     expected_logits = model.output_head(expected_hidden_states[:, 4:])
 
     assert [value.shape for value in logits] == [
@@ -261,7 +321,7 @@ def test_nsm_predicts_every_codebook_including_scale_one() -> None:
 def test_first_scale_uses_the_learned_bos_input() -> None:
     model = _build_model(num_layers=0)
     prefix = torch.randn(2, 4, 3)
-    hidden_states = model.encode(_indices()[:-1], prefix=prefix)
+    hidden_states = model.encode(_indices()[:-1], prefix_by_scale=[prefix])
 
     torch.testing.assert_close(
         hidden_states[:, 4:5],
@@ -276,8 +336,11 @@ def test_nsm_returns_prefix_and_hierarchy_hidden_states() -> None:
     prefix = torch.randn(2, 4, 3)
     indices_by_scale = _indices()
 
-    hidden_states = model.encode(indices_by_scale[:-1], prefix=prefix)
-    logits = model(indices_by_scale[:-1], prefix=prefix)
+    hidden_states = model.encode(
+        indices_by_scale[:-1],
+        prefix_by_scale=[prefix],
+    )
+    logits = model(indices_by_scale[:-1], prefix_by_scale=[prefix])
 
     assert hidden_states.shape == (2, 11, 8)
     assert [value.shape for value in logits] == [
@@ -298,8 +361,8 @@ def test_a_scale_cannot_change_its_own_or_earlier_logits() -> None:
     changed_indices = [indices.clone() for indices in indices_by_scale]
     changed_indices[1][:, 0] = (changed_indices[1][:, 0] + 1) % 5
 
-    logits = model(indices_by_scale[:-1], prefix=prefix)
-    changed_logits = model(changed_indices[:-1], prefix=prefix)
+    logits = model(indices_by_scale[:-1], prefix_by_scale=[prefix])
+    changed_logits = model(changed_indices[:-1], prefix_by_scale=[prefix])
 
     # Scale 2 is only supplied as the input used to predict scale 4.
     torch.testing.assert_close(logits[0], changed_logits[0])
@@ -315,25 +378,77 @@ def test_first_scale_is_predicted_without_supplying_its_code() -> None:
     changed_indices = [indices.clone() for indices in indices_by_scale]
     changed_indices[0][:, 0] = (changed_indices[0][:, 0] + 1) % 4
 
-    logits = model(indices_by_scale[:-1], prefix=prefix)
-    changed_logits = model(changed_indices[:-1], prefix=prefix)
+    logits = model(indices_by_scale[:-1], prefix_by_scale=[prefix])
+    changed_logits = model(changed_indices[:-1], prefix_by_scale=[prefix])
 
     torch.testing.assert_close(logits[0], changed_logits[0])
     assert not torch.equal(logits[1], changed_logits[1])
 
 
-def test_packed_teacher_forcing_matches_scale_by_scale_prediction() -> None:
-    model = _build_model(num_layers=1).eval()
-    prefix = torch.randn(2, 4, 3)
+@pytest.mark.parametrize(
+    "prefix_conditioning",
+    ["full_resolution", "all_previous_resolutions", "nucleotide_sequence"],
+)
+def test_packed_teacher_forcing_matches_scale_by_scale_prediction(
+    prefix_conditioning: str,
+) -> None:
+    model = _build_model(
+        num_layers=1,
+        prefix_conditioning=prefix_conditioning,
+    ).eval()
+    prefix_by_scale = [
+        torch.randn(2, 1, 3),
+        torch.randn(2, 2, 3),
+        torch.randn(2, 4, 3),
+    ]
+    prefix_token_ids = torch.randint(0, 4, (2, 4))
     indices_by_scale = _indices()
 
-    teacher_forced_logits = model(indices_by_scale[:-1], prefix=prefix)
+    teacher_forced_logits = model(
+        indices_by_scale[:-1],
+        prefix_by_scale=prefix_by_scale,
+        prefix_token_ids=prefix_token_ids,
+    )
     for scale_index in range(len(indices_by_scale)):
         scale_logits = model.predict_scale(
-            prefix,
+            prefix_by_scale,
             indices_by_scale[:scale_index],
+            prefix_token_ids=prefix_token_ids,
         )
         torch.testing.assert_close(
             scale_logits,
             teacher_forced_logits[scale_index],
         )
+
+
+def test_nucleotide_prefix_uses_every_raw_base_with_aligned_positions() -> None:
+    model = _build_model(
+        num_layers=0,
+        max_prefix_length=8,
+        prefix_conditioning="nucleotide_sequence",
+    )
+    prefix_by_scale = [
+        torch.randn(2, 1, 3),
+        torch.randn(2, 2, 3),
+        torch.randn(2, 4, 3),
+    ]
+    prefix_token_ids = torch.randint(0, 4, (2, 8))
+
+    hidden_states = model.encode(
+        _indices()[:-1],
+        prefix_by_scale=prefix_by_scale,
+        prefix_token_ids=prefix_token_ids,
+    )
+
+    assert hidden_states.shape == (2, 15, 8)
+    torch.testing.assert_close(
+        model.hierarchy_positions,
+        torch.tensor([3.5, 1.5, 5.5, 0.5, 2.5, 4.5, 6.5]),
+    )
+
+
+def test_nucleotide_prefix_requires_raw_token_ids() -> None:
+    model = _build_model(prefix_conditioning="nucleotide_sequence")
+
+    with pytest.raises(ValueError, match="prefix_token_ids are required"):
+        model(_indices()[:-1], prefix_by_scale=[torch.randn(2, 4, 3)])

@@ -1,4 +1,6 @@
-# Predict each target scale in parallel from 128 prefix latents and earlier scales.
+# Predict each target scale from the compressed prefix and all previous target
+# scales. A second pass replaces true earlier-scale context with detached hard
+# predictions from the teacher-forced pass.
 
 run:
   seed: 0
@@ -12,7 +14,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: nsm
-  name: nsm-256-packed-next-scale-learned-hierarchy
+  name: nsm-256-dinucleotide-attn-prefix-all-prev-scales-student-forcing
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -38,11 +40,13 @@ model:
 
   head_num_blocks: 2
   head_hidden_multiplier: 2.0
+  hierarchy_attention: all_previous_scales
+  prefix_conditioning: full_resolution
 
 optimizer:
   learning_rate: 5e-4
   min_learning_rate: 1e-5
-  # Five percent of the 38,150 optimizer steps across ten epochs.
+  # Ten percent of the 19,075 optimizer steps across five epochs.
   warmup_steps: 1_907
   beta_1: 0.9
   beta_2: 0.95
@@ -52,23 +56,26 @@ optimizer:
 
   # A scale's loss share is proportional to length ** (1 - alpha).
   scale_loss_alpha: 1
+  # Optional per-scale multipliers are normalized before losses are combined.
+  scale_loss_multipliers: [1, 1, 1, 1, 1, 1, 1, 1]
   # Codebook distances are normalized to mean one within each scale. This term
   # gives nearby incorrect codes a smaller penalty while preserving exact-code CE.
-  geometry_loss_weight: 0.1
+  geometry_loss_weight: 0.5
+  # Match distributions under generated earlier-scale context to detached
+  # distributions from the teacher-forced pass using KL divergence.
+  student_forcing_loss_weight: 1.0
 
 mixed_precision:
   enabled: true
 
 training:
-  num_epochs: 10
+  num_epochs: 5
   # Set an integer here to override the epoch-derived training length.
   max_steps: null
   log_interval: 10
-  # Coarse errors affect every later scale, so corrupt them more often. The
-  # probabilities correspond to context scales [1, 2, 4, 8, 16, 32, 64].
-  # Replacements are sampled from the five nearest codebook neighbors, while
-  # prediction targets remain clean.
-  context_corruption_probabilities: [0.30, 0.25, 0.20, 0.15, 0.10, 0.075, 0.05]
+  # Keep synthetic nearest-neighbor corruption off so this experiment isolates
+  # training on the model's own generated context.
+  context_corruption_probabilities: [0, 0, 0, 0, 0, 0, 0]
   context_neighbor_count: 5
 
 evaluation:

@@ -34,7 +34,8 @@ class BlockPredictionBatch:
     """Inputs and targets for predicting one block from its preceding blocks."""
 
     target_ids: Int[Tensor, "batch block_length"]
-    prefix: Float[Tensor, "batch prefix_length vq_dim"]
+    prefix_ids: Int[Tensor, "batch block_length"]
+    prefix_by_scale: list[Float[Tensor, "batch scale_length vq_dim"]]
     targets_by_scale: list[Int[Tensor, "batch scale_length"]]
 
 
@@ -42,14 +43,29 @@ def build_scale_loss_weights(
     scale_lengths: list[int],
     scale_loss_alpha: float,
     device: torch.device,
+    scale_loss_multipliers: list[float] | None = None,
 ) -> Tensor:
     """Return each scale's share of the total next-scale loss.
 
     Alpha 1 gives every scale equal weight. Alpha 0 gives every code position
     equal weight, so longer scales receive a proportionally larger share.
+    Optional multipliers reweight complete scale objectives before normalization.
     """
     lengths = torch.tensor(scale_lengths, dtype=torch.float32, device=device)
     scale_weights = lengths.pow(1.0 - scale_loss_alpha)
+    if scale_loss_multipliers is not None:
+        if len(scale_loss_multipliers) != len(scale_lengths):
+            raise ValueError(
+                "scale_loss_multipliers must have one value per scale"
+            )
+        multipliers = torch.tensor(
+            scale_loss_multipliers,
+            dtype=torch.float32,
+            device=device,
+        )
+        if torch.any(multipliers <= 0):
+            raise ValueError("scale_loss_multipliers must all be positive")
+        scale_weights = scale_weights * multipliers
     return scale_weights / scale_weights.sum()
 
 
@@ -183,6 +199,45 @@ def compute_next_scale_loss(
     return loss, cross_entropy_by_scale, geometry_loss_by_scale
 
 
+def compute_student_forcing_loss(
+    student_logits_by_scale: list[Tensor],
+    teacher_logits_by_scale: list[Tensor],
+    scale_loss_weights: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Match student distributions to detached teacher distributions.
+
+    Scale 1 is excluded because it has no earlier target-scale context, so its
+    inputs are identical in the teacher and student passes. The remaining scale
+    weights are renormalized so this objective has a stable interpretation as
+    the weighted mean consistency loss over affected scales.
+    """
+    consistency_weights = scale_loss_weights[1:]
+    consistency_weights = consistency_weights / consistency_weights.sum()
+    kl_divergence_by_scale = torch.stack(
+        [
+            F.kl_div(
+                F.log_softmax(student_logits.float(), dim=-1),
+                F.softmax(teacher_logits.detach().float(), dim=-1),
+                reduction="none",
+            )
+            .sum(dim=-1)
+            .mean()
+            for student_logits, teacher_logits in zip(
+                student_logits_by_scale[1:],
+                teacher_logits_by_scale[1:],
+                strict=True,
+            )
+        ]
+    )
+    loss = (kl_divergence_by_scale * consistency_weights).sum()
+
+    # This zero-valued connection makes the scale-1 head participate in the
+    # synchronized student backward. Its accumulated teacher gradient is then
+    # reduced correctly by DDP without adding a scale-1 consistency objective.
+    loss = loss + student_logits_by_scale[0].sum() * 0.0
+    return loss, kl_divergence_by_scale
+
+
 @torch.no_grad()
 def prepare_block_predictions(
     tokenizer: VQVAE,
@@ -192,13 +247,14 @@ def prepare_block_predictions(
     block_length = tokenizer.context_length
     prefix_ids = input_ids[:, :block_length]
     target_ids = input_ids[:, block_length:]
-    prefix = tokenizer.encode(prefix_ids)
+    prefix_by_scale = tokenizer.encode_scales(prefix_ids)
     indices_by_scale = tokenizer.encode_indices(target_ids)
 
     return [
         BlockPredictionBatch(
             target_ids=target_ids,
-            prefix=prefix,
+            prefix_ids=prefix_ids,
+            prefix_by_scale=prefix_by_scale,
             targets_by_scale=indices_by_scale,
         )
     ]
@@ -208,13 +264,18 @@ def prepare_block_predictions(
 def rollout_hierarchy(
     model: NSM,
     tokenizer: VQVAE,
-    prefix: Float[Tensor, "batch prefix_length vq_dim"],
+    prefix_by_scale: list[Float[Tensor, "batch scale_length vq_dim"]],
+    prefix_token_ids: Int[Tensor, "batch prefix_length"] | None = None,
 ) -> list[Int[Tensor, "batch scale_length"]]:
     """Greedily generate one complete scale at each coarse-to-fine step."""
     predicted_indices_by_scale = []
 
     for _ in tokenizer.scale_lengths:
-        logits = model.predict_scale(prefix, predicted_indices_by_scale)
+        logits = model.predict_scale(
+            prefix_by_scale,
+            predicted_indices_by_scale,
+            prefix_token_ids=prefix_token_ids,
+        )
         predicted_indices_by_scale.append(logits.argmax(dim=-1))
 
     return predicted_indices_by_scale
@@ -272,7 +333,8 @@ def evaluate(
                 # scales, with all scale tasks packed into one transformer pass.
                 logits_by_scale = model(
                     prediction.targets_by_scale[:-1],
-                    prefix=prediction.prefix,
+                    prefix_by_scale=prediction.prefix_by_scale,
+                    prefix_token_ids=prediction.prefix_ids,
                 )
                 (
                     loss,
@@ -292,7 +354,8 @@ def evaluate(
                     rollout_indices = rollout_hierarchy(
                         model,
                         tokenizer,
-                        prefix=prediction.prefix,
+                        prefix_by_scale=prediction.prefix_by_scale,
+                        prefix_token_ids=prediction.prefix_ids,
                     )
                     rollout_logits = tokenizer.decode_scale(
                         rollout_indices[-1], num_scales - 1
@@ -458,6 +521,10 @@ def main(config: DictConfig) -> None:
         tokenizer.scale_lengths,
         config.optimizer.scale_loss_alpha,
         device,
+        [
+            float(multiplier)
+            for multiplier in config.optimizer.scale_loss_multipliers
+        ],
     )
     codebook_distances_by_scale = build_codebook_distance_matrices(
         [codebook.codebook for codebook in tokenizer.quantizer.codebooks]
@@ -467,6 +534,9 @@ def main(config: DictConfig) -> None:
         int(config.training.context_neighbor_count),
     )
     geometry_loss_weight = float(config.optimizer.geometry_loss_weight)
+    student_forcing_loss_weight = float(
+        config.optimizer.student_forcing_loss_weight
+    )
     context_corruption_probabilities = [
         float(probability)
         for probability in config.training.context_corruption_probabilities
@@ -536,6 +606,7 @@ def main(config: DictConfig) -> None:
             mean_loss = torch.zeros((), device=device)
             mean_cross_entropy_loss = torch.zeros((), device=device)
             mean_geometry_loss = torch.zeros((), device=device)
+            mean_student_forcing_loss = torch.zeros((), device=device)
             correct_codes = torch.zeros((), device=device, dtype=torch.long)
             num_codes = torch.zeros((), device=device, dtype=torch.long)
 
@@ -559,27 +630,33 @@ def main(config: DictConfig) -> None:
                     micro_step == gradient_accumulation_steps - 1
                     and block_index == len(block_predictions) - 1
                 )
-                if distributed_environment.is_distributed and not is_last_prediction:
-                    synchronization_context = training_model.no_sync()
+                # The teacher pass always accumulates locally. The final student
+                # pass synchronizes all accumulated gradients across DDP ranks.
+                if distributed_environment.is_distributed:
+                    teacher_synchronization_context = training_model.no_sync()
                 else:
-                    synchronization_context = nullcontext()
+                    teacher_synchronization_context = nullcontext()
 
-                # Average every block prediction in the optimizer step and only
-                # synchronize DDP gradients on the final backward pass.
-                with synchronization_context:
+                with teacher_synchronization_context:
                     with torch.autocast(
                         device_type=device.type,
                         dtype=torch.bfloat16,
                         enabled=use_mixed_precision,
                     ):
-                        context_indices_by_scale = corrupt_context_indices(
-                            prediction.targets_by_scale[:-1],
-                            codebook_neighbor_tables[:-1],
-                            context_corruption_probabilities,
-                        )
+                        if any(context_corruption_probabilities):
+                            context_indices_by_scale = corrupt_context_indices(
+                                prediction.targets_by_scale[:-1],
+                                codebook_neighbor_tables[:-1],
+                                context_corruption_probabilities,
+                            )
+                        else:
+                            context_indices_by_scale = (
+                                prediction.targets_by_scale[:-1]
+                            )
                         logits_by_scale = training_model(
                             context_indices_by_scale,
-                            prefix=prediction.prefix,
+                            prefix_by_scale=prediction.prefix_by_scale,
+                            prefix_token_ids=prediction.prefix_ids,
                         )
                         (
                             loss,
@@ -592,17 +669,63 @@ def main(config: DictConfig) -> None:
                             codebook_distances_by_scale,
                             geometry_loss_weight,
                         )
-                        accumulated_loss = loss / num_predictions_per_step
-                    accumulated_loss.backward()
+                        detached_teacher_predictions_by_scale = [
+                            scale_logits.detach().argmax(dim=-1)
+                            for scale_logits in logits_by_scale
+                        ]
+                        accumulated_teacher_loss = (
+                            loss / num_predictions_per_step
+                        )
+                    accumulated_teacher_loss.backward()
+
+                if (
+                    distributed_environment.is_distributed
+                    and not is_last_prediction
+                ):
+                    student_synchronization_context = training_model.no_sync()
+                else:
+                    student_synchronization_context = nullcontext()
+
+                with student_synchronization_context:
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=torch.bfloat16,
+                        enabled=use_mixed_precision,
+                    ):
+                        student_logits_by_scale = training_model(
+                            detached_teacher_predictions_by_scale[:-1],
+                            prefix_by_scale=prediction.prefix_by_scale,
+                            prefix_token_ids=prediction.prefix_ids,
+                        )
+                        student_forcing_loss, _ = compute_student_forcing_loss(
+                            student_logits_by_scale,
+                            logits_by_scale,
+                            scale_loss_weights,
+                        )
+                        weighted_student_forcing_loss = (
+                            student_forcing_loss
+                            * student_forcing_loss_weight
+                        )
+                        accumulated_student_forcing_loss = (
+                            weighted_student_forcing_loss
+                            / num_predictions_per_step
+                        )
+                    accumulated_student_forcing_loss.backward()
 
                 if should_log:
-                    mean_loss += loss.detach() / num_predictions_per_step
+                    mean_loss += (
+                        loss.detach() + weighted_student_forcing_loss.detach()
+                    ) / num_predictions_per_step
                     mean_cross_entropy_loss += (
                         cross_entropy_by_scale.detach() * scale_loss_weights
                     ).sum() / num_predictions_per_step
                     mean_geometry_loss += (
                         geometry_loss_by_scale.detach() * scale_loss_weights
                     ).sum() / num_predictions_per_step
+                    mean_student_forcing_loss += (
+                        student_forcing_loss.detach()
+                        / num_predictions_per_step
+                    )
 
                     with torch.no_grad():
                         for scale_logits, scale_targets in zip(
@@ -631,6 +754,7 @@ def main(config: DictConfig) -> None:
                     mean_loss,
                     mean_cross_entropy_loss,
                     mean_geometry_loss,
+                    mean_student_forcing_loss,
                     correct_codes,
                     num_codes,
                 ):
@@ -638,6 +762,7 @@ def main(config: DictConfig) -> None:
                 mean_loss /= distributed_environment.world_size
                 mean_cross_entropy_loss /= distributed_environment.world_size
                 mean_geometry_loss /= distributed_environment.world_size
+                mean_student_forcing_loss /= distributed_environment.world_size
 
             if distributed_environment.is_main_process:
                 accuracy = (correct_codes / num_codes).item()
@@ -654,6 +779,9 @@ def main(config: DictConfig) -> None:
                             mean_cross_entropy_loss.item()
                         ),
                         "train/geometry_loss": mean_geometry_loss.item(),
+                        "train/student_forcing_loss": (
+                            mean_student_forcing_loss.item()
+                        ),
                         "train/accuracy": accuracy,
                         "train/gradient_norm": gradient_norm.item(),
                         "train/learning_rate": learning_rate,

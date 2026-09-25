@@ -1,0 +1,19 @@
+checkpoint: ../runs/nsm-256-dinucleotide-attn-prefix-prev-scale-only/checkpoints/final.pt
+tokenizer_checkpoint: ../runs/vqvae-256-dinucleotide/checkpoints/best.pt
+output_directory: ../results/nsm-256-dinucleotide-attn-prefix-prev-scale-only/oracle-scale-rollout
+
+data:
+  subset_directory: ../datasets/gtdb/500M_subset
+  split: validation
+  batch_size: 32
+  max_batches: 10
+  rollout_max_batches: 10
+  num_workers: 1
+
+seed: 0
+device: cuda:0
+oracle_scale_lengths: [4, 8, 16, 32]
+
+hydra:
+  run:
+    dir: ${output_directory}

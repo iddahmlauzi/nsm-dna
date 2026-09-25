@@ -1,0 +1,15 @@
+checkpoint: ../runs/nsm-256-dinucleotide-attn-prefix-all-prev-scales/checkpoints/best.pt
+tokenizer_checkpoint: ../runs/vqvae-256-dinucleotide/checkpoints/best.pt
+output_directory: ../results/nsm-256-dinucleotide-attn-prefix-all-prev-scales/rollout-geometry
+
+data:
+  subset_directory: ../datasets/gtdb/500M_subset
+  split: validation
+  batch_size: 32
+  max_batches: 10
+  num_workers: 1
+
+seed: 0
+device: cuda:0
+intervention_scale_lengths: [16, 32]
+neighbor_count: 5

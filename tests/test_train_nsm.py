@@ -12,6 +12,7 @@ from scripts.training.train_nsm import (
     build_codebook_neighbor_tables,
     build_scale_loss_weights,
     compute_next_scale_loss,
+    compute_student_forcing_loss,
     corrupt_context_indices,
     evaluate,
     prepare_block_predictions,
@@ -96,6 +97,20 @@ def test_scale_loss_alpha_controls_each_scale_share() -> None:
     torch.testing.assert_close(
         equal_position_weights,
         torch.tensor([1 / 7, 2 / 7, 4 / 7]),
+    )
+
+
+def test_scale_loss_multipliers_reweight_complete_scale_objectives() -> None:
+    weights = build_scale_loss_weights(
+        [1, 2, 4],
+        scale_loss_alpha=1.0,
+        device=torch.device("cpu"),
+        scale_loss_multipliers=[1.0, 1.5, 1.0],
+    )
+
+    torch.testing.assert_close(
+        weights,
+        torch.tensor([1 / 3.5, 1.5 / 3.5, 1 / 3.5]),
     )
 
 
@@ -229,6 +244,57 @@ def test_geometry_loss_prefers_probability_on_nearby_codes() -> None:
     assert near_loss.item() < far_loss.item()
 
 
+def test_student_forcing_matches_detached_teacher_distributions() -> None:
+    teacher_logits_by_scale = [
+        torch.randn(2, 1, 3, requires_grad=True),
+        torch.randn(2, 2, 4, requires_grad=True),
+        torch.randn(2, 4, 5, requires_grad=True),
+    ]
+    student_logits_by_scale = [
+        torch.randn(2, 1, 3, requires_grad=True),
+        torch.randn(2, 2, 4, requires_grad=True),
+        torch.randn(2, 4, 5, requires_grad=True),
+    ]
+    scale_loss_weights = torch.tensor([0.2, 0.3, 0.5])
+
+    loss, kl_divergence_by_scale = compute_student_forcing_loss(
+        student_logits_by_scale,
+        teacher_logits_by_scale,
+        scale_loss_weights,
+    )
+    loss.backward()
+
+    expected_kl_divergence = torch.stack(
+        [
+            F.kl_div(
+                F.log_softmax(student_logits, dim=-1),
+                F.softmax(teacher_logits.detach(), dim=-1),
+                reduction="none",
+            )
+            .sum(dim=-1)
+            .mean()
+            for student_logits, teacher_logits in zip(
+                student_logits_by_scale[1:],
+                teacher_logits_by_scale[1:],
+                strict=True,
+            )
+        ]
+    )
+    expected_weights = scale_loss_weights[1:] / scale_loss_weights[1:].sum()
+
+    torch.testing.assert_close(kl_divergence_by_scale, expected_kl_divergence)
+    torch.testing.assert_close(
+        loss.detach(),
+        (expected_kl_divergence * expected_weights).sum(),
+    )
+    assert all(logits.grad is None for logits in teacher_logits_by_scale)
+    torch.testing.assert_close(
+        student_logits_by_scale[0].grad,
+        torch.zeros_like(student_logits_by_scale[0]),
+    )
+    assert all(logits.grad is not None for logits in student_logits_by_scale[1:])
+
+
 def test_noisy_context_replaces_codes_with_nearest_neighbors() -> None:
     distance_matrices = [
         torch.tensor(
@@ -344,7 +410,7 @@ def test_stage_two_batch_stops_gradients_at_the_tokenizer() -> None:
     indices_by_scale = prediction.targets_by_scale
     logits_by_scale = model(
         indices_by_scale[:-1],
-        prefix=prediction.prefix,
+        prefix_by_scale=prediction.prefix_by_scale,
     )
     loss, _, _ = compute_next_scale_loss(
         logits_by_scale,
@@ -376,14 +442,19 @@ def test_block_prediction_uses_first_block_as_prefix_and_second_as_target() -> N
 
     prediction = block_predictions[0]
     torch.testing.assert_close(prediction.target_ids, target_ids)
-    torch.testing.assert_close(prediction.prefix, tokenizer.encode(prefix_ids))
+    torch.testing.assert_close(prediction.prefix_ids, prefix_ids)
+    assert [prefix.shape[1] for prefix in prediction.prefix_by_scale] == [1, 2, 4]
+    torch.testing.assert_close(
+        prediction.prefix_by_scale[-1],
+        tokenizer.encode(prefix_ids),
+    )
 
     expected_targets = tokenizer.encode_indices(target_ids)
     for actual, expected in zip(prediction.targets_by_scale, expected_targets):
         torch.testing.assert_close(actual, expected)
 
 
-def test_default_config_matches_fixed_hierarchy_recipe() -> None:
+def test_default_config_matches_current_recipe() -> None:
     config_path = Path(__file__).parents[1] / "configs" / "nsm.yaml"
     config = OmegaConf.load(config_path)
 
@@ -391,7 +462,10 @@ def test_default_config_matches_fixed_hierarchy_recipe() -> None:
     assert config.tokenizer_checkpoint.endswith(
         "vqvae-256-dinucleotide/checkpoints/best.pt"
     )
-    assert config.wandb.name == "nsm-256-packed-next-scale-learned-hierarchy"
+    assert (
+        config.wandb.name
+        == "nsm-256-dinucleotide-attn-prefix-all-prev-scales-student-forcing"
+    )
     assert config.data.subset_directory.endswith("gtdb/500M_subset")
     assert config.data.sequence_length == 512
     assert config.data.train_batch_size == 64
@@ -402,12 +476,25 @@ def test_default_config_matches_fixed_hierarchy_recipe() -> None:
     assert config.model.dropout == 0.1
     assert config.model.bias is False
     assert config.model.use_qk_norm is True
+    assert config.model.hierarchy_attention == "all_previous_scales"
+    assert config.model.prefix_conditioning == "full_resolution"
     assert config.optimizer.warmup_steps == 1907
     assert config.optimizer.beta_1 == 0.9
     assert config.optimizer.beta_2 == 0.95
     assert config.optimizer.weight_decay == 0.05
     assert config.optimizer.gradient_accumulation_steps == 1
-    assert config.optimizer.geometry_loss_weight == 0.1
+    assert list(config.optimizer.scale_loss_multipliers) == [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+    ]
+    assert config.optimizer.geometry_loss_weight == 0.5
+    assert config.optimizer.student_forcing_loss_weight == 1.0
     assert (
         config.data.sequence_length
         * config.data.train_batch_size
@@ -415,16 +502,8 @@ def test_default_config_matches_fixed_hierarchy_recipe() -> None:
         * config.optimizer.gradient_accumulation_steps
         == 131_072
     )
-    assert config.training.num_epochs == 10
-    assert list(config.training.context_corruption_probabilities) == [
-        0.30,
-        0.25,
-        0.20,
-        0.15,
-        0.10,
-        0.075,
-        0.05,
-    ]
+    assert config.training.num_epochs == 5
+    assert list(config.training.context_corruption_probabilities) == [0] * 7
     assert config.training.context_neighbor_count == 5
     assert config.checkpoint.interval == 5000
 
@@ -474,12 +553,15 @@ def test_rollout_feeds_each_prediction_back_into_the_hierarchy() -> None:
 
         def predict_scale(
             self,
-            prefix: torch.Tensor,
+            prefix_by_scale: list[torch.Tensor],
             completed_scales: list[torch.Tensor],
+            *,
+            prefix_token_ids: torch.Tensor | None = None,
         ) -> torch.Tensor:
+            del prefix_token_ids
             self.inputs.append(
                 (
-                    prefix.clone(),
+                    prefix_by_scale[-1].clone(),
                     [indices.clone() for indices in completed_scales],
                 )
             )
@@ -495,7 +577,7 @@ def test_rollout_feeds_each_prediction_back_into_the_hierarchy() -> None:
     predicted_indices_by_scale = rollout_hierarchy(
         model,
         tokenizer,
-        prefix=torch.zeros(2, 4, 4),
+        prefix_by_scale=[torch.zeros(2, 4, 4)],
     )
 
     assert [indices.shape for indices in predicted_indices_by_scale] == [

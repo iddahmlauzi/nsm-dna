@@ -178,6 +178,31 @@ def summarize_reconstructions(
     }
 
 
+@torch.no_grad()
+def rollout_with_oracle_scale(
+    model: NSM,
+    tokenizer: VQVAE,
+    prefix_by_scale: list[Tensor],
+    prefix_token_ids: Tensor,
+    true_indices_by_scale: list[Tensor],
+    oracle_scale_index: int,
+) -> list[Tensor]:
+    """Replace one generated scale with its true codes, then continue rollout."""
+    predicted_indices_by_scale = []
+    for scale_index in range(len(tokenizer.scale_lengths)):
+        logits = model.predict_scale(
+            prefix_by_scale,
+            predicted_indices_by_scale,
+            prefix_token_ids=prefix_token_ids,
+        )
+        predicted_indices = logits.argmax(dim=-1)
+        if scale_index == oracle_scale_index:
+            predicted_indices = true_indices_by_scale[scale_index]
+        predicted_indices_by_scale.append(predicted_indices)
+
+    return predicted_indices_by_scale
+
+
 @hydra.main(
     version_base=None,
     config_path="../../configs/evaluation",
@@ -225,6 +250,11 @@ def main(config: DictConfig) -> None:
 
     predicted_scale_lengths = tokenizer.scale_lengths
     predicted_codebook_sizes = tokenizer.codebook_sizes
+    oracle_scale_lengths = [int(value) for value in config.oracle_scale_lengths]
+    oracle_scale_indices = {
+        scale_length: predicted_scale_lengths.index(scale_length)
+        for scale_length in oracle_scale_lengths
+    }
     condition_metrics = {
         name: empty_condition_metrics(len(predicted_scale_lengths))
         for name in ("real", "composition_shuffled", "uniform_random")
@@ -236,6 +266,10 @@ def main(config: DictConfig) -> None:
     ]
     rollout_correct_counts = [0] * len(predicted_scale_lengths)
     rollout_code_counts = [0] * len(predicted_scale_lengths)
+    oracle_rollout_metrics = {
+        str(scale_length): {"nll_sum": 0.0, "correct": 0, "count": 0}
+        for scale_length in oracle_scale_lengths
+    }
     generator = torch.Generator().manual_seed(int(config.seed))
 
     for batch_index, batch in enumerate(tqdm(data_loader, unit="batch")):
@@ -258,8 +292,9 @@ def main(config: DictConfig) -> None:
                 enabled=device.type == "cuda",
             ):
                 logits_by_scale = model(
-                    prediction.targets_by_scale,
-                    prefix=prediction.prefix,
+                    prediction.targets_by_scale[:-1],
+                    prefix_by_scale=prediction.prefix_by_scale,
+                    prefix_token_ids=prediction.prefix_ids,
                 )
             update_condition_metrics(
                 condition_metrics[condition_name],
@@ -284,8 +319,29 @@ def main(config: DictConfig) -> None:
                 rollout_indices = rollout_hierarchy(
                     model,
                     tokenizer,
-                    prefix=prediction.prefix,
+                    prefix_by_scale=prediction.prefix_by_scale,
+                    prefix_token_ids=prediction.prefix_ids,
                 )
+                final_scale_index = len(true_indices) - 1
+                for scale_length, scale_index in oracle_scale_indices.items():
+                    oracle_indices = rollout_with_oracle_scale(
+                        model,
+                        tokenizer,
+                        prediction.prefix_by_scale,
+                        prediction.prefix_ids,
+                        true_indices,
+                        scale_index,
+                    )
+                    oracle_logits = tokenizer.decode_scale(
+                        oracle_indices[-1],
+                        final_scale_index,
+                    )
+                    update_reconstruction_metrics(
+                        oracle_rollout_metrics,
+                        str(scale_length),
+                        oracle_logits,
+                        prediction.target_ids,
+                    )
                 for scale_index, (rollout_targets, true_targets) in enumerate(
                     zip(
                         rollout_indices,
@@ -333,6 +389,14 @@ def main(config: DictConfig) -> None:
         )
         for name, metrics in condition_metrics.items()
     }
+    oracle_rollouts = summarize_reconstructions(oracle_rollout_metrics)
+    baseline_rollout_accuracy = summarize_reconstructions(
+        reconstruction_metrics
+    )["rollout_argmax"]["nucleotide_accuracy"]
+    for metrics in oracle_rollouts.values():
+        metrics["accuracy_gain_vs_baseline"] = (
+            metrics["nucleotide_accuracy"] - baseline_rollout_accuracy
+        )
     baselines = {}
     for scale_length, codebook_size, counts in zip(
         predicted_scale_lengths,
@@ -369,9 +433,14 @@ def main(config: DictConfig) -> None:
         "max_batches": int(config.data.max_batches),
         "batch_size": int(config.data.batch_size),
         "num_examples": conditions["real"]["num_examples"],
+        "num_oracle_rollout_examples": (
+            int(next(iter(oracle_rollout_metrics.values()))["count"])
+            // target_length
+        ),
         "prefix_length": prefix_length,
         "target_length": target_length,
         "first_scale_is_supplied": False,
+        "oracle_scale_lengths": oracle_scale_lengths,
         "baselines": baselines,
         "conditions": conditions,
         "rollout_code_accuracy_by_scale": {
@@ -384,6 +453,7 @@ def main(config: DictConfig) -> None:
             )
         },
         "reconstruction": summarize_reconstructions(reconstruction_metrics),
+        "oracle_scale_rollouts": oracle_rollouts,
     }
     output_path = output_directory / "results.json"
     output_path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
@@ -402,6 +472,12 @@ def main(config: DictConfig) -> None:
         )
     for name, metrics in results["reconstruction"].items():
         print(f"{name} reconstruction: {metrics['nucleotide_accuracy']:.2%}")
+    for scale_length, metrics in oracle_rollouts.items():
+        print(
+            f"oracle scale {scale_length}: "
+            f"{metrics['nucleotide_accuracy']:.2%} "
+            f"({metrics['accuracy_gain_vs_baseline']:+.2%} vs baseline)"
+        )
     print(f"wrote {output_path}")
 
 

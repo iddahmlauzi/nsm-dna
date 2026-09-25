@@ -12,6 +12,7 @@ data:
 
 seed: 0
 device: cuda:0
+oracle_scale_lengths: [4, 8, 16, 32]
 
 hydra:
   run:

@@ -144,9 +144,16 @@ def test_encode_returns_continuous_latents() -> None:
     )
 
     latent = model.encode(token_ids)
+    prefix_by_scale = model.encode_scales(token_ids)
 
     assert latent.shape == (2, 4, 4)
     torch.testing.assert_close(latent, model.encoder(token_ids))
+    assert [prefix.shape for prefix in prefix_by_scale] == [
+        (2, 1, 4),
+        (2, 2, 4),
+        (2, 4, 4),
+    ]
+    torch.testing.assert_close(prefix_by_scale[-1], latent)
 
 
 def test_partial_reconstruction_backpropagates_through_encoder() -> None:
