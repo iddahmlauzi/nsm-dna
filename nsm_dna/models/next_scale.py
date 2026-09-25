@@ -401,9 +401,10 @@ class NSM(nn.Module):
     ) -> Float[Tensor, "batch length model_dim"]:
         """Run the shared packed transformer path used by training and rollout.
 
-        Training supplies every ground-truth scale except the final one, creating
-        all prediction blocks in one pass. Rollout supplies only the scales
-        generated so far, creating the single next-scale block it currently needs.
+        Training supplies one possibly corrupted context for every scale after
+        scale 1, creating all prediction blocks in one pass. Rollout supplies only
+        the scales generated so far, creating the next-scale block it currently
+        needs.
         """
         prefix_length = prefix.shape[1]
         num_scale_blocks = len(completed_scales) + 1
@@ -435,7 +436,7 @@ class NSM(nn.Module):
 
     def encode(
         self,
-        indices_by_scale: list[Int[Tensor, "batch scale_length"]],
+        context_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
         *,
         prefix: Float[Tensor, "batch prefix_length prefix_dim"],
     ) -> Float[Tensor, "batch length model_dim"]:
@@ -445,15 +446,20 @@ class NSM(nn.Module):
                 f"Prefix length {prefix.shape[1]} exceeds the configured maximum "
                 f"of {self.max_prefix_length}."
             )
-        return self._encode_packed(prefix, indices_by_scale[:-1])
+        if len(context_indices_by_scale) != len(self.scale_lengths) - 1:
+            raise ValueError(
+                "One context scale is required for every prediction scale "
+                "after scale 1."
+            )
+        return self._encode_packed(prefix, context_indices_by_scale)
 
     def forward(
         self,
-        indices_by_scale: list[Int[Tensor, "batch scale_length"]],
+        context_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
         *,
         prefix: Float[Tensor, "batch prefix_length prefix_dim"],
     ) -> list[Float[Tensor, "batch scale_length codebook_size"]]:
-        hidden_states = self.encode(indices_by_scale, prefix=prefix)
+        hidden_states = self.encode(context_indices_by_scale, prefix=prefix)
         return self.output_head(hidden_states[:, prefix.shape[1] :])
 
     def predict_scale(

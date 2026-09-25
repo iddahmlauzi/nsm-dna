@@ -64,6 +64,12 @@ training:
   # Set an integer here to override the epoch-derived training length.
   max_steps: null
   log_interval: 10
+  # Coarse errors affect every later scale, so corrupt them more often. The
+  # probabilities correspond to context scales [1, 2, 4, 8, 16, 32, 64].
+  # Replacements are sampled from the five nearest codebook neighbors, while
+  # prediction targets remain clean.
+  context_corruption_probabilities: [0.30, 0.25, 0.20, 0.15, 0.10, 0.075, 0.05]
+  context_neighbor_count: 5
 
 evaluation:
   interval: 1_000

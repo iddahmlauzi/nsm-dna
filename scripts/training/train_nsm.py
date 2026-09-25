@@ -76,6 +76,64 @@ def build_codebook_distance_matrices(
     return distance_matrices
 
 
+@torch.no_grad()
+def build_codebook_neighbor_tables(
+    codebook_distances_by_scale: list[Tensor],
+    neighbor_count: int,
+) -> list[Tensor]:
+    """Return the nearest alternative code IDs for every code at each scale."""
+    neighbor_tables = []
+    for distances in codebook_distances_by_scale:
+        distances = distances.clone()
+        distances.fill_diagonal_(torch.inf)
+        neighbor_tables.append(
+            distances.topk(neighbor_count, largest=False).indices
+        )
+    return neighbor_tables
+
+
+@torch.no_grad()
+def corrupt_context_indices(
+    context_indices_by_scale: list[Int[Tensor, "batch scale_length"]],
+    neighbor_tables_by_scale: list[Int[Tensor, "codebook_size neighbor"]],
+    corruption_probabilities: list[float],
+) -> list[Int[Tensor, "batch scale_length"]]:
+    """Replace selected context codes with nearby codes from the same codebook."""
+    corrupted_context = []
+    for context_indices, neighbor_table, corruption_probability in zip(
+        context_indices_by_scale,
+        neighbor_tables_by_scale,
+        corruption_probabilities,
+        strict=True,
+    ):
+        neighbor_rank = torch.randint(
+            neighbor_table.shape[1],
+            context_indices.shape,
+            device=context_indices.device,
+        )
+        replacement_indices = neighbor_table[context_indices].gather(
+            dim=-1,
+            index=neighbor_rank.unsqueeze(-1),
+        ).squeeze(-1)
+        corruption_mask = torch.rand(
+            context_indices.shape,
+            device=context_indices.device,
+        ) < corruption_probability
+
+        # Inference errors are valid but incorrect code IDs. Nearby-code
+        # replacement exposes the model to that failure mode while preserving
+        # the tokenizer's discrete input representation.
+        corrupted_context.append(
+            torch.where(
+                corruption_mask,
+                replacement_indices,
+                context_indices,
+            )
+        )
+
+    return corrupted_context
+
+
 def compute_next_scale_loss(
     logits_by_scale: list[Tensor],
     targets_by_scale: list[Tensor],
@@ -213,7 +271,7 @@ def evaluate(
                 # Every scale is predicted in parallel from completed earlier
                 # scales, with all scale tasks packed into one transformer pass.
                 logits_by_scale = model(
-                    prediction.targets_by_scale,
+                    prediction.targets_by_scale[:-1],
                     prefix=prediction.prefix,
                 )
                 (
@@ -404,7 +462,15 @@ def main(config: DictConfig) -> None:
     codebook_distances_by_scale = build_codebook_distance_matrices(
         [codebook.codebook for codebook in tokenizer.quantizer.codebooks]
     )
+    codebook_neighbor_tables = build_codebook_neighbor_tables(
+        codebook_distances_by_scale,
+        int(config.training.context_neighbor_count),
+    )
     geometry_loss_weight = float(config.optimizer.geometry_loss_weight)
+    context_corruption_probabilities = [
+        float(probability)
+        for probability in config.training.context_corruption_probabilities
+    ]
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -506,8 +572,13 @@ def main(config: DictConfig) -> None:
                         dtype=torch.bfloat16,
                         enabled=use_mixed_precision,
                     ):
+                        context_indices_by_scale = corrupt_context_indices(
+                            prediction.targets_by_scale[:-1],
+                            codebook_neighbor_tables[:-1],
+                            context_corruption_probabilities,
+                        )
                         logits_by_scale = training_model(
-                            prediction.targets_by_scale,
+                            context_indices_by_scale,
                             prefix=prediction.prefix,
                         )
                         (
