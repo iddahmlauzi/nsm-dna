@@ -52,6 +52,7 @@ class VQVAE(nn.Module):
         rope_base: float = 10000.0,
         decay: float = 0.99,
         eps: float = 1e-5,
+        initialize_scale_64_from_prefix_triplets: bool = False,
     ) -> None:
         super().__init__()
 
@@ -66,6 +67,9 @@ class VQVAE(nn.Module):
         self.rope_base = rope_base
         self.scale_lengths = list(scale_lengths)
         self.codebook_sizes = list(codebook_sizes)
+        self.initialize_scale_64_from_prefix_triplets = (
+            initialize_scale_64_from_prefix_triplets
+        )
         if context_length != 2 * latent_length or codebook_sizes[-1] != 16:
             raise ValueError(
                 "The final scale requires one code for each dinucleotide."
@@ -79,6 +83,8 @@ class VQVAE(nn.Module):
             decay=decay,
             eps=eps,
         )
+        if self.initialize_scale_64_from_prefix_triplets:
+            self.quantizer.initialize_prefix_triplet_scale(self.vocab_size)
         self.child_predictors = nn.ModuleList(
             [
                 _PairPredictionHead(
@@ -133,6 +139,10 @@ class VQVAE(nn.Module):
             rope_base=config.rope_base,
             decay=config.decay,
             eps=config.eps,
+            initialize_scale_64_from_prefix_triplets=config.get(
+                "initialize_scale_64_from_prefix_triplets",
+                False,
+            ),
         )
         model.load_state_dict(checkpoint["model"])
         model = model.to(device)

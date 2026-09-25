@@ -199,45 +199,6 @@ def compute_next_scale_loss(
     return loss, cross_entropy_by_scale, geometry_loss_by_scale
 
 
-def compute_student_forcing_loss(
-    student_logits_by_scale: list[Tensor],
-    teacher_logits_by_scale: list[Tensor],
-    scale_loss_weights: Tensor,
-) -> tuple[Tensor, Tensor]:
-    """Match student distributions to detached teacher distributions.
-
-    Scale 1 is excluded because it has no earlier target-scale context, so its
-    inputs are identical in the teacher and student passes. The remaining scale
-    weights are renormalized so this objective has a stable interpretation as
-    the weighted mean consistency loss over affected scales.
-    """
-    consistency_weights = scale_loss_weights[1:]
-    consistency_weights = consistency_weights / consistency_weights.sum()
-    kl_divergence_by_scale = torch.stack(
-        [
-            F.kl_div(
-                F.log_softmax(student_logits.float(), dim=-1),
-                F.softmax(teacher_logits.detach().float(), dim=-1),
-                reduction="none",
-            )
-            .sum(dim=-1)
-            .mean()
-            for student_logits, teacher_logits in zip(
-                student_logits_by_scale[1:],
-                teacher_logits_by_scale[1:],
-                strict=True,
-            )
-        ]
-    )
-    loss = (kl_divergence_by_scale * consistency_weights).sum()
-
-    # This zero-valued connection makes the scale-1 head participate in the
-    # synchronized student backward. Its accumulated teacher gradient is then
-    # reduced correctly by DDP without adding a scale-1 consistency objective.
-    loss = loss + student_logits_by_scale[0].sum() * 0.0
-    return loss, kl_divergence_by_scale
-
-
 @torch.no_grad()
 def prepare_block_predictions(
     tokenizer: VQVAE,
@@ -534,9 +495,6 @@ def main(config: DictConfig) -> None:
         int(config.training.context_neighbor_count),
     )
     geometry_loss_weight = float(config.optimizer.geometry_loss_weight)
-    student_forcing_loss_weight = float(
-        config.optimizer.student_forcing_loss_weight
-    )
     context_corruption_probabilities = [
         float(probability)
         for probability in config.training.context_corruption_probabilities
@@ -606,7 +564,6 @@ def main(config: DictConfig) -> None:
             mean_loss = torch.zeros((), device=device)
             mean_cross_entropy_loss = torch.zeros((), device=device)
             mean_geometry_loss = torch.zeros((), device=device)
-            mean_student_forcing_loss = torch.zeros((), device=device)
             correct_codes = torch.zeros((), device=device, dtype=torch.long)
             num_codes = torch.zeros((), device=device, dtype=torch.long)
 
@@ -630,14 +587,17 @@ def main(config: DictConfig) -> None:
                     micro_step == gradient_accumulation_steps - 1
                     and block_index == len(block_predictions) - 1
                 )
-                # The teacher pass always accumulates locally. The final student
-                # pass synchronizes all accumulated gradients across DDP ranks.
-                if distributed_environment.is_distributed:
-                    teacher_synchronization_context = training_model.no_sync()
+                if (
+                    distributed_environment.is_distributed
+                    and not is_last_prediction
+                ):
+                    synchronization_context = training_model.no_sync()
                 else:
-                    teacher_synchronization_context = nullcontext()
+                    synchronization_context = nullcontext()
 
-                with teacher_synchronization_context:
+                # Average every block prediction in the optimizer step and only
+                # synchronize DDP gradients on the final backward pass.
+                with synchronization_context:
                     with torch.autocast(
                         device_type=device.type,
                         dtype=torch.bfloat16,
@@ -669,64 +629,17 @@ def main(config: DictConfig) -> None:
                             codebook_distances_by_scale,
                             geometry_loss_weight,
                         )
-                        detached_teacher_predictions_by_scale = [
-                            scale_logits.detach().argmax(dim=-1)
-                            for scale_logits in logits_by_scale
-                        ]
-                        accumulated_teacher_loss = (
-                            loss / num_predictions_per_step
-                        )
-                    accumulated_teacher_loss.backward()
-
-                if (
-                    distributed_environment.is_distributed
-                    and not is_last_prediction
-                ):
-                    student_synchronization_context = training_model.no_sync()
-                else:
-                    student_synchronization_context = nullcontext()
-
-                with student_synchronization_context:
-                    with torch.autocast(
-                        device_type=device.type,
-                        dtype=torch.bfloat16,
-                        enabled=use_mixed_precision,
-                    ):
-                        student_logits_by_scale = training_model(
-                            detached_teacher_predictions_by_scale[:-1],
-                            prefix_by_scale=prediction.prefix_by_scale,
-                            prefix_token_ids=prediction.prefix_ids,
-                        )
-                        student_forcing_loss, _ = compute_student_forcing_loss(
-                            student_logits_by_scale,
-                            logits_by_scale,
-                            scale_loss_weights,
-                        )
-                        weighted_student_forcing_loss = (
-                            student_forcing_loss
-                            * student_forcing_loss_weight
-                        )
-                        accumulated_student_forcing_loss = (
-                            weighted_student_forcing_loss
-                            / num_predictions_per_step
-                        )
-                    accumulated_student_forcing_loss.backward()
+                        accumulated_loss = loss / num_predictions_per_step
+                    accumulated_loss.backward()
 
                 if should_log:
-                    mean_loss += (
-                        loss.detach() + weighted_student_forcing_loss.detach()
-                    ) / num_predictions_per_step
+                    mean_loss += loss.detach() / num_predictions_per_step
                     mean_cross_entropy_loss += (
                         cross_entropy_by_scale.detach() * scale_loss_weights
                     ).sum() / num_predictions_per_step
                     mean_geometry_loss += (
                         geometry_loss_by_scale.detach() * scale_loss_weights
                     ).sum() / num_predictions_per_step
-                    mean_student_forcing_loss += (
-                        student_forcing_loss.detach()
-                        / num_predictions_per_step
-                    )
-
                     with torch.no_grad():
                         for scale_logits, scale_targets in zip(
                             logits_by_scale,
@@ -754,7 +667,6 @@ def main(config: DictConfig) -> None:
                     mean_loss,
                     mean_cross_entropy_loss,
                     mean_geometry_loss,
-                    mean_student_forcing_loss,
                     correct_codes,
                     num_codes,
                 ):
@@ -762,7 +674,6 @@ def main(config: DictConfig) -> None:
                 mean_loss /= distributed_environment.world_size
                 mean_cross_entropy_loss /= distributed_environment.world_size
                 mean_geometry_loss /= distributed_environment.world_size
-                mean_student_forcing_loss /= distributed_environment.world_size
 
             if distributed_environment.is_main_process:
                 accuracy = (correct_codes / num_codes).item()
@@ -779,9 +690,6 @@ def main(config: DictConfig) -> None:
                             mean_cross_entropy_loss.item()
                         ),
                         "train/geometry_loss": mean_geometry_loss.item(),
-                        "train/student_forcing_loss": (
-                            mean_student_forcing_loss.item()
-                        ),
                         "train/accuracy": accuracy,
                         "train/gradient_norm": gradient_norm.item(),
                         "train/learning_rate": learning_rate,

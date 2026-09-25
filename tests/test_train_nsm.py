@@ -12,7 +12,6 @@ from scripts.training.train_nsm import (
     build_codebook_neighbor_tables,
     build_scale_loss_weights,
     compute_next_scale_loss,
-    compute_student_forcing_loss,
     corrupt_context_indices,
     evaluate,
     prepare_block_predictions,
@@ -244,57 +243,6 @@ def test_geometry_loss_prefers_probability_on_nearby_codes() -> None:
     assert near_loss.item() < far_loss.item()
 
 
-def test_student_forcing_matches_detached_teacher_distributions() -> None:
-    teacher_logits_by_scale = [
-        torch.randn(2, 1, 3, requires_grad=True),
-        torch.randn(2, 2, 4, requires_grad=True),
-        torch.randn(2, 4, 5, requires_grad=True),
-    ]
-    student_logits_by_scale = [
-        torch.randn(2, 1, 3, requires_grad=True),
-        torch.randn(2, 2, 4, requires_grad=True),
-        torch.randn(2, 4, 5, requires_grad=True),
-    ]
-    scale_loss_weights = torch.tensor([0.2, 0.3, 0.5])
-
-    loss, kl_divergence_by_scale = compute_student_forcing_loss(
-        student_logits_by_scale,
-        teacher_logits_by_scale,
-        scale_loss_weights,
-    )
-    loss.backward()
-
-    expected_kl_divergence = torch.stack(
-        [
-            F.kl_div(
-                F.log_softmax(student_logits, dim=-1),
-                F.softmax(teacher_logits.detach(), dim=-1),
-                reduction="none",
-            )
-            .sum(dim=-1)
-            .mean()
-            for student_logits, teacher_logits in zip(
-                student_logits_by_scale[1:],
-                teacher_logits_by_scale[1:],
-                strict=True,
-            )
-        ]
-    )
-    expected_weights = scale_loss_weights[1:] / scale_loss_weights[1:].sum()
-
-    torch.testing.assert_close(kl_divergence_by_scale, expected_kl_divergence)
-    torch.testing.assert_close(
-        loss.detach(),
-        (expected_kl_divergence * expected_weights).sum(),
-    )
-    assert all(logits.grad is None for logits in teacher_logits_by_scale)
-    torch.testing.assert_close(
-        student_logits_by_scale[0].grad,
-        torch.zeros_like(student_logits_by_scale[0]),
-    )
-    assert all(logits.grad is not None for logits in student_logits_by_scale[1:])
-
-
 def test_noisy_context_replaces_codes_with_nearest_neighbors() -> None:
     distance_matrices = [
         torch.tensor(
@@ -460,11 +408,11 @@ def test_default_config_matches_current_recipe() -> None:
 
     assert config.run.resume_from is None
     assert config.tokenizer_checkpoint.endswith(
-        "vqvae-256-dinucleotide/checkpoints/best.pt"
+        "vqvae-256-pairwise-hierarchy-scale64-prefix-init/checkpoints/best.pt"
     )
     assert (
         config.wandb.name
-        == "nsm-256-dinucleotide-attn-prefix-all-prev-scales-student-forcing"
+        == "nsm-256-dinucleotide-attn-prefix-all-prev-scales"
     )
     assert config.data.subset_directory.endswith("gtdb/500M_subset")
     assert config.data.sequence_length == 512
@@ -494,7 +442,6 @@ def test_default_config_matches_current_recipe() -> None:
         1,
     ]
     assert config.optimizer.geometry_loss_weight == 0.5
-    assert config.optimizer.student_forcing_loss_weight == 1.0
     assert (
         config.data.sequence_length
         * config.data.train_batch_size
@@ -503,7 +450,15 @@ def test_default_config_matches_current_recipe() -> None:
         == 131_072
     )
     assert config.training.num_epochs == 5
-    assert list(config.training.context_corruption_probabilities) == [0] * 7
+    assert list(config.training.context_corruption_probabilities) == [
+        0.25,
+        0.25,
+        0.25,
+        0.30,
+        0.20,
+        0.075,
+        0.05,
+    ]
     assert config.training.context_neighbor_count == 5
     assert config.checkpoint.interval == 5000
 

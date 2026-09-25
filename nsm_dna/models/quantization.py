@@ -227,6 +227,88 @@ class MultiscaleVectorQuantizer(nn.Module):
             ]
         )
 
+    @torch.no_grad()
+    def initialize_prefix_triplet_scale(self, vocab_size: int) -> None:
+        """Initialize the finest learned scale to group by three-base prefixes.
+
+        Each exact dinucleotide starts as the sum of separate one-hot features
+        for its first and second bases. The first downsampler then copies both
+        bases from the left dinucleotide and the first base from the right
+        dinucleotide. Consequently, the four four-mers that differ only at the
+        final base initially select the same learned code. All initialized
+        tensors retain their normal training behavior after construction.
+        """
+        required_dimension = 3 * vocab_size
+        if self.quantization_dim < required_dimension:
+            raise ValueError(
+                "Prefix-triplet initialization requires quantization_dim to be "
+                f"at least {required_dimension}."
+            )
+        if len(self.codebooks) < 2:
+            raise ValueError(
+                "Prefix-triplet initialization requires at least two scales."
+            )
+
+        finest_codebook = self.codebooks[-1]
+        prefix_codebook = self.codebooks[-2]
+        if not isinstance(finest_codebook, DeterministicCodebook):
+            raise RuntimeError("Expected a deterministic finest codebook.")
+        if not isinstance(prefix_codebook, EMACodebook):
+            raise RuntimeError("Expected an EMA codebook below the finest scale.")
+        if finest_codebook.codebook_size != vocab_size**2:
+            raise ValueError(
+                "The finest codebook must contain one code per dinucleotide."
+            )
+        if prefix_codebook.codebook_size != vocab_size**3:
+            raise ValueError(
+                "The next scale must contain one code per nucleotide triplet."
+            )
+
+        vector_scale = (self.quantization_dim / 2) ** 0.5
+        finest_vectors = finest_codebook.codebook
+        finest_vectors.zero_()
+        for first_base in range(vocab_size):
+            for second_base in range(vocab_size):
+                code_index = first_base * vocab_size + second_base
+                finest_vectors[code_index, first_base] = vector_scale
+                finest_vectors[code_index, vocab_size + second_base] = vector_scale
+
+        first_downsampler = self.downsamplers[0]
+        convolution = first_downsampler.convolution
+        convolution.weight.zero_()
+        for base_index in range(vocab_size):
+            convolution.weight[base_index, base_index, 0] = 1.0
+            convolution.weight[
+                vocab_size + base_index,
+                vocab_size + base_index,
+                0,
+            ] = 1.0
+            convolution.weight[
+                2 * vocab_size + base_index,
+                base_index,
+                1,
+            ] = 1.0
+
+        triplet_indices = torch.arange(
+            vocab_size**3,
+            device=finest_vectors.device,
+        )
+        first_bases = triplet_indices // (vocab_size**2)
+        second_bases = (triplet_indices // vocab_size) % vocab_size
+        third_bases = triplet_indices % vocab_size
+        left_indices = first_bases * vocab_size + second_bases
+        right_indices = third_bases * vocab_size
+        paired_vectors = torch.stack(
+            [finest_vectors[left_indices], finest_vectors[right_indices]],
+            dim=1,
+        )
+        prefix_vectors = first_downsampler(paired_vectors).squeeze(1)
+
+        prefix_codebook.codebook.copy_(prefix_vectors)
+        prefix_codebook.ema_counts.fill_(1.0)
+        prefix_codebook.ema_vector_sums.copy_(prefix_vectors)
+        prefix_codebook.codebook_hits.zero_()
+
     def _quantize_scale(
         self,
         latent: Float[Tensor, "batch length quantization_dim"],

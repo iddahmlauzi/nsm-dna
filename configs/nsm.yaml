@@ -1,6 +1,5 @@
 # Predict each target scale from the compressed prefix and all previous target
-# scales. A second pass replaces true earlier-scale context with detached hard
-# predictions from the teacher-forced pass.
+# scales, with nearest-neighbor context corruption for rollout robustness.
 
 run:
   seed: 0
@@ -8,13 +7,13 @@ run:
 
 # The checkpoint's stored model configuration is the source of truth for the
 # tokenizer architecture, scale lengths, and codebook sizes.
-tokenizer_checkpoint: ../runs/vqvae-256-dinucleotide/checkpoints/best.pt
+tokenizer_checkpoint: ../runs/vqvae-256-pairwise-hierarchy-scale64-prefix-init/checkpoints/best.pt
 
 wandb:
   enabled: true
   entity: nsm-dna
   project: nsm
-  name: nsm-256-dinucleotide-attn-prefix-all-prev-scales-student-forcing
+  name: nsm-256-dinucleotide-attn-prefix-all-prev-scales
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -61,9 +60,6 @@ optimizer:
   # Codebook distances are normalized to mean one within each scale. This term
   # gives nearby incorrect codes a smaller penalty while preserving exact-code CE.
   geometry_loss_weight: 0.5
-  # Match distributions under generated earlier-scale context to detached
-  # distributions from the teacher-forced pass using KL divergence.
-  student_forcing_loss_weight: 1.0
 
 mixed_precision:
   enabled: true
@@ -73,9 +69,9 @@ training:
   # Set an integer here to override the epoch-derived training length.
   max_steps: null
   log_interval: 10
-  # Keep synthetic nearest-neighbor corruption off so this experiment isolates
-  # training on the model's own generated context.
-  context_corruption_probabilities: [0, 0, 0, 0, 0, 0, 0]
+  # Corrupt middle context scales most heavily. Replacements come from the five
+  # nearest codes in the same codebook, while prediction targets remain clean.
+  context_corruption_probabilities: [0.25, 0.25, 0.25, 0.30, 0.20, 0.075, 0.05]
   context_neighbor_count: 5
 
 evaluation:
