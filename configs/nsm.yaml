@@ -6,7 +6,7 @@ run:
 
 # The checkpoint's stored model configuration is the source of truth for the
 # tokenizer architecture, scale lengths, and codebook sizes.
-tokenizer_checkpoint: ../runs/vqvae-256-learned-hierarchy-dinucleotide-final/checkpoints/best.pt
+tokenizer_checkpoint: ../runs/vqvae-256-dinucleotide/checkpoints/best.pt
 
 wandb:
   enabled: true

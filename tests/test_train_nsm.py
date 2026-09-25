@@ -343,7 +343,7 @@ def test_default_config_matches_fixed_hierarchy_recipe() -> None:
 
     assert config.run.resume_from is None
     assert config.tokenizer_checkpoint.endswith(
-        "vqvae-256-learned-hierarchy-dinucleotide-final/checkpoints/best.pt"
+        "vqvae-256-dinucleotide/checkpoints/best.pt"
     )
     assert config.wandb.name == "nsm-256-packed-next-scale-learned-hierarchy"
     assert config.data.subset_directory.endswith("gtdb/500M_subset")

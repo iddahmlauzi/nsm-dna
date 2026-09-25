@@ -8,7 +8,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: vqvae
-  name: vqvae-256-learned-hierarchy-dinucleotide-final
+  name: vqvae-256-dinucleotide
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
