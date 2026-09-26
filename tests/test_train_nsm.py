@@ -408,7 +408,7 @@ def test_default_config_matches_current_recipe() -> None:
 
     assert config.run.resume_from is None
     assert config.tokenizer_checkpoint.endswith(
-        "vqvae-256-pairwise-hierarchy-scale64-prefix-init/checkpoints/best.pt"
+        "vqvae-256-pairwise-hierarchy-learned-scale64/checkpoints/best.pt"
     )
     assert (
         config.wandb.name

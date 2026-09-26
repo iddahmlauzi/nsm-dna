@@ -330,9 +330,6 @@ def main(config: DictConfig) -> None:
         rope_base=config.model.rope_base,
         decay=config.model.decay,
         eps=config.model.eps,
-        initialize_scale_64_from_prefix_triplets=(
-            config.model.initialize_scale_64_from_prefix_triplets
-        ),
     )
 
     device = distributed_environment.device

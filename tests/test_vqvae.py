@@ -174,55 +174,6 @@ def test_finest_scale_uses_exact_dinucleotide_ids() -> None:
     assert finest_codebook.codebook_hits.count_nonzero() == 16
 
 
-def test_prefix_triplet_initialization_groups_four_mers_by_first_three_bases() -> None:
-    model = VQVAE(
-        vocab_size=4,
-        context_length=8,
-        latent_length=4,
-        embed_dim=16,
-        quantization_dim=16,
-        num_heads=4,
-        scale_lengths=[1, 2, 4],
-        codebook_sizes=[8, 64, 16],
-        initialize_scale_64_from_prefix_triplets=True,
-    )
-    quantizer = model.quantizer
-    finest_codebook = quantizer.codebooks[-1]
-    prefix_codebook = quantizer.codebooks[-2]
-    assert isinstance(finest_codebook, DeterministicCodebook)
-
-    four_mers = torch.tensor(
-        [
-            [first, second, third, fourth]
-            for first in range(4)
-            for second in range(4)
-            for third in range(4)
-            for fourth in range(4)
-        ]
-    )
-    finest_indices = torch.stack(
-        [
-            four_mers[:, 0] * 4 + four_mers[:, 1],
-            four_mers[:, 2] * 4 + four_mers[:, 3],
-        ],
-        dim=1,
-    )
-    prefix_latents = quantizer.downsamplers[0](
-        finest_codebook(finest_indices)
-    )
-    _, prefix_indices = prefix_codebook(prefix_latents)
-    expected_indices = (
-        four_mers[:, 0] * 16
-        + four_mers[:, 1] * 4
-        + four_mers[:, 2]
-    )
-
-    torch.testing.assert_close(prefix_indices.squeeze(1), expected_indices)
-    assert prefix_codebook.codebook_hits.count_nonzero() == 64
-    assert finest_codebook.codebook.requires_grad
-    assert quantizer.downsamplers[0].convolution.weight.requires_grad
-
-
 def test_full_reconstruction_trains_dinucleotide_vectors() -> None:
     model = _build_model()
     token_ids = torch.tensor(

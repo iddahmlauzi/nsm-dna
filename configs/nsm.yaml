@@ -7,7 +7,7 @@ run:
 
 # The checkpoint's stored model configuration is the source of truth for the
 # tokenizer architecture, scale lengths, and codebook sizes.
-tokenizer_checkpoint: ../runs/vqvae-256-pairwise-hierarchy-scale64-prefix-init/checkpoints/best.pt
+tokenizer_checkpoint: ../runs/vqvae-256-pairwise-hierarchy-learned-scale64/checkpoints/best.pt
 
 wandb:
   enabled: true

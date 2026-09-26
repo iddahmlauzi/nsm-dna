@@ -8,7 +8,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: vqvae
-  name: vqvae-256-pairwise-hierarchy-scale64-prefix-init
+  name: vqvae-256-pairwise-hierarchy-learned-scale64
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -42,9 +42,6 @@ model:
   # Scale 128 represents exact dinucleotides. Scale 64 compresses the 256
   # possible four-mers into 64 codes, or four four-mers per code when balanced.
   codebook_sizes: [32, 32, 64, 64, 128, 128, 64, 16]
-  # Initially group the four-mers that share their first three nucleotides.
-  # Nearest-neighbor assignments and EMA updates are unconstrained afterward.
-  initialize_scale_64_from_prefix_triplets: true
 
   decoder_num_layers: 4
   use_qk_norm: true
