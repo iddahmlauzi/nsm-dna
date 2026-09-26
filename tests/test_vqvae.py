@@ -1,6 +1,9 @@
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from omegaconf import OmegaConf
 
 from nsm_dna.models.autoencoder import Decoder
 from nsm_dna.models.common import RMSNorm
@@ -31,6 +34,15 @@ def _build_model(
         decoder_num_layers=decoder_num_layers,
         use_qk_norm=True,
     )
+
+
+def test_default_config_uses_left_grouped_k64_hierarchy() -> None:
+    config_path = Path(__file__).parents[1] / "configs" / "vqvae.yaml"
+    config = OmegaConf.load(config_path)
+
+    assert config.wandb.name == "vqvae-256-left-grouped-hierarchy-k64"
+    assert list(config.model.codebook_sizes) == [64] * 7 + [16]
+    assert config.model.group_codes_by_left_child is True
 
 
 def test_decoder_supplies_rope_to_attention() -> None:
@@ -114,6 +126,50 @@ def test_quantizer_builds_and_quantizes_every_scale() -> None:
         (2, 2, 2),
         (2, 4, 2),
     ]
+
+
+def test_structured_hierarchy_reserves_parent_codes_by_left_child() -> None:
+    quantizer = MultiscaleVectorQuantizer(
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[8, 8, 4],
+        quantization_dim=2,
+        latent_length=4,
+        group_codes_by_left_child=True,
+    ).eval()
+    finest_indices = torch.tensor([[0, 1, 2, 3], [3, 0, 1, 2]])
+
+    result = quantizer.quantize(finest_indices)
+    scale_one, scale_two, _ = result.indices_by_scale
+
+    # Scale 2 has two possible parent codes for each finest-scale left child.
+    torch.testing.assert_close(
+        scale_two // 2,
+        finest_indices[:, 0::2],
+    )
+    # Scale 1 has one possible parent code for each scale-2 left child.
+    torch.testing.assert_close(scale_one, scale_two[:, 0::2])
+
+
+def test_one_parent_per_left_child_ignores_right_child_for_assignment() -> None:
+    quantizer = MultiscaleVectorQuantizer(
+        scale_lengths=[1, 2, 4],
+        codebook_sizes=[4, 4, 4],
+        quantization_dim=2,
+        latent_length=4,
+        group_codes_by_left_child=True,
+    ).eval()
+    finest_indices = torch.tensor([[0, 1, 2, 3], [0, 3, 2, 1]])
+
+    result = quantizer.quantize(finest_indices)
+
+    torch.testing.assert_close(
+        result.indices_by_scale[1][0],
+        result.indices_by_scale[1][1],
+    )
+    torch.testing.assert_close(
+        result.indices_by_scale[0][0],
+        result.indices_by_scale[0][1],
+    )
 
 
 def test_discrete_hierarchy_downsamples_quantized_children() -> None:
@@ -291,6 +347,8 @@ def test_evaluate_reports_diagnostics_by_scale() -> None:
         if scale_length != model.scale_lengths[-1]:
             assert f"child_prediction_loss_scale_{scale_length}" in metrics
             assert f"child_prediction_accuracy_scale_{scale_length}" in metrics
+            assert f"left_child_accuracy_scale_{scale_length}" in metrics
+            assert f"right_child_accuracy_scale_{scale_length}" in metrics
             assert f"commitment_loss_scale_{scale_length}" in metrics
     assert "child_prediction_loss_scale_4" not in metrics
     assert "commitment_loss_scale_4" not in metrics

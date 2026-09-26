@@ -73,6 +73,9 @@ def evaluate(
     commitment_loss_sums_by_scale = [0.0] * num_commitment_scales
     child_correct_by_scale = [0] * len(model.child_predictors)
     child_count_by_scale = [0] * len(model.child_predictors)
+    left_child_correct_by_scale = [0] * len(model.child_predictors)
+    right_child_correct_by_scale = [0] * len(model.child_predictors)
+    child_positions_by_scale = [0] * len(model.child_predictors)
     correct_tokens = 0
     num_tokens = 0
     num_batches = 0
@@ -123,11 +126,19 @@ def evaluate(
                 children = indices_by_scale[scale_index + 1]
                 left_targets = children[:, 0::2]
                 right_targets = children[:, 1::2]
+                left_correct = (
+                    left_logits.argmax(dim=-1) == left_targets
+                ).sum().item()
+                right_correct = (
+                    right_logits.argmax(dim=-1) == right_targets
+                ).sum().item()
+                left_child_correct_by_scale[scale_index] += left_correct
+                right_child_correct_by_scale[scale_index] += right_correct
                 child_correct_by_scale[scale_index] += (
-                    (left_logits.argmax(dim=-1) == left_targets).sum().item()
-                    + (right_logits.argmax(dim=-1) == right_targets).sum().item()
+                    left_correct + right_correct
                 )
                 child_count_by_scale[scale_index] += children.numel()
+                child_positions_by_scale[scale_index] += left_targets.numel()
 
             finest_latent = model.encode(input_ids)
             scale_latents = model.quantizer.indices_to_scale_latents(
@@ -225,6 +236,14 @@ def evaluate(
             metrics[f"child_prediction_accuracy_scale_{scale_length}"] = (
                 child_correct_by_scale[scale_index]
                 / child_count_by_scale[scale_index]
+            )
+            metrics[f"left_child_accuracy_scale_{scale_length}"] = (
+                left_child_correct_by_scale[scale_index]
+                / child_positions_by_scale[scale_index]
+            )
+            metrics[f"right_child_accuracy_scale_{scale_length}"] = (
+                right_child_correct_by_scale[scale_index]
+                / child_positions_by_scale[scale_index]
             )
         if scale_index < num_commitment_scales:
             metrics[f"commitment_loss_scale_{scale_length}"] = (
@@ -330,6 +349,7 @@ def main(config: DictConfig) -> None:
         rope_base=config.model.rope_base,
         decay=config.model.decay,
         eps=config.model.eps,
+        group_codes_by_left_child=config.model.group_codes_by_left_child,
     )
 
     device = distributed_environment.device

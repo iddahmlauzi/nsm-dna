@@ -52,6 +52,7 @@ class VQVAE(nn.Module):
         rope_base: float = 10000.0,
         decay: float = 0.99,
         eps: float = 1e-5,
+        group_codes_by_left_child: bool = False,
     ) -> None:
         super().__init__()
 
@@ -66,6 +67,7 @@ class VQVAE(nn.Module):
         self.rope_base = rope_base
         self.scale_lengths = list(scale_lengths)
         self.codebook_sizes = list(codebook_sizes)
+        self.group_codes_by_left_child = group_codes_by_left_child
         if context_length != 2 * latent_length or codebook_sizes[-1] != 16:
             raise ValueError(
                 "The final scale requires one code for each dinucleotide."
@@ -78,6 +80,7 @@ class VQVAE(nn.Module):
             latent_length=self.latent_length,
             decay=decay,
             eps=eps,
+            group_codes_by_left_child=self.group_codes_by_left_child,
         )
         self.child_predictors = nn.ModuleList(
             [
@@ -133,6 +136,10 @@ class VQVAE(nn.Module):
             rope_base=config.rope_base,
             decay=config.decay,
             eps=config.eps,
+            group_codes_by_left_child=config.get(
+                "group_codes_by_left_child",
+                False,
+            ),
         )
         model.load_state_dict(checkpoint["model"])
         model = model.to(device)

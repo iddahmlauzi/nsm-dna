@@ -8,7 +8,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: vqvae
-  name: vqvae-256-pairwise-hierarchy-learned-scale64
+  name: vqvae-256-left-grouped-hierarchy-k64
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -33,15 +33,15 @@ model:
   # RoPE is applied only in the decoder.
   rope_base: 10_000
   # Every scale is quantized after recursively applying learned stride-2
-  # convolutions. Each parent is built from quantized child vectors so the
-  # discrete codes form a nested pairwise hierarchy. Child vectors are detached
-  # at each boundary so a parent loss cannot collapse its prediction targets.
-  # Scale 128 uses the exact ID 4 * left_base + right_base and a trainable vector
-  # for each dinucleotide. Only the coarser scales use EMA vector quantization.
+  # convolutions. Child vectors are detached at each boundary so a parent loss
+  # cannot collapse its prediction targets. Scale 128 uses the exact ID
+  # 4 * left_base + right_base and a trainable vector for each dinucleotide.
   scale_lengths: [1, 2, 4, 8, 16, 32, 64, 128]
-  # Scale 128 represents exact dinucleotides. Scale 64 compresses the 256
-  # possible four-mers into 64 codes, or four four-mers per code when balanced.
-  codebook_sizes: [32, 32, 64, 64, 128, 128, 64, 16]
+  # All learned scales use 64 codes. At scale 64, four codes are reserved for
+  # each possible left dinucleotide. At every coarser scale, one parent code is
+  # reserved for each possible left-child code.
+  codebook_sizes: [64, 64, 64, 64, 64, 64, 64, 16]
+  group_codes_by_left_child: true
 
   decoder_num_layers: 4
   use_qk_norm: true

@@ -57,19 +57,64 @@ class EMACodebook(nn.Module):
     def forward(
         self,
         x: Float[Tensor, "batch length quantization_dim"],
+        *,
+        group_indices: Int[Tensor, "batch length"] | None = None,
+        num_groups: int | None = None,
     ) -> tuple[
         Float[Tensor, "batch length quantization_dim"],
         Int[Tensor, "batch length"],
     ]:
         flat_input = einx.id("b l d -> (b l) d", x.detach().float())
 
-        # Compute the distance from each input to every codebook vector.
-        distances = (
-            torch.sum(flat_input**2, dim=1, keepdim=True)
-            + torch.sum(self.codebook**2, dim=1)
-            - 2 * einx.dot("n d, k d -> n k", flat_input, self.codebook)
-        )
-        flat_indices = distances.argmin(dim=-1)
+        if group_indices is None:
+            # Compute the distance from each input to every codebook vector.
+            distances = (
+                torch.sum(flat_input**2, dim=1, keepdim=True)
+                + torch.sum(self.codebook**2, dim=1)
+                - 2 * einx.dot("n d, k d -> n k", flat_input, self.codebook)
+            )
+            flat_indices = distances.argmin(dim=-1)
+        else:
+            if num_groups is None:
+                raise ValueError(
+                    "num_groups is required for grouped codebook lookup."
+                )
+            if group_indices.shape != x.shape[:2]:
+                raise ValueError(
+                    "group_indices must match the batch and length dimensions "
+                    "of the codebook input."
+                )
+            if self.codebook_size % num_groups != 0:
+                raise ValueError(
+                    f"Codebook size {self.codebook_size} must be divisible by "
+                    f"the {num_groups} lookup groups."
+                )
+
+            codes_per_group = self.codebook_size // num_groups
+            flat_groups = group_indices.detach().flatten()
+
+            if codes_per_group == 1:
+                flat_indices = flat_groups
+            else:
+                grouped_codebook = self.codebook.reshape(
+                    num_groups,
+                    codes_per_group,
+                    self.quantization_dim,
+                )
+                candidate_vectors = grouped_codebook[flat_groups]
+                distances = (
+                    torch.sum(flat_input**2, dim=1, keepdim=True)
+                    + torch.sum(candidate_vectors**2, dim=2)
+                    - 2
+                    * torch.sum(
+                        flat_input.unsqueeze(1) * candidate_vectors,
+                        dim=2,
+                    )
+                )
+                within_group_indices = distances.argmin(dim=-1)
+                flat_indices = (
+                    flat_groups * codes_per_group + within_group_indices
+                )
         indices = einx.id("(b l) -> b l", flat_indices, b=x.shape[0])
 
         if self.training:
@@ -193,6 +238,7 @@ class MultiscaleVectorQuantizer(nn.Module):
         latent_length: int,
         decay: float = 0.99,
         eps: float = 1e-5,
+        group_codes_by_left_child: bool = False,
     ) -> None:
         super().__init__()
 
@@ -200,6 +246,21 @@ class MultiscaleVectorQuantizer(nn.Module):
         self.codebook_sizes = list(codebook_sizes)
         self.quantization_dim = quantization_dim
         self.latent_length = latent_length
+        self.group_codes_by_left_child = group_codes_by_left_child
+
+        if self.group_codes_by_left_child:
+            for parent_size, child_size in zip(
+                self.codebook_sizes[:-1],
+                self.codebook_sizes[1:],
+                strict=True,
+            ):
+                if parent_size < child_size or parent_size % child_size != 0:
+                    raise ValueError(
+                        "Each structured parent codebook must contain an "
+                        "integer number of codes for every possible left-child "
+                        f"code, but received parent size {parent_size} and "
+                        f"child size {child_size}."
+                    )
 
         # Exact dinucleotide vectors supply scale 128. Learned reductions then
         # build the remaining hierarchy: 128 → 64 → 32 → 16 → 8 → 4 → 2 → 1.
@@ -231,11 +292,19 @@ class MultiscaleVectorQuantizer(nn.Module):
         self,
         latent: Float[Tensor, "batch length quantization_dim"],
         scale_index: int,
+        left_child_indices: Int[Tensor, "batch length"],
     ) -> tuple[Tensor, Tensor, Tensor]:
         codebook = self.codebooks[scale_index]
         if not isinstance(codebook, EMACodebook):
             raise RuntimeError("Deterministic codebooks require explicit IDs.")
-        quantized, indices = codebook(latent)
+        if self.group_codes_by_left_child:
+            quantized, indices = codebook(
+                latent,
+                group_indices=left_child_indices,
+                num_groups=self.codebook_sizes[scale_index + 1],
+            )
+        else:
+            quantized, indices = codebook(latent)
         commitment_loss = F.mse_loss(latent.float(), quantized.detach().float())
         quantized_with_gradient = latent + (quantized - latent).detach()
         return quantized_with_gradient, indices, commitment_loss
@@ -255,6 +324,7 @@ class MultiscaleVectorQuantizer(nn.Module):
         if not isinstance(finest_codebook, DeterministicCodebook):
             raise RuntimeError("Expected a deterministic finest codebook.")
         current_quantized = finest_codebook(finest_scale_indices)
+        current_indices = finest_scale_indices
         latents_by_length[finest_scale_length] = current_quantized
         quantized_by_length[finest_scale_length] = current_quantized
         indices_by_length[finest_scale_length] = finest_scale_indices
@@ -263,6 +333,7 @@ class MultiscaleVectorQuantizer(nn.Module):
             reversed(range(finest_scale_index))
         ):
             scale_length = self.scale_lengths[scale_index]
+            left_child_indices = current_indices[:, 0::2]
             current_latent = self.downsamplers[downsampler_index](
                 current_quantized.detach()
             )
@@ -271,10 +342,15 @@ class MultiscaleVectorQuantizer(nn.Module):
                 current_quantized,
                 scale_indices,
                 commitment_loss,
-            ) = self._quantize_scale(current_latent, scale_index)
+            ) = self._quantize_scale(
+                current_latent,
+                scale_index,
+                left_child_indices,
+            )
             commitment_by_length[scale_length] = commitment_loss
             quantized_by_length[scale_length] = current_quantized
             indices_by_length[scale_length] = scale_indices
+            current_indices = scale_indices
 
         return (
             [latents_by_length[length] for length in self.scale_lengths],
