@@ -12,7 +12,7 @@ wandb:
   enabled: true
   entity: nsm-dna
   project: nsm
-  name: nsm-256-packed-next-scale-learned-hierarchy
+  name: nsm-256-dinucleotide-attn-prefix-all-prev-scales
 
 data:
   subset_directory: ../datasets/gtdb/500M_subset
@@ -42,7 +42,7 @@ model:
 optimizer:
   learning_rate: 5e-4
   min_learning_rate: 1e-5
-  # Five percent of the 38,150 optimizer steps across ten epochs.
+  # Ten percent of the 19,075 optimizer steps across five epochs.
   warmup_steps: 1_907
   beta_1: 0.9
   beta_2: 0.95
@@ -54,13 +54,13 @@ optimizer:
   scale_loss_alpha: 1
   # Codebook distances are normalized to mean one within each scale. This term
   # gives nearby incorrect codes a smaller penalty while preserving exact-code CE.
-  geometry_loss_weight: 0.1
+  geometry_loss_weight: 0.5
 
 mixed_precision:
   enabled: true
 
 training:
-  num_epochs: 10
+  num_epochs: 5
   # Set an integer here to override the epoch-derived training length.
   max_steps: null
   log_interval: 10
@@ -68,7 +68,7 @@ training:
   # probabilities correspond to context scales [1, 2, 4, 8, 16, 32, 64].
   # Replacements are sampled from the five nearest codebook neighbors, while
   # prediction targets remain clean.
-  context_corruption_probabilities: [0.30, 0.25, 0.20, 0.15, 0.10, 0.075, 0.05]
+  context_corruption_probabilities: [0.25, 0.25, 0.25, 0.30, 0.20, 0.075, 0.05]
   context_neighbor_count: 5
 
 evaluation:
